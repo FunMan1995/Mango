@@ -65,7 +65,10 @@ synthetic programs, not real app code yet.
   unconditional `B`, `SVC`, and `BX`. `BX` and `POP {pc}` interwork:
   bit 0 of the target selects Thumb vs ARM (odd stop-sentinels used by
   the tests are left intact so a `BX LR` halt still matches). 32-bit
-  Thumb (`BL`, IT-predicated ops, many extra loads) is rejected.
+  Thumb covers `BL`/`BLX` (immediate), `B.W` / `B<cond>.W`, `MOVW`/`MOVT`,
+  and `IT` (ITSTATE in CPSR, including ITE-style inverted conditions on
+  later slots). Other T32 groups (wide load/store, data-processing) are
+  still rejected.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/
@@ -134,7 +137,7 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: forty-one test programs, hand-encoded by
+- `tests/test_interp.c`: forty-six test programs, hand-encoded by
   working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why
@@ -177,8 +180,8 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
 
 ## Where to look if you want to help
 
-- 32-bit Thumb (`BL`, `IT`, extra load/store T32), then NEON. Each
-  addition should come with a hand-derived test case the way the
+- Remaining 32-bit Thumb (wide load/store, data-processing), then NEON.
+  Each addition should come with a hand-derived test case the way the
   existing ones work, see `docs/CONTRIBUTING.md`'s testing section.
 - A real trampoline mechanism for `getTrampoline`: it can already find a
   requested symbol in a loaded guest library (`elf32.c`), but the real

@@ -627,6 +627,16 @@ int mango_decode_t16(uint16_t hw, MangoInsn* out) {
       out->w = 1;
       return 0;
     }
+    if ((hw >> 8) == 0xBFu) { /* IT */
+      uint32_t mask = hw & 0xFu;
+      uint32_t firstcond = (hw >> 4) & 0xFu;
+      if (mask == 0 || firstcond == 0xFu) {
+        return -1;
+      }
+      out->op = MANGO_OP_IT;
+      out->imm = (firstcond << 4) | mask; /* 8-bit ITSTATE */
+      return 0;
+    }
     if ((hw >> 9) == 0x5Eu) { /* POP */
       uint32_t list = hw & 0xFFu;
       if ((hw >> 8) & 1u) {
@@ -689,6 +699,110 @@ int mango_decode_t16(uint16_t hw, MangoInsn* out) {
     out->op = MANGO_OP_B;
     out->imm = offset;
     return 0;
+  }
+
+  return -1;
+}
+
+static uint32_t mango_t32_branch_imm25(uint16_t hw1, uint16_t hw2) {
+  uint32_t s = (hw1 >> 10) & 1u;
+  uint32_t j1 = (hw2 >> 13) & 1u;
+  uint32_t j2 = (hw2 >> 11) & 1u;
+  uint32_t i1 = (j1 ^ s) ^ 1u;
+  uint32_t i2 = (j2 ^ s) ^ 1u;
+  uint32_t imm10 = hw1 & 0x3FFu;
+  uint32_t imm11 = hw2 & 0x7FFu;
+  uint32_t imm = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+  if (s) {
+    imm |= 0xFE000000u;
+  }
+  return imm;
+}
+
+static uint32_t mango_t32_bcond_imm(uint16_t hw1, uint16_t hw2) {
+  uint32_t s = (hw1 >> 10) & 1u;
+  uint32_t j1 = (hw2 >> 13) & 1u;
+  uint32_t j2 = (hw2 >> 11) & 1u;
+  uint32_t i1 = (j1 ^ s) ^ 1u;
+  uint32_t i2 = (j2 ^ s) ^ 1u;
+  uint32_t imm6 = hw1 & 0x3Fu;
+  uint32_t imm11 = hw2 & 0x7FFu;
+  uint32_t imm = (s << 20) | (i1 << 19) | (i2 << 18) | (imm6 << 12) | (imm11 << 1);
+  if (s) {
+    imm |= 0xFFE00000u;
+  }
+  return imm;
+}
+
+int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
+  mango_insn_clear(out);
+  out->cond = 0xE;
+
+  /* MOVW: 11110 i 100100 imm4 / 0 imm3 Rd imm8 */
+  if ((hw1 & 0xFBF0u) == 0xF240u && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t imm4 = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->is_imm = 1;
+    out->imm = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+    return 0;
+  }
+
+  /* MOVT: 11110 i 101100 imm4 / 0 imm3 Rd imm8 */
+  if ((hw1 & 0xFBF0u) == 0xF2C0u && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t imm4 = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOVT;
+    out->rd = rd;
+    out->is_imm = 1;
+    out->imm = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+    return 0;
+  }
+
+  if ((hw1 >> 11) == 0x1Eu) {
+    uint32_t b15_14 = hw2 >> 14;
+    uint32_t b12 = (hw2 >> 12) & 1u;
+    if (b15_14 == 3u && b12 == 1u) {
+      out->op = MANGO_OP_BL;
+      out->imm = mango_t32_branch_imm25(hw1, hw2);
+      return 0;
+    }
+    if (b15_14 == 3u && b12 == 0u) {
+      if (hw2 & 1u) {
+        return -1; /* BLX imm H bit must be 0 */
+      }
+      out->op = MANGO_OP_BLX;
+      out->imm = mango_t32_branch_imm25(hw1, hw2);
+      return 0;
+    }
+    if (b15_14 == 2u && b12 == 1u) {
+      out->op = MANGO_OP_B;
+      out->imm = mango_t32_branch_imm25(hw1, hw2);
+      return 0;
+    }
+    if (b15_14 == 2u && b12 == 0u) {
+      uint32_t cond = (hw1 >> 6) & 0xFu;
+      if (cond >= 0xEu) {
+        return -1;
+      }
+      out->op = MANGO_OP_B;
+      out->cond = cond;
+      out->imm = mango_t32_bcond_imm(hw1, hw2);
+      return 0;
+    }
   }
 
   return -1;

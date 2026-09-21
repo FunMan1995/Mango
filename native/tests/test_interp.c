@@ -1715,6 +1715,158 @@ static int test_arm_bx_into_thumb(void) {
   return 0;
 }
 
+static int test_thumb_bl(void) {
+  /* BL at 0 to 8 (imm=4). Return lands at 4. Callee sets r0=42. */
+  static const uint16_t kProg[] = {
+      0xF000u, 0xF802u, /* bl .+8 */
+      0x2101u,          /* mov r1, #1 */
+      0x4710u,          /* bx r2 */
+      0x202Au,          /* mov r0, #42 */
+      0x4770u,          /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[2] = 0xBEEF0000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xBEEF0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_bl): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 42 || cpu.r[1] != 1) {
+    fprintf(stderr, "FAIL(thumb_bl): expected r0=42 r1=1, got r0=%u r1=%u\n", cpu.r[0], cpu.r[1]);
+    return 1;
+  }
+  printf("ok: thumb BL call and return (r0 = %u, r1 = %u)\n", cpu.r[0], cpu.r[1]);
+  return 0;
+}
+
+static int test_thumb_movw_movt(void) {
+  static const uint16_t kProg[] = {
+      0xF241u, 0x2034u, /* movw r0, #0x1234 */
+      0xF6CAu, 0x30CDu, /* movt r0, #0xabcd */
+      0x4770u,          /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 5);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_LR] = 0xCAFE0000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xCAFE0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_movw_movt): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 0xABCD1234u) {
+    fprintf(stderr, "FAIL(thumb_movw_movt): expected r0==0xabcd1234, got 0x%08x\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: thumb MOVW/MOVT (r0 = 0x%08x)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_thumb_it_eq_taken(void) {
+  static const uint16_t kProg[] = {
+      0x4280u, /* cmp r0, r0 */
+      0xBF08u, /* it eq */
+      0x3001u, /* add r0, #1 */
+      0x4770u, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 4);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[0] = 7;
+  cpu.r[MANGO_REG_LR] = 0x11110000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x11110000u, 100);
+  if (rc != 0 || cpu.r[0] != 8) {
+    fprintf(stderr, "FAIL(thumb_it_eq_taken): rc=%d r0=%u, want r0=8\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: thumb IT EQ taken (r0 = %u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_thumb_it_eq_skipped(void) {
+  static const uint16_t kProg[] = {
+      0x2801u, /* cmp r0, #1 */
+      0xBF08u, /* it eq */
+      0x3001u, /* add r0, #1 */
+      0x4770u, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 4);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[0] = 7;
+  cpu.r[MANGO_REG_LR] = 0x22220000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x22220000u, 100);
+  if (rc != 0 || cpu.r[0] != 7) {
+    fprintf(stderr, "FAIL(thumb_it_eq_skipped): rc=%d r0=%u, want r0=7\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: thumb IT EQ skipped (r0 = %u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_thumb_b_w(void) {
+  static const uint16_t kProg[] = {
+      0xF000u, 0xB802u, /* b.w .+8 */
+      0x2001u,          /* mov r0, #1, must skip */
+      0x4770u,          /* bx lr */
+      0x2009u,          /* mov r0, #9 */
+      0x4770u,          /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_LR] = 0x33330000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x33330000u, 100);
+  if (rc != 0 || cpu.r[0] != 9) {
+    fprintf(stderr, "FAIL(thumb_b_w): rc=%d r0=%u, want r0=9\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: thumb B.W (r0 = %u)\n", cpu.r[0]);
+  return 0;
+}
+
 static int test_swp_and_swpb(void) {
   static const uint32_t kProgram[] = {
       0xE3A00011u, /* mov r0, #0x11  (will be overwritten by swp) */
@@ -1809,6 +1961,11 @@ int main(void) {
   failures += test_thumb_mov_add_bx();
   failures += test_thumb_push_pop();
   failures += test_arm_bx_into_thumb();
+  failures += test_thumb_bl();
+  failures += test_thumb_movw_movt();
+  failures += test_thumb_it_eq_taken();
+  failures += test_thumb_it_eq_skipped();
+  failures += test_thumb_b_w();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

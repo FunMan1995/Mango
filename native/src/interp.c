@@ -248,6 +248,29 @@ static void mango_set_nzcv(MangoCpu* cpu, uint32_t flags) {
   cpu->cpsr |= flags;
 }
 
+/* ITSTATE is CPSR[15:10,26:25] packed as an 8-bit firstcond:mask value. */
+static uint32_t mango_get_itstate(uint32_t cpsr) {
+  return (((cpsr >> 10) & 0x3Fu) << 2) | ((cpsr >> 25) & 3u);
+}
+
+static void mango_set_itstate(MangoCpu* cpu, uint32_t it) {
+  cpu->cpsr &= ~((0x3Fu << 10) | (3u << 25));
+  cpu->cpsr |= ((it >> 2) & 0x3Fu) << 10;
+  cpu->cpsr |= (it & 3u) << 25;
+}
+
+static void mango_advance_itstate(MangoCpu* cpu) {
+  uint32_t it = mango_get_itstate(cpu->cpsr);
+  if (it == 0) {
+    return;
+  }
+  if ((it & 7u) == 0) {
+    mango_set_itstate(cpu, 0);
+  } else {
+    mango_set_itstate(cpu, (it & 0xE0u) | ((it & 0x1Fu) << 1));
+  }
+}
+
 static int mango_cond_holds(uint32_t cond, uint32_t cpsr) {
   int n = (cpsr & MANGO_CPSR_N) != 0;
   int z = (cpsr & MANGO_CPSR_Z) != 0;
@@ -307,10 +330,20 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         return -1;
       }
       uint16_t hw = (uint16_t)mango_load_u16_le(mem->bytes + addr);
-      if (mango_decode_t16(hw, &insn) != 0) {
+      if ((hw >> 11) >= 0x1Du) {
+        if (mango_check_half_access(mem, addr + 2u) != 0) {
+          return -1;
+        }
+        uint16_t hw2 = (uint16_t)mango_load_u16_le(mem->bytes + addr + 2u);
+        if (mango_decode_t32(hw, hw2, &insn) != 0) {
+          return -1;
+        }
+        next_addr = addr + 4u;
+      } else if (mango_decode_t16(hw, &insn) != 0) {
         return -1;
+      } else {
+        next_addr = addr + 2u;
       }
-      next_addr = addr + 2u;
     } else {
       if (mango_check_word_access(mem, addr) != 0) {
         return -1;
@@ -321,8 +354,14 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
       next_addr = addr + 4u;
     }
 
+    uint32_t it = mango_get_itstate(cpu->cpsr);
+    uint32_t cond = insn.cond;
+    if (it != 0 && insn.op != MANGO_OP_IT) {
+      cond = (it >> 4) & 0xFu;
+    }
+
     /* condition false = no-op, covers B/BX too, no per-case handling needed */
-    if (mango_cond_holds(insn.cond, cpu->cpsr)) {
+    if (mango_cond_holds(cond, cpu->cpsr)) {
       switch (insn.op) {
         case MANGO_OP_MOV: {
           MangoOp2 op2 = mango_eval_operand2(cpu, addr, &insn);
@@ -479,8 +518,27 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_BL:
-          cpu->r[MANGO_REG_LR] = addr + 4u;
-          next_addr = addr + 8u + insn.imm;
+          if (cpu->cpsr & MANGO_CPSR_T) {
+            cpu->r[MANGO_REG_LR] = (addr + 4u) | 1u;
+            next_addr = addr + 4u + insn.imm;
+          } else {
+            cpu->r[MANGO_REG_LR] = addr + 4u;
+            next_addr = addr + 8u + insn.imm;
+          }
+          break;
+
+        case MANGO_OP_BLX:
+          cpu->r[MANGO_REG_LR] = (addr + 4u) | 1u;
+          cpu->cpsr &= ~MANGO_CPSR_T;
+          next_addr = ((addr + 4u) & ~3u) + insn.imm;
+          break;
+
+        case MANGO_OP_MOVT:
+          cpu->r[insn.rd] = (cpu->r[insn.rd] & 0xFFFFu) | (insn.imm << 16);
+          break;
+
+        case MANGO_OP_IT:
+          mango_set_itstate(cpu, insn.imm);
           break;
 
         case MANGO_OP_BX: {
@@ -673,6 +731,10 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         default:
           return -1;
       }
+    }
+
+    if (it != 0 && insn.op != MANGO_OP_IT) {
+      mango_advance_itstate(cpu);
     }
 
     addr = next_addr;
