@@ -17,9 +17,13 @@ synthetic programs, not real app code yet.
   ARM ALU opcodes), `MUL` and `MLA` (PC operands and MUL's non-zero Ra
   field are rejected rather than misdecoded), `B`, `BL`, `BX`,
   `LDR`/`STR`/`LDRB`/`STRB` (immediate or register offset, pre-index with
-  optional writeback, and post-index; `LDRB` zero-extends, there's no
-  signed byte load; `LDRT`/`STRT`, writeback into PC, `LDR` writeback
-  into the same register as the dest, and `LDR`/`STR` of PC are rejected),
+  optional writeback, and post-index; `LDRB` zero-extends; `LDRT`/`STRT`,
+  writeback into PC, `LDR` writeback into the same register as the dest,
+  and `LDR`/`STR` of PC are rejected), extra load/store `LDRH`/`STRH`/
+  `LDRSB`/`LDRSH` (8-bit immediate or unshifted register offset, same
+  pre/post/writeback rules; halfword accesses are 2-byte aligned;
+  `LDRD`/`STRD` are rejected), `SWP`/`SWPB` (PC operands and Rn overlapping
+  Rt/Rm are rejected),
   and `LDM`/`STM` including the `PUSH`/`POP`
   aliases (`STMDB sp!` / `LDMIA sp!`). Block transfers cover all four
   addressing modes (IA/IB/DA/DB) with optional writeback. Lowest-numbered
@@ -53,13 +57,14 @@ synthetic programs, not real app code yet.
   instruction address + 8" per real hardware semantics, which matters for
   the very common `LDR Rd, [PC, #imm]` literal-pool pattern. This is
   genuinely a subset, real apps will use far more of the ISA (Thumb-2,
-  signed byte/halfword loads, NEON, and so on all still need doing).
+  `LDRD`/`STRD`, NEON, and so on all still need doing).
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
-  Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDM`/`STM` is
-  bounds-checked (word accesses are also alignment-checked, byte ones
-  aren't since any address is a valid byte offset); out of range fails
-  the run rather than reading or writing past the buffer, and there are
+  Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/
+  `LDRSH`/`SWP`/`LDM`/`STM` is bounds-checked (word accesses are 4-byte
+  aligned, halfword ones 2-byte aligned, byte ones aren't since any
+  address is a valid byte offset); out of range fails the run rather
+  than reading or writing past the buffer, and there are
   tests specifically proving that (not just asserting it in a comment),
   see `docs/SECURITY.md` for why that's the priority here.
 - `mango_interp_run` takes a `stop_addr` now, not just `max_steps`: it
@@ -121,19 +126,21 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: thirty-one test programs, hand-encoded by
+- `tests/test_interp.c`: thirty-seven test programs, hand-encoded by
   working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why
   that second encoder exists; `encode_ldm_stm` / `encode_ldst` /
-  `encode_mla` in the test file are the same idea). All pass under
+  `encode_mla` / `encode_extra_ldst` in the test file are the same
+  idea). All pass under
   `-Wall -Wextra -Werror -fsanitize=address,undefined`, including two
   negative tests that specifically try an out-of-bounds and a misaligned
   `LDR` and check they're rejected, not just that the happy path works,
   an out-of-bounds `STM`, rejected `LDM`/`STM` shapes (empty list, S-bit,
   STM of PC, writeback with Rn in the list, PC as base), rejected
   `LDRT` / writeback-into-PC / `LDR` writeback into the same dest /
-  `LSL pc`, and `S=0` `TST`/`TEQ`/`CMP`/`CMN` shapes. Earlier rounds of
+  `LSL pc`, `LDRD`/`STRD`, a misaligned `LDRH`, and `S=0`
+  `TST`/`TEQ`/`CMP`/`CMN` shapes. Earlier rounds of
   this (the `BX` mask-width bug) caught real bugs during development,
   which is exactly the kind of mistake this subset of the project is
   prone to; more test cases from more people is how this gets more
@@ -162,10 +169,9 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
 
 ## Where to look if you want to help
 
-- More A32 instructions: signed/halfword extra loads (`LDRH`/`LDRSH`/
-  `LDRSB`/`STRH`), `SWP`, then Thumb-2. Each addition should come with a
-  hand-derived test case the way the existing ones work, see
-  `docs/CONTRIBUTING.md`'s testing section.
+- More A32 instructions: `LDRD`/`STRD`, then Thumb-2. Each addition
+  should come with a hand-derived test case the way the existing ones
+  work, see `docs/CONTRIBUTING.md`'s testing section.
 - A real trampoline mechanism for `getTrampoline`: it can already find a
   requested symbol in a loaded guest library (`elf32.c`), but the real
   blocker is deeper than "generate a trampoline". A JNI native method's

@@ -1356,6 +1356,252 @@ static int test_ldst_rejected_shapes(void) {
   return 0;
 }
 
+/* Extra load/store: bits 27-25=000, bit7=bit4=1. i is bit 22 (1=imm). */
+static uint32_t encode_extra_ldst(int p, int u, int i, int w, int l, uint32_t rn, uint32_t rt,
+                                  int s, int h, uint32_t imm8_or_rm) {
+  uint32_t hi = i ? ((imm8_or_rm >> 4) & 0xFu) : 0u;
+  uint32_t lo = imm8_or_rm & 0xFu;
+  return 0xE0000000u | ((uint32_t)p << 24) | ((uint32_t)u << 23) | ((uint32_t)i << 22) |
+         ((uint32_t)w << 21) | ((uint32_t)l << 20) | ((rn & 0xFu) << 16) | ((rt & 0xFu) << 12) |
+         (hi << 8) | (1u << 7) | ((uint32_t)s << 6) | ((uint32_t)h << 5) | (1u << 4) | lo;
+}
+
+static int test_ldrh_strh_roundtrip(void) {
+  uint32_t strh = encode_extra_ldst(1, 1, 1, 0, 0, 1, 0, 0, 1, 4); /* strh r0, [r1, #4] */
+  uint32_t ldrh = encode_extra_ldst(1, 1, 1, 0, 1, 1, 2, 0, 1, 4); /* ldrh r2, [r1, #4] */
+  if (strh != 0xE1C100B4u || ldrh != 0xE1D120B4u) {
+    fprintf(stderr, "FAIL(ldrh_strh_roundtrip): encoder mismatch strh=0x%08x ldrh=0x%08x\n", strh,
+            ldrh);
+    return 1;
+  }
+
+  /* Neighbor bytes must stay 0, proving STRH writes two bytes not four. */
+  static const uint32_t kProg[] = {
+      0xE3A000ABu, /* mov r0, #0xAB */
+      0xE3A01040u, /* mov r1, #64 */
+      0xE1C100B4u, /* strh r0, [r1, #4] */
+      0xE3A02000u, /* mov r2, #0 */
+      0xE1D120B4u, /* ldrh r2, [r1, #4] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProg, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xA1A1u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xA1A1u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(ldrh_strh_roundtrip): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[2] != 0xABu) {
+    fprintf(stderr, "FAIL(ldrh_strh_roundtrip): expected r2==0xab, got 0x%x\n", cpu.r[2]);
+    return 1;
+  }
+  if (mem_buf[68] != 0xAB || mem_buf[69] != 0 || mem_buf[70] != 0 || mem_buf[71] != 0) {
+    fprintf(stderr, "FAIL(ldrh_strh_roundtrip): strh wrote more than two bytes\n");
+    return 1;
+  }
+  printf("ok: strh + ldrh round trip, zero-extended (r2 = %u)\n", cpu.r[2]);
+  return 0;
+}
+
+static int test_ldrsb_ldrsh_sign_extend(void) {
+  uint32_t ldrsb = encode_extra_ldst(1, 1, 1, 0, 1, 1, 0, 1, 0, 0); /* ldrsb r0, [r1] */
+  uint32_t ldrsh = encode_extra_ldst(1, 1, 1, 0, 1, 1, 2, 1, 1, 2); /* ldrsh r2, [r1, #2] */
+  if (ldrsb != 0xE1D100D0u || ldrsh != 0xE1D120F2u) {
+    fprintf(stderr, "FAIL(ldrsb_ldrsh_sign_extend): encoder mismatch\n");
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A01040u, /* mov r1, #64 */
+      0xE1D100D0u, /* ldrsb r0, [r1] */
+      0xE1D120F2u, /* ldrsh r2, [r1, #2] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 4);
+  mem_buf[64] = 0xAB; /* signed byte -85 */
+  mem_buf[66] = 0x00;
+  mem_buf[67] = 0x80; /* halfword 0x8000, little-endian */
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xB2B2u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xB2B2u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(ldrsb_ldrsh_sign_extend): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 0xFFFFFFABu) {
+    fprintf(stderr, "FAIL(ldrsb_ldrsh_sign_extend): expected r0==0xffffffab, got 0x%08x\n",
+            cpu.r[0]);
+    return 1;
+  }
+  if (cpu.r[2] != 0xFFFF8000u) {
+    fprintf(stderr, "FAIL(ldrsb_ldrsh_sign_extend): expected r2==0xffff8000, got 0x%08x\n",
+            cpu.r[2]);
+    return 1;
+  }
+  printf("ok: ldrsb/ldrsh sign-extend (r0=0x%08x, r2=0x%08x)\n", cpu.r[0], cpu.r[2]);
+  return 0;
+}
+
+static int test_extra_ldst_writeback_and_reg_offset(void) {
+  uint32_t strh_wb = encode_extra_ldst(1, 1, 1, 1, 0, 1, 0, 0, 1, 4);  /* strh r0, [r1, #4]! */
+  uint32_t ldrh_reg = encode_extra_ldst(1, 1, 0, 0, 1, 1, 2, 0, 1, 2); /* ldrh r2, [r1, r2] */
+  if (strh_wb != 0xE1E100B4u || ldrh_reg != 0xE19120B2u) {
+    fprintf(stderr, "FAIL(extra_ldst_writeback): encoder mismatch wb=0x%08x reg=0x%08x\n", strh_wb,
+            ldrh_reg);
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A000AAu, /* mov r0, #0xAA */
+      0xE3A01040u, /* mov r1, #64 */
+      0xE1E100B4u, /* strh r0, [r1, #4]! */
+      0xE3A02000u, /* mov r2, #0  — then we need r2=0 as offset from new r1? */
+      0xE19120B2u, /* ldrh r2, [r1, r2]  r1=68, r2=0 => load mem[68] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xC3C3u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xC3C3u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(extra_ldst_writeback): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[1] != 68 || cpu.r[2] != 0xAAu) {
+    fprintf(stderr, "FAIL(extra_ldst_writeback): expected r1=68 r2=0xaa, got r1=%u r2=0x%x\n",
+            cpu.r[1], cpu.r[2]);
+    return 1;
+  }
+  printf("ok: strh writeback and ldrh register offset\n");
+  return 0;
+}
+
+static int test_ldrh_misaligned_rejected(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A01041u, /* mov r1, #65 */
+      0xE1D100B0u, /* ldrh r0, [r1] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xFFFFFFFFu, 100);
+  if (rc == 0) {
+    fprintf(stderr, "FAIL(ldrh_misaligned_rejected): expected a failure, got success\n");
+    return 1;
+  }
+  printf("ok: misaligned ldrh correctly rejected\n");
+  return 0;
+}
+
+static int test_extra_ldst_rejected_shapes(void) {
+  MangoInsn insn;
+  uint32_t ldrd = encode_extra_ldst(1, 1, 1, 0, 0, 1, 0, 1, 0, 0); /* ldrd r0, [r1] */
+  if (mango_decode(ldrd, &insn) == 0) {
+    fprintf(stderr, "FAIL(extra_ldst_rejected_shapes): ldrd was decoded\n");
+    return 1;
+  }
+  uint32_t strd = encode_extra_ldst(1, 1, 1, 0, 0, 1, 0, 1, 1, 0); /* strd r0, [r1] */
+  if (mango_decode(strd, &insn) == 0) {
+    fprintf(stderr, "FAIL(extra_ldst_rejected_shapes): strd was decoded\n");
+    return 1;
+  }
+  uint32_t wb_pc = encode_extra_ldst(1, 1, 1, 1, 1, MANGO_REG_PC, 0, 0, 1, 4);
+  if (mango_decode(wb_pc, &insn) == 0) {
+    fprintf(stderr, "FAIL(extra_ldst_rejected_shapes): ldrh writeback into pc was decoded\n");
+    return 1;
+  }
+  printf("ok: ldrd/strd/ldrh-writeback-pc shapes rejected\n");
+  return 0;
+}
+
+static int test_swp_and_swpb(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A00011u, /* mov r0, #0x11  (will be overwritten by swp) */
+      0xE3A01022u, /* mov r1, #0x22 */
+      0xE3A02040u, /* mov r2, #64 */
+      0xE1020091u, /* swp r0, r1, [r2] */
+      0xE3A03033u, /* mov r3, #0x33 */
+      0xE1423091u, /* swpb r3, r1, [r2] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 7);
+  mem_buf[64] = 0x44;
+  mem_buf[65] = 0x55;
+  mem_buf[66] = 0x66;
+  mem_buf[67] = 0x77; /* word 0x77665544 */
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xD4D4u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xD4D4u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(swp_and_swpb): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 0x77665544u) {
+    fprintf(stderr, "FAIL(swp_and_swpb): expected r0==0x77665544 after swp, got 0x%08x\n",
+            cpu.r[0]);
+    return 1;
+  }
+  /* After swp, mem is 0x00000022 (r1). Then swpb stores r1's low byte 0x22
+   * again and r3 gets the low byte that was there, 0x22. */
+  if (cpu.r[3] != 0x22u) {
+    fprintf(stderr, "FAIL(swp_and_swpb): expected r3==0x22 after swpb, got 0x%x\n", cpu.r[3]);
+    return 1;
+  }
+  if (mem_buf[64] != 0x22 || mem_buf[65] != 0 || mem_buf[66] != 0 || mem_buf[67] != 0) {
+    fprintf(stderr, "FAIL(swp_and_swpb): memory after swp/swpb is %02x %02x %02x %02x\n",
+            mem_buf[64], mem_buf[65], mem_buf[66], mem_buf[67]);
+    return 1;
+  }
+  printf("ok: swp and swpb (r0=0x%08x, r3=0x%x)\n", cpu.r[0], cpu.r[3]);
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -1389,6 +1635,12 @@ int main(void) {
   failures += test_register_specified_shift();
   failures += test_shifter_carry_and_rrx();
   failures += test_ldst_rejected_shapes();
+  failures += test_ldrh_strh_roundtrip();
+  failures += test_ldrsb_ldrsh_sign_extend();
+  failures += test_extra_ldst_writeback_and_reg_offset();
+  failures += test_ldrh_misaligned_rejected();
+  failures += test_extra_ldst_rejected_shapes();
+  failures += test_swp_and_swpb();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

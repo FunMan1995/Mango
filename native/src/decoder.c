@@ -76,6 +76,91 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
+  /* SWP/SWPB: cond 00010 B 00 Rn Rt SBZ 1001 Rm. Bits 7-4 match MUL, but
+   * bits 27-23 are 00010 rather than MUL's 00000. */
+  if (((word >> 23) & 0x1F) == 0x02 && ((word >> 20) & 0x3) == 0x0 && ((word >> 4) & 0xF) == 0x9) {
+    uint32_t b = (word >> 22) & 0x1;
+    uint32_t rn = (word >> 16) & 0xF;
+    uint32_t rt = (word >> 12) & 0xF;
+    uint32_t sbz = (word >> 8) & 0xF;
+    uint32_t rm = word & 0xF;
+    if (sbz != 0 || rn == MANGO_REG_PC || rt == MANGO_REG_PC || rm == MANGO_REG_PC || rt == rn ||
+        rm == rn) {
+      return -1; /* SBZ, PC, or Rn overlapping Rt/Rm are all UNPREDICTABLE */
+    }
+    out->op = MANGO_OP_SWP;
+    out->rn = rn;
+    out->rd = rt;
+    out->rm = rm;
+    out->b = (int)b;
+    return 0;
+  }
+
+  /* Extra load/store: bits 27-25=000, bits 7 and 4 set, bits 6-5 != 00
+   * (00 would be MUL/SWP, already handled). Bit 22 is I here (1=imm),
+   * inverted from the regular LDR/STR I-bit. */
+  if (((word >> 25) & 0x7) == 0x0 && ((word >> 7) & 0x1) == 1 && ((word >> 4) & 0x1) == 1 &&
+      ((word >> 5) & 0x3) != 0) {
+    uint32_t p = (word >> 24) & 0x1;
+    uint32_t u = (word >> 23) & 0x1;
+    uint32_t i = (word >> 22) & 0x1;
+    uint32_t w = (word >> 21) & 0x1;
+    uint32_t l = (word >> 20) & 0x1;
+    uint32_t rn = (word >> 16) & 0xF;
+    uint32_t rt = (word >> 12) & 0xF;
+    uint32_t s = (word >> 6) & 0x1;
+    uint32_t h = (word >> 5) & 0x1;
+    int writeback = (!p || w) ? 1 : 0;
+    MangoOp op;
+
+    if (!p && w) {
+      return -1; /* unprivileged extra T-form, UNPREDICTABLE in this encoding */
+    }
+    if (rt == MANGO_REG_PC) {
+      return -1;
+    }
+    if (writeback && (rn == MANGO_REG_PC || (l && rt == rn))) {
+      return -1;
+    }
+    if (!l && s) {
+      return -1; /* LDRD/STRD, not in this subset */
+    }
+    if (l && !s && h) {
+      op = MANGO_OP_LDRH;
+    } else if (!l && !s && h) {
+      op = MANGO_OP_STRH;
+    } else if (l && s && !h) {
+      op = MANGO_OP_LDRSB;
+    } else if (l && s && h) {
+      op = MANGO_OP_LDRSH;
+    } else {
+      return -1;
+    }
+
+    out->op = op;
+    out->rn = rn;
+    out->rd = rt;
+    out->u = (int)u;
+    out->p = (int)p;
+    out->w = writeback;
+
+    if (i) {
+      out->is_imm = 1;
+      out->imm = (((word >> 8) & 0xF) << 4) | (word & 0xF);
+    } else {
+      if (((word >> 8) & 0xF) != 0) {
+        return -1; /* register form's bits 11-8 are SBZ */
+      }
+      uint32_t rm = word & 0xF;
+      if (rm == MANGO_REG_PC) {
+        return -1; /* Rm=PC is UNPREDICTABLE for extra load/store */
+      }
+      out->is_imm = 0;
+      out->rm = rm;
+    }
+    return 0;
+  }
+
   /* Data-processing: bits 27-26 == 00 */
   if (((word >> 26) & 0x3) == 0x0) {
     uint32_t i = (word >> 25) & 0x1;

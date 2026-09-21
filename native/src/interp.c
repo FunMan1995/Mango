@@ -28,6 +28,29 @@ static int mango_check_byte_access(const MangoMemory* mem, uint32_t addr) {
   return addr < mem->size ? 0 : -1;
 }
 
+static uint32_t mango_load_u16_le(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+}
+
+static void mango_store_u16_le(uint8_t* p, uint32_t v) {
+  p[0] = (uint8_t)(v & 0xFFu);
+  p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static int mango_check_half_access(const MangoMemory* mem, uint32_t addr) {
+  if ((addr % 2u) != 0) {
+    return -1;
+  }
+  if ((uint64_t)addr + 2u > mem->size) {
+    return -1;
+  }
+  return 0;
+}
+
+static uint32_t mango_sign_extend8(uint32_t b) { return (b & 0x80u) ? (b | 0xFFFFFF00u) : b; }
+
+static uint32_t mango_sign_extend16(uint32_t h) { return (h & 0x8000u) ? (h | 0xFFFF0000u) : h; }
+
 /* Real hardware: reading PC as an operand gives addr+8, not cpu->r[15]. */
 static uint32_t mango_read_reg(const MangoCpu* cpu, uint32_t insn_addr, uint32_t reg) {
   if (reg == MANGO_REG_PC) {
@@ -472,6 +495,60 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           }
           if (insn.w) {
             cpu->r[insn.rn] = wbaddr;
+          }
+          break;
+        }
+
+        case MANGO_OP_LDRH:
+        case MANGO_OP_STRH:
+        case MANGO_OP_LDRSB:
+        case MANGO_OP_LDRSH: {
+          /* Extra load/store: Rm is never shifted, unlike regular LDR/STR. */
+          uint32_t offset = insn.is_imm ? insn.imm : mango_read_reg(cpu, addr, insn.rm);
+          uint32_t base = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t wbaddr = insn.u ? base + offset : base - offset;
+          uint32_t eaddr = insn.p ? wbaddr : base;
+
+          if (insn.op == MANGO_OP_LDRSB) {
+            if (mango_check_byte_access(mem, eaddr) != 0) {
+              return -1;
+            }
+            cpu->r[insn.rd] = mango_sign_extend8(mem->bytes[eaddr]);
+          } else {
+            if (mango_check_half_access(mem, eaddr) != 0) {
+              return -1;
+            }
+            if (insn.op == MANGO_OP_STRH) {
+              mango_store_u16_le(mem->bytes + eaddr, cpu->r[insn.rd]);
+            } else if (insn.op == MANGO_OP_LDRH) {
+              cpu->r[insn.rd] = mango_load_u16_le(mem->bytes + eaddr);
+            } else {
+              cpu->r[insn.rd] = mango_sign_extend16(mango_load_u16_le(mem->bytes + eaddr));
+            }
+          }
+          if (insn.w) {
+            cpu->r[insn.rn] = wbaddr;
+          }
+          break;
+        }
+
+        case MANGO_OP_SWP: {
+          uint32_t eaddr = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t store_val = mango_read_reg(cpu, addr, insn.rm);
+          if (insn.b) {
+            if (mango_check_byte_access(mem, eaddr) != 0) {
+              return -1;
+            }
+            uint32_t loaded = mem->bytes[eaddr];
+            mem->bytes[eaddr] = (uint8_t)(store_val & 0xFFu);
+            cpu->r[insn.rd] = loaded;
+          } else {
+            if (mango_check_word_access(mem, eaddr) != 0) {
+              return -1;
+            }
+            uint32_t loaded = mango_load_u32_le(mem->bytes + eaddr);
+            mango_store_u32_le(mem->bytes + eaddr, store_val);
+            cpu->r[insn.rd] = loaded;
           }
           break;
         }
