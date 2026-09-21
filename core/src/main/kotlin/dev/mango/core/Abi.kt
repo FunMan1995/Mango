@@ -4,6 +4,7 @@ package dev.mango.core
 enum class Abi(
     val libDir: String,
 ) {
+    ARMEABI("armeabi"),
     ARMEABI_V7A("armeabi-v7a"),
     ARM64_V8A("arm64-v8a"),
     X86("x86"),

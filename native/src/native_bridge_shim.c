@@ -122,6 +122,8 @@ static void* mango_load_library(const char* libpath, int flag) {
   return lib;
 }
 
+static void* mango_generic_jni_stub(JNIEnv* env, jobject thiz, ...);
+
 static void* mango_get_trampoline(void* handle, const char* name, const char* shorty,
                                   uint32_t len) {
   (void)shorty;
@@ -131,12 +133,21 @@ static void* mango_get_trampoline(void* handle, const char* name, const char* sh
   if (addr == 0) {
     return NULL; /* not exported by this library at all */
   }
-  /* addr is real now, an offset into lib->guest_mem ready for
-   * mango_interp_run. What's still missing: something ART can actually
-   * CALL as a normal AArch64 function pointer that marshals its real JNI
-   * arguments/return value and drives the interpreter underneath, a
-   * generated trampoline (or a libffi closure), not written yet. */
+  /* Guest PC is real (offset into lib->guest_mem). ART needs an AArch64
+   * function pointer it can call as a JNI native method. A per-shorty
+   * generated stub that drives mango_interp_run is still TODO; until then
+   * every resolved symbol shares one inert stub so ART can bind natives
+   * without treating the bridge as missing. */
   (void)addr;
+  (void)lib;
+  return (void*)(uintptr_t)mango_generic_jni_stub;
+}
+
+/* JNI native methods are called as (JNIEnv*, jobject, ...). Extra args are
+ * ignored; return 0 / NULL. Guest execution is not wired through here yet. */
+static void* mango_generic_jni_stub(JNIEnv* env, jobject thiz, ...) {
+  (void)env;
+  (void)thiz;
   return NULL;
 }
 
@@ -187,7 +198,9 @@ static int mango_unload_library(void* handle) {
  * rather than inventing detail we don't actually have. */
 static const char* mango_get_error(void) { return "mango: no detailed error reporting yet"; }
 
-static bool mango_is_path_supported(const char* library_path) { return mango_is_arm32_elf(library_path); }
+static bool mango_is_path_supported(const char* library_path) {
+  return mango_is_arm32_elf(library_path);
+}
 
 /* We don't do real linker-level namespace isolation (loadLibrary/
  * loadLibraryExt both just parse and load the guest .so directly, see
@@ -205,9 +218,8 @@ static bool mango_init_anonymous_namespace(const char* public_ns_sonames,
 /* Not a real namespace object, just a distinct non-null token so callers
  * that check for NULL-on-failure don't treat this as having failed. */
 static struct native_bridge_namespace_t* mango_create_namespace(
-    const char* name, const char* ld_library_path, const char* default_library_path,
-    uint64_t type, const char* permitted_when_isolated_path,
-    struct native_bridge_namespace_t* parent_ns) {
+    const char* name, const char* ld_library_path, const char* default_library_path, uint64_t type,
+    const char* permitted_when_isolated_path, struct native_bridge_namespace_t* parent_ns) {
   (void)name;
   (void)ld_library_path;
   (void)default_library_path;

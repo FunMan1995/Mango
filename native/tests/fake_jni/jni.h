@@ -14,6 +14,7 @@
 
 typedef struct JNIEnv JNIEnv;
 typedef void* jclass;
+typedef void* jobject;
 typedef void* jmethodID;
 typedef struct {
   const char* name;

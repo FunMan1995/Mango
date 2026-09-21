@@ -35,7 +35,10 @@ object CompatibilityChecker {
 
         val is32BitOnly =
             apk.abisPresent.isNotEmpty() &&
-                apk.abisPresent.all { it == Abi.ARMEABI_V7A || it == Abi.X86 }
+                apk.abisPresent.all {
+                    it == Abi.ARMEABI || it == Abi.ARMEABI_V7A || it == Abi.X86
+                } &&
+                apk.abisPresent.any { it == Abi.ARMEABI || it == Abi.ARMEABI_V7A }
 
         if (!is32BitOnly) {
             return CompatibilityReport(

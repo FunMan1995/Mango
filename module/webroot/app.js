@@ -50,6 +50,7 @@ async function run(cmd) {
 }
 
 /* Mirrors CompatibilityChecker.kt by hand, see docs/ARCHITECTURE.md. */
+const ARMEABI = 'armeabi';
 const ARMEABI_V7A = 'armeabi-v7a';
 const X86 = 'x86';
 
@@ -66,7 +67,9 @@ function checkCompatibility(abisPresent, supportedAbis, bridgeActive) {
       notes: ['Already ships a native ABI this device supports directly.'],
     };
   }
-  const is32BitOnly = abisPresent.every((abi) => abi === ARMEABI_V7A || abi === X86);
+  const is32BitOnly =
+    abisPresent.every((abi) => abi === ARMEABI || abi === ARMEABI_V7A || abi === X86) &&
+    abisPresent.some((abi) => abi === ARMEABI || abi === ARMEABI_V7A);
   if (!is32BitOnly) {
     return {
       verdict: 'BLOCKED',

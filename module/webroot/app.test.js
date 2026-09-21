@@ -51,6 +51,16 @@ test('checkCompatibility: 32-bit-only with the bridge active needs the bridge', 
   assert.equal(report.verdict, 'NEEDS_BRIDGE');
 });
 
+test('checkCompatibility: armeabi-only with the bridge active needs the bridge', () => {
+  const report = checkCompatibility(['armeabi'], ['arm64-v8a'], true);
+  assert.equal(report.verdict, 'NEEDS_BRIDGE');
+});
+
+test('checkCompatibility: x86-only is not an ARM guest', () => {
+  const report = checkCompatibility(['x86'], ['arm64-v8a'], true);
+  assert.equal(report.verdict, 'BLOCKED');
+});
+
 test('checkCompatibility: 32-bit-only without the bridge is blocked', () => {
   const report = checkCompatibility(['armeabi-v7a'], ['arm64-v8a'], false);
   assert.equal(report.verdict, 'BLOCKED');
