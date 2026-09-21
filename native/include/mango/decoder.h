@@ -35,6 +35,8 @@ typedef enum MangoOp {
   MANGO_OP_STRH,
   MANGO_OP_LDRSB,
   MANGO_OP_LDRSH,
+  MANGO_OP_LDRD,
+  MANGO_OP_STRD,
   MANGO_OP_SWP,
   MANGO_OP_LDM,
   MANGO_OP_STM,
@@ -63,5 +65,8 @@ typedef struct MangoInsn {
 /* 0 and fills *out on success, -1 for anything outside native/README.md's
  * documented subset. */
 int mango_decode(uint32_t word, MangoInsn* out);
+
+/* Thumb-16. 32-bit Thumb encodings (BL, many ALU/load forms) return -1. */
+int mango_decode_t16(uint16_t hw, MangoInsn* out);
 
 #endif /* MANGO_DECODER_H_ */

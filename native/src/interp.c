@@ -51,12 +51,20 @@ static uint32_t mango_sign_extend8(uint32_t b) { return (b & 0x80u) ? (b | 0xFFF
 
 static uint32_t mango_sign_extend16(uint32_t h) { return (h & 0x8000u) ? (h | 0xFFFF0000u) : h; }
 
-/* Real hardware: reading PC as an operand gives addr+8, not cpu->r[15]. */
+/* Real hardware: reading PC as an operand gives addr+8 in A32, addr+4 in T16. */
 static uint32_t mango_read_reg(const MangoCpu* cpu, uint32_t insn_addr, uint32_t reg) {
   if (reg == MANGO_REG_PC) {
-    return insn_addr + 8u;
+    return insn_addr + ((cpu->cpsr & MANGO_CPSR_T) ? 4u : 8u);
   }
   return cpu->r[reg];
+}
+
+/* T16 ADR and LDR-literal: (PC + 4) AND NOT 3. High-register ADD Rd, PC does not. */
+static uint32_t mango_thumb_align_pc(const MangoCpu* cpu, const MangoInsn* insn, uint32_t value) {
+  if ((cpu->cpsr & MANGO_CPSR_T) && insn->rn == MANGO_REG_PC && insn->is_imm) {
+    return value & ~3u;
+  }
+  return value;
 }
 
 typedef struct MangoOp2 {
@@ -289,16 +297,29 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
     if (addr == stop_addr) {
       return 0;
     }
-    if (mango_check_word_access(mem, addr) != 0) {
-      return -1;
-    }
 
+    int thumb = (cpu->cpsr & MANGO_CPSR_T) != 0;
     MangoInsn insn;
-    if (mango_decode(mango_load_u32_le(mem->bytes + addr), &insn) != 0) {
-      return -1;
-    }
+    uint32_t next_addr;
 
-    uint32_t next_addr = addr + 4u;
+    if (thumb) {
+      if ((addr % 2u) != 0 || mango_check_half_access(mem, addr) != 0) {
+        return -1;
+      }
+      uint16_t hw = (uint16_t)mango_load_u16_le(mem->bytes + addr);
+      if (mango_decode_t16(hw, &insn) != 0) {
+        return -1;
+      }
+      next_addr = addr + 2u;
+    } else {
+      if (mango_check_word_access(mem, addr) != 0) {
+        return -1;
+      }
+      if (mango_decode(mango_load_u32_le(mem->bytes + addr), &insn) != 0) {
+        return -1;
+      }
+      next_addr = addr + 4u;
+    }
 
     /* condition false = no-op, covers B/BX too, no per-case handling needed */
     if (mango_cond_holds(insn.cond, cpu->cpsr)) {
@@ -353,7 +374,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
 
         case MANGO_OP_ADD: {
           uint32_t rhs = mango_eval_operand2(cpu, addr, &insn).value;
-          uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t lhs = mango_thumb_align_pc(cpu, &insn, mango_read_reg(cpu, addr, insn.rn));
           uint32_t result = lhs + rhs;
           cpu->r[insn.rd] = result;
           if (insn.sets_flags) {
@@ -451,18 +472,32 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         case MANGO_OP_SVC:
           return 1; /* cpu->r[PC] == addr still, caller thunks r7/r0-r6 and resumes, see interp.h */
 
-        case MANGO_OP_B:
-          next_addr = addr + 8u + insn.imm; /* PC reads as addr+8 */
+        case MANGO_OP_B: {
+          uint32_t pc_off = (cpu->cpsr & MANGO_CPSR_T) ? 4u : 8u;
+          next_addr = addr + pc_off + insn.imm;
           break;
+        }
 
         case MANGO_OP_BL:
           cpu->r[MANGO_REG_LR] = addr + 4u;
           next_addr = addr + 8u + insn.imm;
           break;
 
-        case MANGO_OP_BX:
-          next_addr = cpu->r[insn.rm];
+        case MANGO_OP_BX: {
+          uint32_t dest = cpu->r[insn.rm];
+          /* Odd stop-sentinels must stay equal to LR so a BX LR halt still
+           * matches before fetch. Even stops (and any real target) interwork. */
+          if (dest == stop_addr && (dest & 1u)) {
+            next_addr = dest;
+          } else if (dest & 1u) {
+            cpu->cpsr |= MANGO_CPSR_T;
+            next_addr = dest & ~1u;
+          } else {
+            cpu->cpsr &= ~MANGO_CPSR_T;
+            next_addr = dest;
+          }
           break;
+        }
 
         case MANGO_OP_LDR:
         case MANGO_OP_STR: {
@@ -470,7 +505,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             return -1; /* indirect branch via LDR PC, not supported yet */
           }
           uint32_t offset = insn.is_imm ? insn.imm : mango_eval_operand2(cpu, addr, &insn).value;
-          uint32_t base = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t base = mango_thumb_align_pc(cpu, &insn, mango_read_reg(cpu, addr, insn.rn));
           uint32_t wbaddr = insn.u ? base + offset : base - offset;
           uint32_t eaddr = insn.p ? wbaddr : base;
 
@@ -532,6 +567,29 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
         }
 
+        case MANGO_OP_LDRD:
+        case MANGO_OP_STRD: {
+          uint32_t offset = insn.is_imm ? insn.imm : mango_read_reg(cpu, addr, insn.rm);
+          uint32_t base = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t wbaddr = insn.u ? base + offset : base - offset;
+          uint32_t eaddr = insn.p ? wbaddr : base;
+          if (mango_check_word_access(mem, eaddr) != 0 ||
+              mango_check_word_access(mem, eaddr + 4u) != 0) {
+            return -1;
+          }
+          if (insn.op == MANGO_OP_STRD) {
+            mango_store_u32_le(mem->bytes + eaddr, cpu->r[insn.rd]);
+            mango_store_u32_le(mem->bytes + eaddr + 4u, cpu->r[insn.rd + 1u]);
+          } else {
+            cpu->r[insn.rd] = mango_load_u32_le(mem->bytes + eaddr);
+            cpu->r[insn.rd + 1u] = mango_load_u32_le(mem->bytes + eaddr + 4u);
+          }
+          if (insn.w) {
+            cpu->r[insn.rn] = wbaddr;
+          }
+          break;
+        }
+
         case MANGO_OP_SWP: {
           uint32_t eaddr = mango_read_reg(cpu, addr, insn.rn);
           uint32_t store_val = mango_read_reg(cpu, addr, insn.rm);
@@ -586,8 +644,15 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               mango_store_u32_le(mem->bytes + eaddr, mango_read_reg(cpu, addr, i));
             } else if (i == MANGO_REG_PC) {
               uint32_t value = mango_load_u32_le(mem->bytes + eaddr);
-              if ((value & 3u) != 0) {
-                return -1; /* Thumb or unaligned ARM PC, not in this subset */
+              if (value == stop_addr && (value & 1u)) {
+                /* odd sentinel: keep the exact value so the run stops */
+              } else if (value & 1u) {
+                cpu->cpsr |= MANGO_CPSR_T;
+                value &= ~1u;
+              } else if (value & 2u) {
+                return -1; /* unaligned ARM PC */
+              } else {
+                cpu->cpsr &= ~MANGO_CPSR_T;
               }
               loaded_pc = 1;
               new_pc = value;

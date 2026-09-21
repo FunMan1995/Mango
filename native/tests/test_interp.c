@@ -28,6 +28,15 @@ static uint32_t bytes_to_u32_le(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static void load_halfwords(uint8_t* mem, uint32_t mem_size, const uint16_t* hw, uint32_t n) {
+  memset(mem, 0, mem_size);
+  for (uint32_t i = 0; i < n; i++) {
+    uint16_t h = hw[i];
+    mem[i * 2u + 0] = (uint8_t)(h & 0xFF);
+    mem[i * 2u + 1] = (uint8_t)((h >> 8) & 0xFF);
+  }
+}
+
 static int test_mov_add_bx(void) {
   static const uint32_t kProgram[] = {
       0xE3A00002u, /* mov r0, #2 */
@@ -1532,14 +1541,9 @@ static int test_ldrh_misaligned_rejected(void) {
 
 static int test_extra_ldst_rejected_shapes(void) {
   MangoInsn insn;
-  uint32_t ldrd = encode_extra_ldst(1, 1, 1, 0, 0, 1, 0, 1, 0, 0); /* ldrd r0, [r1] */
-  if (mango_decode(ldrd, &insn) == 0) {
-    fprintf(stderr, "FAIL(extra_ldst_rejected_shapes): ldrd was decoded\n");
-    return 1;
-  }
-  uint32_t strd = encode_extra_ldst(1, 1, 1, 0, 0, 1, 0, 1, 1, 0); /* strd r0, [r1] */
-  if (mango_decode(strd, &insn) == 0) {
-    fprintf(stderr, "FAIL(extra_ldst_rejected_shapes): strd was decoded\n");
+  uint32_t odd = encode_extra_ldst(1, 1, 1, 0, 0, 1, 1, 1, 0, 0); /* ldrd r1, [r1] odd Rt */
+  if (mango_decode(odd, &insn) == 0) {
+    fprintf(stderr, "FAIL(extra_ldst_rejected_shapes): ldrd with odd rt was decoded\n");
     return 1;
   }
   uint32_t wb_pc = encode_extra_ldst(1, 1, 1, 1, 1, MANGO_REG_PC, 0, 0, 1, 4);
@@ -1547,7 +1551,167 @@ static int test_extra_ldst_rejected_shapes(void) {
     fprintf(stderr, "FAIL(extra_ldst_rejected_shapes): ldrh writeback into pc was decoded\n");
     return 1;
   }
-  printf("ok: ldrd/strd/ldrh-writeback-pc shapes rejected\n");
+  printf("ok: ldrd-odd-rt / ldrh-writeback-pc shapes rejected\n");
+  return 0;
+}
+
+static int test_ldrd_strd_roundtrip(void) {
+  uint32_t strd = encode_extra_ldst(1, 1, 1, 0, 0, 2, 0, 1, 1, 8); /* strd r0, r1, [r2, #8] */
+  uint32_t ldrd = encode_extra_ldst(1, 1, 1, 0, 0, 2, 4, 1, 0, 8); /* ldrd r4, r5, [r2, #8] */
+  if (strd != 0xE1C200F8u || ldrd != 0xE1C240D8u) {
+    fprintf(stderr, "FAIL(ldrd_strd_roundtrip): encoder mismatch strd=0x%08x ldrd=0x%08x\n", strd,
+            ldrd);
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A00011u, /* mov r0, #0x11 */
+      0xE3A01022u, /* mov r1, #0x22 */
+      0xE3A02040u, /* mov r2, #64 */
+      0xE1C200F8u, /* strd r0, r1, [r2, #8] */
+      0xE1C240D8u, /* ldrd r4, r5, [r2, #8] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xE5E5u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xE5E5u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(ldrd_strd_roundtrip): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[4] != 0x11 || cpu.r[5] != 0x22) {
+    fprintf(stderr, "FAIL(ldrd_strd_roundtrip): expected r4=0x11 r5=0x22, got r4=0x%x r5=0x%x\n",
+            cpu.r[4], cpu.r[5]);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + 72) != 0x11 || bytes_to_u32_le(mem_buf + 76) != 0x22) {
+    fprintf(stderr, "FAIL(ldrd_strd_roundtrip): memory pair is not r0 then r1\n");
+    return 1;
+  }
+  printf("ok: strd + ldrd round trip (r4=0x%x, r5=0x%x)\n", cpu.r[4], cpu.r[5]);
+  return 0;
+}
+
+static int test_thumb_mov_add_bx(void) {
+  static const uint16_t kProg[] = {
+      0x2002u, /* mov r0, #2 */
+      0x3003u, /* add r0, #3 */
+      0x4770u, /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_LR] = 0xCAFE0000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xCAFE0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_mov_add_bx): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 5) {
+    fprintf(stderr, "FAIL(thumb_mov_add_bx): expected r0 == 5, got %u\n", cpu.r[0]);
+    return 1;
+  }
+  if (cpu.cpsr & MANGO_CPSR_T) {
+    fprintf(stderr, "FAIL(thumb_mov_add_bx): bx to even lr should have left Thumb state\n");
+    return 1;
+  }
+  printf("ok: thumb mov + add + bx (r0 = %u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_thumb_push_pop(void) {
+  static const uint16_t kProg[] = {
+      0xB510u, /* push {r4, lr} */
+      0x2401u, /* mov r4, #1 */
+      0xBD10u, /* pop {r4, pc} */
+  };
+
+  uint8_t mem_buf[256];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[4] = 0xA1A1A1A1u;
+  cpu.r[MANGO_REG_SP] = 128;
+  cpu.r[MANGO_REG_LR] = 0xDEAD0000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xDEAD0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_push_pop): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[4] != 0xA1A1A1A1u || cpu.r[MANGO_REG_SP] != 128) {
+    fprintf(stderr, "FAIL(thumb_push_pop): r4=0x%x sp=%u\n", cpu.r[4], cpu.r[MANGO_REG_SP]);
+    return 1;
+  }
+  printf("ok: thumb push/pop restores r4 and returns via pc\n");
+  return 0;
+}
+
+static int test_arm_bx_into_thumb(void) {
+  /* ARM at 0: bx r1. r1 = 8|1, Thumb at 8: mov r0, #7; bx lr */
+  static const uint32_t kArm[] = {
+      0xE12FFF11u, /* bx r1 */
+  };
+  static const uint16_t kThumb[] = {
+      0x2007u, /* mov r0, #7 */
+      0x4770u, /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = 0x11;
+  mem_buf[1] = 0xFF;
+  mem_buf[2] = 0x2F;
+  mem_buf[3] = 0xE1;
+  mem_buf[8] = 0x07;
+  mem_buf[9] = 0x20;
+  mem_buf[10] = 0x70;
+  mem_buf[11] = 0x47;
+  (void)kArm;
+  (void)kThumb;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[1] = 8u | 1u;
+  cpu.r[MANGO_REG_LR] = 0xF00Fu;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xF00Fu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(arm_bx_into_thumb): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 7) {
+    fprintf(stderr, "FAIL(arm_bx_into_thumb): expected r0 == 7, got %u\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: ARM bx into Thumb and back (r0 = %u)\n", cpu.r[0]);
   return 0;
 }
 
@@ -1641,6 +1805,10 @@ int main(void) {
   failures += test_ldrh_misaligned_rejected();
   failures += test_extra_ldst_rejected_shapes();
   failures += test_swp_and_swpb();
+  failures += test_ldrd_strd_roundtrip();
+  failures += test_thumb_mov_add_bx();
+  failures += test_thumb_push_pop();
+  failures += test_arm_bx_into_thumb();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

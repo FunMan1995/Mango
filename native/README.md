@@ -20,10 +20,11 @@ synthetic programs, not real app code yet.
   optional writeback, and post-index; `LDRB` zero-extends; `LDRT`/`STRT`,
   writeback into PC, `LDR` writeback into the same register as the dest,
   and `LDR`/`STR` of PC are rejected), extra load/store `LDRH`/`STRH`/
-  `LDRSB`/`LDRSH` (8-bit immediate or unshifted register offset, same
-  pre/post/writeback rules; halfword accesses are 2-byte aligned;
-  `LDRD`/`STRD` are rejected), `SWP`/`SWPB` (PC operands and Rn overlapping
-  Rt/Rm are rejected),
+  `LDRSB`/`LDRSH`/`LDRD`/`STRD` (8-bit immediate or unshifted register
+  offset, same pre/post/writeback rules; halfword accesses are 2-byte
+  aligned; `LDRD`/`STRD` require an even Rt that isn't r14; odd Rt is
+  rejected), `SWP`/`SWPB` (PC operands and Rn overlapping Rt/Rm are
+  rejected),
   and `LDM`/`STM` including the `PUSH`/`POP`
   aliases (`STMDB sp!` / `LDMIA sp!`). Block transfers cover all four
   addressing modes (IA/IB/DA/DB) with optional writeback. Lowest-numbered
@@ -56,8 +57,15 @@ synthetic programs, not real app code yet.
   hardware. Register reads correctly treat r15 (PC) as "current
   instruction address + 8" per real hardware semantics, which matters for
   the very common `LDR Rd, [PC, #imm]` literal-pool pattern. This is
-  genuinely a subset, real apps will use far more of the ISA (Thumb-2,
-  `LDRD`/`STRD`, NEON, and so on all still need doing).
+  genuinely a subset, real apps will use far more of the ISA (32-bit
+  Thumb, NEON, and so on all still need doing). A Thumb-16 subset is
+  implemented: low-register ALU, `MOV`/`ADD`/`SUB`/`CMP` immediates,
+  shifts, load/store (imm, register, SP-relative, PC-literal), `ADR`,
+  `ADD`/`SUB SP`, `PUSH`/`POP`, `STMIA`/`LDMIA`, conditional and
+  unconditional `B`, `SVC`, and `BX`. `BX` and `POP {pc}` interwork:
+  bit 0 of the target selects Thumb vs ARM (odd stop-sentinels used by
+  the tests are left intact so a `BX LR` halt still matches). 32-bit
+  Thumb (`BL`, IT-predicated ops, many extra loads) is rejected.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/
@@ -126,7 +134,7 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: thirty-seven test programs, hand-encoded by
+- `tests/test_interp.c`: forty-one test programs, hand-encoded by
   working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why
@@ -169,9 +177,9 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
 
 ## Where to look if you want to help
 
-- More A32 instructions: `LDRD`/`STRD`, then Thumb-2. Each addition
-  should come with a hand-derived test case the way the existing ones
-  work, see `docs/CONTRIBUTING.md`'s testing section.
+- 32-bit Thumb (`BL`, `IT`, extra load/store T32), then NEON. Each
+  addition should come with a hand-derived test case the way the
+  existing ones work, see `docs/CONTRIBUTING.md`'s testing section.
 - A real trampoline mechanism for `getTrampoline`: it can already find a
   requested symbol in a loaded guest library (`elf32.c`), but the real
   blocker is deeper than "generate a trampoline". A JNI native method's

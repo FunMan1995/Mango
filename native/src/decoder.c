@@ -2,8 +2,7 @@
 
 #include "mango/cpu.h"
 
-int mango_decode(uint32_t word, MangoInsn* out) {
-  out->cond = (word >> 28) & 0xF;
+static void mango_insn_clear(MangoInsn* out) {
   out->rd = out->rn = out->rm = out->rs = out->imm = out->reglist = 0;
   out->shift_type = 0;
   out->shift_amount = 0;
@@ -15,6 +14,11 @@ int mango_decode(uint32_t word, MangoInsn* out) {
   out->p = 0;
   out->w = 0;
   out->op = MANGO_OP_UNKNOWN;
+}
+
+int mango_decode(uint32_t word, MangoInsn* out) {
+  mango_insn_clear(out);
+  out->cond = (word >> 28) & 0xF;
 
   if (out->cond == 0xF) {
     return -1; /* 0xF is ARMv5+'s unconditional-extension selector, not a real cond */
@@ -119,11 +123,8 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     if (rt == MANGO_REG_PC) {
       return -1;
     }
-    if (writeback && (rn == MANGO_REG_PC || (l && rt == rn))) {
+    if (writeback && rn == MANGO_REG_PC) {
       return -1;
-    }
-    if (!l && s) {
-      return -1; /* LDRD/STRD, not in this subset */
     }
     if (l && !s && h) {
       op = MANGO_OP_LDRH;
@@ -133,8 +134,22 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       op = MANGO_OP_LDRSB;
     } else if (l && s && h) {
       op = MANGO_OP_LDRSH;
+    } else if (!l && s && !h) {
+      op = MANGO_OP_LDRD;
+    } else if (!l && s && h) {
+      op = MANGO_OP_STRD;
     } else {
       return -1;
+    }
+    if (op == MANGO_OP_LDRD || op == MANGO_OP_STRD) {
+      if ((rt & 1u) || rt == 14u) {
+        return -1; /* pair must be even and not include PC */
+      }
+      if (writeback && (rn == rt || rn == rt + 1u)) {
+        return -1;
+      }
+    } else if (writeback && l && rt == rn) {
+      return -1; /* LDRH/LDRSB/LDRSH writeback into the dest */
     }
 
     out->op = op;
@@ -154,6 +169,9 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       uint32_t rm = word & 0xF;
       if (rm == MANGO_REG_PC) {
         return -1; /* Rm=PC is UNPREDICTABLE for extra load/store */
+      }
+      if (op == MANGO_OP_LDRD && (rm == rt || rm == rt + 1u)) {
+        return -1;
       }
       out->is_imm = 0;
       out->rm = rm;
@@ -352,6 +370,324 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     out->p = (int)p;
     out->u = (int)u;
     out->w = (int)w;
+    return 0;
+  }
+
+  return -1;
+}
+
+int mango_decode_t16(uint16_t hw, MangoInsn* out) {
+  mango_insn_clear(out);
+  out->cond = 0xE; /* AL; conditional B overrides this */
+
+  /* 32-bit Thumb: BL and a large ALU/load group. Not this subset. */
+  if ((hw >> 11) >= 0x1Du) {
+    return -1;
+  }
+
+  /* Shifts and add/sub (000xx) */
+  if ((hw >> 13) == 0) {
+    uint32_t opc = (hw >> 11) & 3u;
+    uint32_t rd = hw & 7u;
+    if (opc < 3u) {
+      out->op = MANGO_OP_MOV;
+      out->rd = rd;
+      out->rm = (hw >> 3) & 7u;
+      out->shift_type = opc; /* 0=LSL, 1=LSR, 2=ASR */
+      out->shift_amount = (hw >> 6) & 0x1Fu;
+      out->sets_flags = 1;
+      return 0;
+    }
+    out->op = ((hw >> 9) & 1u) ? MANGO_OP_SUB : MANGO_OP_ADD;
+    out->rd = rd;
+    out->rn = (hw >> 3) & 7u;
+    out->sets_flags = 1;
+    if ((hw >> 10) & 1u) {
+      out->is_imm = 1;
+      out->imm = (hw >> 6) & 7u;
+    } else {
+      out->rm = (hw >> 6) & 7u;
+    }
+    return 0;
+  }
+
+  /* MOV/CMP/ADD/SUB Rd, #imm8 (001xx) */
+  if ((hw >> 13) == 1u) {
+    uint32_t opc = (hw >> 11) & 3u;
+    uint32_t rd = (hw >> 8) & 7u;
+    out->is_imm = 1;
+    out->imm = hw & 0xFFu;
+    out->rd = rd;
+    out->rn = rd;
+    out->sets_flags = 1;
+    if (opc == 0) {
+      out->op = MANGO_OP_MOV;
+    } else if (opc == 1) {
+      out->op = MANGO_OP_CMP;
+      out->sets_flags = 1;
+    } else if (opc == 2) {
+      out->op = MANGO_OP_ADD;
+    } else {
+      out->op = MANGO_OP_SUB;
+    }
+    return 0;
+  }
+
+  /* Data-processing register (010000) */
+  if ((hw >> 10) == 0x10u) {
+    uint32_t opc = (hw >> 6) & 0xFu;
+    uint32_t rs = (hw >> 3) & 7u;
+    uint32_t rd = hw & 7u;
+    static const MangoOp kDp[16] = {
+        MANGO_OP_AND, MANGO_OP_EOR, MANGO_OP_MOV, MANGO_OP_MOV, MANGO_OP_MOV, MANGO_OP_ADC,
+        MANGO_OP_SBC, MANGO_OP_MOV, MANGO_OP_TST, MANGO_OP_RSB, MANGO_OP_CMP, MANGO_OP_CMN,
+        MANGO_OP_ORR, MANGO_OP_MUL, MANGO_OP_BIC, MANGO_OP_MVN,
+    };
+    out->op = kDp[opc];
+    out->rd = rd;
+    out->sets_flags = 1; /* T16 ALU always sets NZCV */
+    if (opc == 2u || opc == 3u || opc == 4u || opc == 7u) {
+      /* LSL/LSR/ASR/ROR Rd, Rs: Rd = Rd shift Rs */
+      out->rm = rd;
+      out->rs = rs;
+      out->shift_by_reg = 1;
+      out->shift_type = (opc == 2u) ? 0u : (opc == 3u) ? 1u : (opc == 4u) ? 2u : 3u;
+    } else if (opc == 8u || opc == 10u || opc == 11u) {
+      out->rn = rd;
+      out->rm = rs;
+      out->sets_flags = 1;
+    } else if (opc == 9u) {
+      /* NEG Rd, Rm = RSB Rd, Rm, #0 */
+      out->rn = rs;
+      out->is_imm = 1;
+      out->imm = 0;
+    } else if (opc == 13u) {
+      out->rm = rd;
+      out->rs = rs;
+    } else if (opc == 15u) {
+      out->rm = rs;
+    } else {
+      out->rn = rd;
+      out->rm = rs;
+    }
+    return 0;
+  }
+
+  /* Special high registers / BX (010001) */
+  if ((hw >> 10) == 0x11u) {
+    uint32_t opc = (hw >> 8) & 3u;
+    uint32_t rm = (hw >> 3) & 0xFu;
+    uint32_t rd = (hw & 7u) | (((hw >> 7) & 1u) << 3);
+    if (opc == 3u) {
+      if ((hw & (1u << 7)) || (hw & 7u)) {
+        return -1; /* BLX, or BX with non-zero SBZ Rd */
+      }
+      out->op = MANGO_OP_BX;
+      out->rm = rm;
+      return 0;
+    }
+    out->rd = rd;
+    out->rm = rm;
+    out->rn = rd;
+    if (opc == 0) {
+      out->op = MANGO_OP_ADD;
+    } else if (opc == 1) {
+      out->op = MANGO_OP_CMP;
+      out->sets_flags = 1;
+    } else {
+      out->op = MANGO_OP_MOV;
+    }
+    return 0;
+  }
+
+  /* LDR literal (01001) */
+  if ((hw >> 11) == 0x09u) {
+    out->op = MANGO_OP_LDR;
+    out->rd = (hw >> 8) & 7u;
+    out->rn = MANGO_REG_PC;
+    out->is_imm = 1;
+    out->imm = (uint32_t)(hw & 0xFFu) << 2;
+    out->p = 1;
+    out->u = 1;
+    return 0;
+  }
+
+  /* Load/store register offset (0101) */
+  if ((hw >> 12) == 0x5u) {
+    uint32_t opc = (hw >> 9) & 7u;
+    out->rn = (hw >> 3) & 7u;
+    out->rd = hw & 7u;
+    out->rm = (hw >> 6) & 7u;
+    out->p = 1;
+    out->u = 1;
+    switch (opc) {
+      case 0:
+        out->op = MANGO_OP_STR;
+        break;
+      case 1:
+        out->op = MANGO_OP_STRH;
+        break;
+      case 2:
+        out->op = MANGO_OP_STR;
+        out->b = 1;
+        break;
+      case 3:
+        out->op = MANGO_OP_LDRSB;
+        break;
+      case 4:
+        out->op = MANGO_OP_LDR;
+        break;
+      case 5:
+        out->op = MANGO_OP_LDRH;
+        break;
+      case 6:
+        out->op = MANGO_OP_LDR;
+        out->b = 1;
+        break;
+      default:
+        out->op = MANGO_OP_LDRSH;
+        break;
+    }
+    return 0;
+  }
+
+  /* STR/LDR/STRB/LDRB imm5 (011xx) */
+  if ((hw >> 13) == 0x3u) {
+    int b = (int)((hw >> 12) & 1u);
+    int l = (int)((hw >> 11) & 1u);
+    uint32_t imm5 = (hw >> 6) & 0x1Fu;
+    out->op = l ? MANGO_OP_LDR : MANGO_OP_STR;
+    out->b = b;
+    out->rd = hw & 7u;
+    out->rn = (hw >> 3) & 7u;
+    out->is_imm = 1;
+    out->imm = b ? imm5 : (imm5 << 2);
+    out->p = 1;
+    out->u = 1;
+    return 0;
+  }
+
+  /* STRH/LDRH imm5 (1000x) */
+  if ((hw >> 12) == 0x8u) {
+    out->op = ((hw >> 11) & 1u) ? MANGO_OP_LDRH : MANGO_OP_STRH;
+    out->rd = hw & 7u;
+    out->rn = (hw >> 3) & 7u;
+    out->is_imm = 1;
+    out->imm = ((hw >> 6) & 0x1Fu) << 1;
+    out->p = 1;
+    out->u = 1;
+    return 0;
+  }
+
+  /* STR/LDR SP-relative (1001x) */
+  if ((hw >> 12) == 0x9u) {
+    out->op = ((hw >> 11) & 1u) ? MANGO_OP_LDR : MANGO_OP_STR;
+    out->rd = (hw >> 8) & 7u;
+    out->rn = MANGO_REG_SP;
+    out->is_imm = 1;
+    out->imm = (uint32_t)(hw & 0xFFu) << 2;
+    out->p = 1;
+    out->u = 1;
+    return 0;
+  }
+
+  /* ADR / ADD Rd, SP, #imm (1010x) */
+  if ((hw >> 12) == 0xAu) {
+    out->op = MANGO_OP_ADD;
+    out->rd = (hw >> 8) & 7u;
+    out->rn = ((hw >> 11) & 1u) ? MANGO_REG_SP : MANGO_REG_PC;
+    out->is_imm = 1;
+    out->imm = (uint32_t)(hw & 0xFFu) << 2;
+    return 0;
+  }
+
+  /* Misc 1011: ADD/SUB SP, PUSH/POP */
+  if ((hw >> 12) == 0xBu) {
+    if ((hw >> 8) == 0xB0u) {
+      out->op = ((hw >> 7) & 1u) ? MANGO_OP_SUB : MANGO_OP_ADD;
+      out->rd = MANGO_REG_SP;
+      out->rn = MANGO_REG_SP;
+      out->is_imm = 1;
+      out->imm = (uint32_t)(hw & 0x7Fu) << 2;
+      return 0;
+    }
+    if ((hw >> 9) == 0x5Au) { /* PUSH */
+      uint32_t list = hw & 0xFFu;
+      if ((hw >> 8) & 1u) {
+        list |= (1u << MANGO_REG_LR);
+      }
+      if (list == 0) {
+        return -1;
+      }
+      out->op = MANGO_OP_STM;
+      out->rn = MANGO_REG_SP;
+      out->reglist = list;
+      out->p = 1;
+      out->u = 0;
+      out->w = 1;
+      return 0;
+    }
+    if ((hw >> 9) == 0x5Eu) { /* POP */
+      uint32_t list = hw & 0xFFu;
+      if ((hw >> 8) & 1u) {
+        list |= (1u << MANGO_REG_PC);
+      }
+      if (list == 0) {
+        return -1;
+      }
+      out->op = MANGO_OP_LDM;
+      out->rn = MANGO_REG_SP;
+      out->reglist = list;
+      out->p = 0;
+      out->u = 1;
+      out->w = 1;
+      return 0;
+    }
+    return -1;
+  }
+
+  /* STMIA/LDMIA (1100x) */
+  if ((hw >> 12) == 0xCu) {
+    uint32_t l = (hw >> 11) & 1u;
+    uint32_t rn = (hw >> 8) & 7u;
+    uint32_t list = hw & 0xFFu;
+    if (list == 0) {
+      return -1;
+    }
+    out->op = l ? MANGO_OP_LDM : MANGO_OP_STM;
+    out->rn = rn;
+    out->reglist = list;
+    out->p = 0;
+    out->u = 1;
+    out->w = (l && (list & (1u << rn))) ? 0 : 1;
+    return 0;
+  }
+
+  /* B<cond> / SVC (1101) */
+  if ((hw >> 12) == 0xDu) {
+    uint32_t cond = (hw >> 8) & 0xFu;
+    if (cond == 0xFu) {
+      out->op = MANGO_OP_SVC;
+      return 0;
+    }
+    if (cond == 0xEu) {
+      return -1; /* undefined */
+    }
+    int32_t imm8 = (int8_t)(hw & 0xFFu);
+    out->op = MANGO_OP_B;
+    out->cond = cond;
+    out->imm = (uint32_t)(imm8 << 1);
+    return 0;
+  }
+
+  /* B uncond (11100) */
+  if ((hw >> 11) == 0x1Cu) {
+    uint32_t offset = (uint32_t)(hw & 0x7FFu) << 1;
+    if (offset & 0x800u) {
+      offset |= 0xFFFFF000u;
+    }
+    out->op = MANGO_OP_B;
+    out->imm = offset;
     return 0;
   }
 
