@@ -36,31 +36,135 @@ static uint32_t mango_read_reg(const MangoCpu* cpu, uint32_t insn_addr, uint32_t
   return cpu->r[reg];
 }
 
-/* shift_amount is always in a safe 0-31 (LSL) or 1-31 (LSR/ASR/ROR) range, decode
- * guarantees it. ASR is hand-rolled since signed right-shift is implementation-defined. */
-static uint32_t mango_apply_shift(uint32_t value, uint32_t shift_type, uint32_t shift_amount) {
-  switch (shift_type) {
-    case 0: /* LSL */
-      return shift_amount == 0 ? value : value << shift_amount;
-    case 1: /* LSR */
-      return value >> shift_amount;
-    case 2: { /* ASR */
-      uint32_t sign_fill = (value & 0x80000000u) ? (~0u << (32 - shift_amount)) : 0u;
-      return (value >> shift_amount) | sign_fill;
+typedef struct MangoOp2 {
+  uint32_t value;
+  uint32_t carry; /* 0 or 1, only meaningful if update_c */
+  int update_c;   /* 0 = logical S-bit ops leave C alone (LSL #0, Rs=0, rot=0) */
+} MangoOp2;
+
+/* ARM barrel shifter, including the #0 encodings (LSR/ASR #32, RRX) and
+ * register-controlled amounts. ASR is hand-rolled: signed right-shift is
+ * implementation-defined in C. amount is the 5-bit field (immediate) or
+ * Rs[7:0] (register). */
+static MangoOp2 mango_shift(uint32_t value, uint32_t shift_type, uint32_t amount, int by_reg,
+                            uint32_t carry_in) {
+  MangoOp2 o;
+  o.value = value;
+  o.carry = 0;
+  o.update_c = 1;
+
+  if (!by_reg) {
+    if (shift_type == 0) { /* LSL */
+      if (amount == 0) {
+        o.update_c = 0;
+        return o;
+      }
+      o.value = value << amount;
+      o.carry = (value >> (32u - amount)) & 1u;
+      return o;
     }
-    case 3: /* ROR */
-      return (value >> shift_amount) | (value << (32 - shift_amount));
-    default:
-      return value;
+    if (shift_type == 1) { /* LSR; #0 means #32 */
+      uint32_t n = amount == 0 ? 32u : amount;
+      o.value = n == 32u ? 0u : value >> n;
+      o.carry = (value >> (n - 1u)) & 1u;
+      return o;
+    }
+    if (shift_type == 2) { /* ASR; #0 means #32 */
+      uint32_t n = amount == 0 ? 32u : amount;
+      if (n == 32u) {
+        o.value = (value & 0x80000000u) ? 0xFFFFFFFFu : 0u;
+        o.carry = (value >> 31) & 1u;
+      } else {
+        uint32_t sign_fill = (value & 0x80000000u) ? (~0u << (32u - n)) : 0u;
+        o.value = (value >> n) | sign_fill;
+        o.carry = (value >> (n - 1u)) & 1u;
+      }
+      return o;
+    }
+    /* ROR; #0 means RRX */
+    if (amount == 0) {
+      o.value = (carry_in << 31) | (value >> 1);
+      o.carry = value & 1u;
+      return o;
+    }
+    o.value = (value >> amount) | (value << (32u - amount));
+    o.carry = (value >> (amount - 1u)) & 1u;
+    return o;
+  }
+
+  if (amount == 0) {
+    o.update_c = 0;
+    return o;
+  }
+  if (shift_type == 0) { /* LSL Rs */
+    if (amount < 32u) {
+      o.value = value << amount;
+      o.carry = (value >> (32u - amount)) & 1u;
+    } else if (amount == 32u) {
+      o.value = 0;
+      o.carry = value & 1u;
+    } else {
+      o.value = 0;
+      o.carry = 0;
+    }
+    return o;
+  }
+  if (shift_type == 1) { /* LSR Rs */
+    if (amount < 32u) {
+      o.value = value >> amount;
+      o.carry = (value >> (amount - 1u)) & 1u;
+    } else if (amount == 32u) {
+      o.value = 0;
+      o.carry = (value >> 31) & 1u;
+    } else {
+      o.value = 0;
+      o.carry = 0;
+    }
+    return o;
+  }
+  if (shift_type == 2) { /* ASR Rs */
+    if (amount < 32u) {
+      uint32_t sign_fill = (value & 0x80000000u) ? (~0u << (32u - amount)) : 0u;
+      o.value = (value >> amount) | sign_fill;
+      o.carry = (value >> (amount - 1u)) & 1u;
+    } else {
+      o.value = (value & 0x80000000u) ? 0xFFFFFFFFu : 0u;
+      o.carry = (value >> 31) & 1u;
+    }
+    return o;
+  }
+  /* ROR Rs: Rs[4:0]==0 and Rs[7:0]!=0 is rotate-by-32 (identity, C=Rm[31]) */
+  {
+    uint32_t low5 = amount & 31u;
+    if (low5 == 0) {
+      o.value = value;
+      o.carry = (value >> 31) & 1u;
+      return o;
+    }
+    o.value = (value >> low5) | (value << (32u - low5));
+    o.carry = (value >> (low5 - 1u)) & 1u;
+    return o;
   }
 }
 
-static uint32_t mango_read_operand2(const MangoCpu* cpu, uint32_t addr, const MangoInsn* insn) {
+static MangoOp2 mango_eval_operand2(const MangoCpu* cpu, uint32_t addr, const MangoInsn* insn) {
   if (insn->is_imm) {
-    return insn->imm;
+    MangoOp2 o;
+    o.value = insn->imm;
+    if (insn->shift_amount != 0) {
+      o.update_c = 1;
+      o.carry = insn->imm >> 31;
+    } else {
+      o.update_c = 0;
+      o.carry = 0;
+    }
+    return o;
   }
   uint32_t value = mango_read_reg(cpu, addr, insn->rm);
-  return mango_apply_shift(value, insn->shift_type, insn->shift_amount);
+  uint32_t amount =
+      insn->shift_by_reg ? (mango_read_reg(cpu, addr, insn->rs) & 0xFFu) : insn->shift_amount;
+  uint32_t carry_in = (cpu->cpsr & MANGO_CPSR_C) ? 1u : 0u;
+  return mango_shift(value, insn->shift_type, amount, insn->shift_by_reg, carry_in);
 }
 
 /* NZCV for ADD/ADDS: result = lhs + rhs. */
@@ -97,13 +201,15 @@ static uint32_t mango_flags_for_adc(uint32_t lhs, uint32_t rhs, uint32_t carry_i
   return flags;
 }
 
-/* NZ for AND/EOR/ORR/BIC/MVN/TST/TEQ: C should come from the shifter, not
- * implemented (see MOVS below), and V is unaffected by these; both kept
- * as-is rather than cleared. */
-static uint32_t mango_flags_for_logical(const MangoCpu* cpu, uint32_t result) {
+/* NZ for AND/EOR/ORR/BIC/MVN/MOV/TST/TEQ, and MULS/MLAS. V is unaffected.
+ * C comes from the shifter when update_c; otherwise C is left as-is
+ * (LSL #0, Rs=0, unrotated immediate, MUL/MLA). */
+static uint32_t mango_flags_for_logical(uint32_t old_cpsr, uint32_t result, uint32_t shifter_c,
+                                        int update_c) {
   uint32_t n = (result & 0x80000000u) ? MANGO_CPSR_N : 0;
   uint32_t z = (result == 0) ? MANGO_CPSR_Z : 0;
-  return (cpu->cpsr & (MANGO_CPSR_C | MANGO_CPSR_V)) | n | z;
+  uint32_t c = update_c ? (shifter_c ? MANGO_CPSR_C : 0) : (old_cpsr & MANGO_CPSR_C);
+  return (old_cpsr & MANGO_CPSR_V) | n | z | c;
 }
 
 static void mango_set_nzcv(MangoCpu* cpu, uint32_t flags) {
@@ -175,19 +281,22 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
     if (mango_cond_holds(insn.cond, cpu->cpsr)) {
       switch (insn.op) {
         case MANGO_OP_MOV: {
-          uint32_t result = mango_read_operand2(cpu, addr, &insn);
-          cpu->r[insn.rd] = result;
+          MangoOp2 op2 = mango_eval_operand2(cpu, addr, &insn);
+          cpu->r[insn.rd] = op2.value;
           if (insn.sets_flags) {
-            mango_set_nzcv(cpu, mango_flags_for_logical(cpu, result));
+            mango_set_nzcv(cpu,
+                           mango_flags_for_logical(cpu->cpsr, op2.value, op2.carry, op2.update_c));
           }
           break;
         }
 
         case MANGO_OP_MVN: {
-          uint32_t result = ~mango_read_operand2(cpu, addr, &insn);
+          MangoOp2 op2 = mango_eval_operand2(cpu, addr, &insn);
+          uint32_t result = ~op2.value;
           cpu->r[insn.rd] = result;
           if (insn.sets_flags) {
-            mango_set_nzcv(cpu, mango_flags_for_logical(cpu, result));
+            mango_set_nzcv(cpu,
+                           mango_flags_for_logical(cpu->cpsr, result, op2.carry, op2.update_c));
           }
           break;
         }
@@ -196,30 +305,31 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         case MANGO_OP_EOR:
         case MANGO_OP_ORR:
         case MANGO_OP_BIC: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          MangoOp2 op2 = mango_eval_operand2(cpu, addr, &insn);
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
-          uint32_t result = insn.op == MANGO_OP_AND   ? (lhs & rhs)
-                            : insn.op == MANGO_OP_EOR ? (lhs ^ rhs)
-                            : insn.op == MANGO_OP_ORR ? (lhs | rhs)
-                                                      : (lhs & ~rhs);
+          uint32_t result = insn.op == MANGO_OP_AND   ? (lhs & op2.value)
+                            : insn.op == MANGO_OP_EOR ? (lhs ^ op2.value)
+                            : insn.op == MANGO_OP_ORR ? (lhs | op2.value)
+                                                      : (lhs & ~op2.value);
           cpu->r[insn.rd] = result;
           if (insn.sets_flags) {
-            mango_set_nzcv(cpu, mango_flags_for_logical(cpu, result));
+            mango_set_nzcv(cpu,
+                           mango_flags_for_logical(cpu->cpsr, result, op2.carry, op2.update_c));
           }
           break;
         }
 
         case MANGO_OP_TST:
         case MANGO_OP_TEQ: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          MangoOp2 op2 = mango_eval_operand2(cpu, addr, &insn);
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
-          uint32_t result = insn.op == MANGO_OP_TST ? (lhs & rhs) : (lhs ^ rhs);
-          mango_set_nzcv(cpu, mango_flags_for_logical(cpu, result));
+          uint32_t result = insn.op == MANGO_OP_TST ? (lhs & op2.value) : (lhs ^ op2.value);
+          mango_set_nzcv(cpu, mango_flags_for_logical(cpu->cpsr, result, op2.carry, op2.update_c));
           break;
         }
 
         case MANGO_OP_ADD: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          uint32_t rhs = mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           uint32_t result = lhs + rhs;
           cpu->r[insn.rd] = result;
@@ -230,14 +340,14 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_CMN: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          uint32_t rhs = mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           mango_set_nzcv(cpu, mango_flags_for_add(lhs, rhs, lhs + rhs));
           break;
         }
 
         case MANGO_OP_ADC: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          uint32_t rhs = mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           uint32_t carry_in = (cpu->cpsr & MANGO_CPSR_C) ? 1u : 0u;
           uint32_t result = lhs + rhs + carry_in;
@@ -249,7 +359,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_SUB: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          uint32_t rhs = mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           uint32_t result = lhs - rhs;
           cpu->r[insn.rd] = result;
@@ -260,7 +370,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_RSB: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          uint32_t rhs = mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           uint32_t result = rhs - lhs;
           cpu->r[insn.rd] = result;
@@ -271,7 +381,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_SBC: {
-          uint32_t rhs = ~mango_read_operand2(cpu, addr, &insn); /* A-B-1+C == A+~B+C */
+          uint32_t rhs = ~mango_eval_operand2(cpu, addr, &insn).value; /* A-B-1+C == A+~B+C */
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           uint32_t carry_in = (cpu->cpsr & MANGO_CPSR_C) ? 1u : 0u;
           uint32_t result = lhs + rhs + carry_in;
@@ -283,7 +393,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_RSC: {
-          uint32_t op2 = mango_read_operand2(cpu, addr, &insn);
+          uint32_t op2 = mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t not_rn = ~mango_read_reg(cpu, addr, insn.rn); /* B-A-1+C == B+~A+C */
           uint32_t carry_in = (cpu->cpsr & MANGO_CPSR_C) ? 1u : 0u;
           uint32_t result = op2 + not_rn + carry_in;
@@ -295,18 +405,22 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_CMP: {
-          uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
+          uint32_t rhs = mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           mango_set_nzcv(cpu, mango_flags_for_sub(lhs, rhs, lhs - rhs));
           break;
         }
 
-        case MANGO_OP_MUL: {
+        case MANGO_OP_MUL:
+        case MANGO_OP_MLA: {
           uint32_t result = mango_read_reg(cpu, addr, insn.rm) * mango_read_reg(cpu, addr, insn.rs);
+          if (insn.op == MANGO_OP_MLA) {
+            result += mango_read_reg(cpu, addr, insn.rn);
+          }
           cpu->r[insn.rd] = result;
           if (insn.sets_flags) {
-            /* MULS: C,V left as-is, same convention as the other logical-flag ops. */
-            mango_set_nzcv(cpu, mango_flags_for_logical(cpu, result));
+            /* MULS/MLAS: C,V left as-is. */
+            mango_set_nzcv(cpu, mango_flags_for_logical(cpu->cpsr, result, 0, 0));
           }
           break;
         }
@@ -332,8 +446,10 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           if (insn.rd == MANGO_REG_PC) {
             return -1; /* indirect branch via LDR PC, not supported yet */
           }
+          uint32_t offset = insn.is_imm ? insn.imm : mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t base = mango_read_reg(cpu, addr, insn.rn);
-          uint32_t eaddr = insn.u ? base + insn.imm : base - insn.imm;
+          uint32_t wbaddr = insn.u ? base + offset : base - offset;
+          uint32_t eaddr = insn.p ? wbaddr : base;
 
           if (insn.b) {
             if (mango_check_byte_access(mem, eaddr) != 0) {
@@ -353,6 +469,9 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             } else {
               mango_store_u32_le(mem->bytes + eaddr, cpu->r[insn.rd]);
             }
+          }
+          if (insn.w) {
+            cpu->r[insn.rn] = wbaddr;
           }
           break;
         }

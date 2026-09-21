@@ -8,6 +8,7 @@ int mango_decode(uint32_t word, MangoInsn* out) {
   out->shift_type = 0;
   out->shift_amount = 0;
   out->is_imm = 0;
+  out->shift_by_reg = 0;
   out->sets_flags = 0;
   out->u = 0;
   out->b = 0;
@@ -49,24 +50,26 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
-  /* MUL Rd,Rm,Rs: cond 000000 A S Rd 0000 Rs 1001 Rm. Same bits27-26 as
+  /* MUL/MLA: cond 000000 A S Rd Ra Rs 1001 Rm. Same bits27-26 as
    * data-processing below, so this must be checked first or AND/EOR would
    * silently steal it (their opcodes are 0000/0001, exactly A/S here). */
   if (((word >> 22) & 0x3F) == 0x0 && ((word >> 4) & 0xF) == 0x9) {
     uint32_t a = (word >> 21) & 0x1;
     uint32_t s = (word >> 20) & 0x1;
     uint32_t rd = (word >> 16) & 0xF;
-    uint32_t rn_field = (word >> 12) & 0xF;
+    uint32_t ra = (word >> 12) & 0xF;
     uint32_t rs = (word >> 8) & 0xF;
     uint32_t rm = word & 0xF;
-    if (a) {
-      return -1; /* MLA, not supported yet */
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC || rs == MANGO_REG_PC ||
+        (a && ra == MANGO_REG_PC)) {
+      return -1; /* PC as an operand is UNPREDICTABLE */
     }
-    if (rn_field != 0 || rd == MANGO_REG_PC || rm == MANGO_REG_PC || rs == MANGO_REG_PC) {
-      return -1; /* SBZ violated, or PC as an operand, both UNPREDICTABLE */
+    if (!a && ra != 0) {
+      return -1; /* MUL's Ra field is SBZ */
     }
-    out->op = MANGO_OP_MUL;
+    out->op = a ? MANGO_OP_MLA : MANGO_OP_MUL;
     out->rd = rd;
+    out->rn = ra; /* accumulate for MLA; 0 for MUL */
     out->rm = rm;
     out->rs = rs;
     out->sets_flags = (int)s;
@@ -153,39 +156,80 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       }
       out->is_imm = 1;
       out->imm = val;
+      out->shift_amount = rot; /* 0 => C unaffected; else C = rotated bit 31 */
     } else {
       uint32_t shift_by_reg = (operand2 >> 4) & 0x1;
-      if (shift_by_reg) {
-        return -1; /* register-specified shift amount not supported yet */
-      }
       uint32_t shift_type = (operand2 >> 5) & 0x3;
-      uint32_t shift_amount = (operand2 >> 7) & 0x1F;
-      if (shift_type != 0 && shift_amount == 0) {
-        return -1; /* #0 means #32 for LSR/ASR, RRX for ROR, see decoder.h */
+      uint32_t rm = operand2 & 0xF;
+      if (shift_by_reg) {
+        if ((operand2 >> 7) & 0x1) {
+          return -1; /* bit 7 must be 0; 1 is multiply/SWP/etc. */
+        }
+        uint32_t rs = (operand2 >> 8) & 0xF;
+        if (rs == MANGO_REG_PC) {
+          return -1; /* register-specified shift with Rs=PC is UNPREDICTABLE */
+        }
+        out->rm = rm;
+        out->rs = rs;
+        out->shift_type = shift_type;
+        out->shift_by_reg = 1;
+      } else {
+        /* amount 0 is LSL #0, LSR #32, ASR #32, or RRX — execute handles it */
+        out->rm = rm;
+        out->shift_type = shift_type;
+        out->shift_amount = (operand2 >> 7) & 0x1F;
       }
-      out->rm = operand2 & 0xF;
-      out->shift_type = shift_type;
-      out->shift_amount = shift_amount;
     }
     return 0;
   }
 
-  /* LDR/STR immediate offset, no writeback: bits 27-26=01, I=0, P=1, W=0 */
-  if (((word >> 26) & 0x3) == 0x1 && ((word >> 25) & 0x1) == 0 && ((word >> 24) & 0x1) == 1 &&
-      ((word >> 21) & 0x1) == 0) {
+  /* LDR/STR: bits 27-26=01. Immediate or register offset, pre/post-index,
+   * optional writeback. P=0 W=1 is LDRT/STRT, not this subset. */
+  if (((word >> 26) & 0x3) == 0x1) {
+    uint32_t i = (word >> 25) & 0x1;
+    uint32_t p = (word >> 24) & 0x1;
     uint32_t u = (word >> 23) & 0x1;
     uint32_t b = (word >> 22) & 0x1;
+    uint32_t w = (word >> 21) & 0x1;
     uint32_t l = (word >> 20) & 0x1;
     uint32_t rn = (word >> 16) & 0xF;
     uint32_t rt = (word >> 12) & 0xF;
-    uint32_t imm12 = word & 0xFFF;
+    uint32_t operand12 = word & 0xFFF;
+    int writeback = (!p || w) ? 1 : 0;
+
+    if (!p && w) {
+      return -1; /* LDRT/STRT unprivileged form */
+    }
+    if (rt == MANGO_REG_PC) {
+      return -1; /* LDR/STR PC is an indirect branch, not in this subset */
+    }
+    if (writeback && rn == MANGO_REG_PC) {
+      return -1; /* writeback into PC is UNPREDICTABLE */
+    }
+    if (writeback && l && rt == rn) {
+      return -1; /* LDR writeback into the same register as the dest */
+    }
 
     out->op = l ? MANGO_OP_LDR : MANGO_OP_STR;
     out->rn = rn;
     out->rd = rt;
-    out->imm = imm12;
     out->u = (int)u;
     out->b = (int)b;
+    out->p = (int)p;
+    out->w = writeback;
+
+    if (!i) {
+      out->is_imm = 1;
+      out->imm = operand12;
+    } else {
+      if (operand12 & 0x10u) {
+        return -1; /* bit 4 must be 0; 1 is media/undefined, not Rm-shift */
+      }
+      out->is_imm = 0;
+      out->rm = operand12 & 0xF;
+      out->shift_type = (operand12 >> 5) & 0x3;
+      out->shift_amount = (operand12 >> 7) & 0x1F;
+    }
     return 0;
   }
 

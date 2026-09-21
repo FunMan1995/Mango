@@ -1092,25 +1092,267 @@ static int test_stm_out_of_bounds_rejected(void) {
   return 0;
 }
 
-static int test_mla_and_s0_compares_rejected(void) {
-  /* MLA (the A=1 sibling of MUL) and TST/TEQ/CMP/CMN with S=0 both share
-   * bit patterns with real opcodes (AND/EOR and MRS/MSR respectively);
-   * decoding either as if they were is a silent-corruption bug waiting
-   * to happen, so both must be flatly rejected instead of guessed at. */
+static int test_s0_compares_rejected(void) {
+  /* TST/TEQ/CMP/CMN with S=0 isn't those ops at all (MRS/MSR overlap);
+   * decoding it as a flag-less compare would be silently wrong. */
   MangoInsn insn;
-  uint32_t mla = 0xE0203190u; /* mla r0, r0, r1, r3 */
-  if (mango_decode(mla, &insn) == 0) {
-    fprintf(stderr, "FAIL(mla_and_s0_compares_rejected): mla was decoded, should be rejected\n");
-    return 1;
-  }
   uint32_t cmp_s0 = 0xE1400001u; /* looks like "cmp r0,r1" but S=0: not really CMP */
   if (mango_decode(cmp_s0, &insn) == 0) {
     fprintf(stderr,
-            "FAIL(mla_and_s0_compares_rejected): CMP-shaped word with S=0 was decoded, "
+            "FAIL(s0_compares_rejected): CMP-shaped word with S=0 was decoded, "
             "should be rejected\n");
     return 1;
   }
-  printf("ok: mla and S=0 tst/teq/cmp/cmn shapes correctly rejected\n");
+  printf("ok: S=0 tst/teq/cmp/cmn shapes correctly rejected\n");
+  return 0;
+}
+
+static uint32_t encode_mla(uint32_t rd, uint32_t rm, uint32_t rs, uint32_t ra) {
+  return 0xE0200090u | ((rd & 0xFu) << 16) | ((ra & 0xFu) << 12) | ((rs & 0xFu) << 8) | (rm & 0xFu);
+}
+
+static uint32_t encode_ldst(int i, int p, int u, int b, int w, int l, uint32_t rn, uint32_t rt,
+                            uint32_t operand12) {
+  return 0xE0000000u | (1u << 26) | ((uint32_t)i << 25) | ((uint32_t)p << 24) |
+         ((uint32_t)u << 23) | ((uint32_t)b << 22) | ((uint32_t)w << 21) | ((uint32_t)l << 20) |
+         ((rn & 0xFu) << 16) | ((rt & 0xFu) << 12) | (operand12 & 0xFFFu);
+}
+
+static int test_mla(void) {
+  uint32_t mla = encode_mla(0, 0, 1, 3); /* mla r0, r0, r1, r3 */
+  if (mla != 0xE0203190u) {
+    fprintf(stderr, "FAIL(mla): encoder mismatch, got 0x%08x\n", mla);
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A00006u, /* mov r0, #6 */
+      0xE3A01007u, /* mov r1, #7 */
+      0xE3A0300Au, /* mov r3, #10 */
+      0xE0203190u, /* mla r0, r0, r1, r3 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 5);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0x4242u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x4242u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(mla): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 52) {
+    fprintf(stderr, "FAIL(mla): expected r0 == 52 (6*7+10), got %u\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: mla r0, r0, r1, r3 (r0 = %u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_ldr_str_writeback_and_postindex(void) {
+  uint32_t str_pre = encode_ldst(0, 1, 1, 0, 1, 0, 1, 0, 4);  /* str r0, [r1, #4]! */
+  uint32_t str_post = encode_ldst(0, 0, 1, 0, 0, 0, 1, 3, 4); /* str r3, [r1], #4 */
+  uint32_t ldr_neg = encode_ldst(0, 1, 0, 0, 0, 1, 1, 4, 4);  /* ldr r4, [r1, #-4] */
+  if (str_pre != 0xE5A10004u || str_post != 0xE4813004u || ldr_neg != 0xE5114004u) {
+    fprintf(stderr, "FAIL(ldr_str_writeback): encoder mismatch\n");
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A00064u, /* mov r0, #100 */
+      0xE3A01040u, /* mov r1, #64 */
+      0xE5A10004u, /* str r0, [r1, #4]! */
+      0xE3A03009u, /* mov r3, #9 */
+      0xE4813004u, /* str r3, [r1], #4 */
+      0xE5114004u, /* ldr r4, [r1, #-4] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 7);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0x5151u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x5151u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(ldr_str_writeback): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  /* str [r1,#4]! with r1=64: mem[68]=100, r1=68. Then str [r1],#4 with r3=9:
+   * mem[68]=9, r1=72. Then ldr r4, [r1, #-4]: r4=mem[68]=9, r1 stays 72. */
+  if (cpu.r[1] != 72 || cpu.r[4] != 9 || bytes_to_u32_le(mem_buf + 68) != 9) {
+    fprintf(stderr, "FAIL(ldr_str_writeback): r1=%u r4=%u mem[68]=%u\n", cpu.r[1], cpu.r[4],
+            bytes_to_u32_le(mem_buf + 68));
+    return 1;
+  }
+  printf("ok: ldr/str pre-index writeback and post-index\n");
+  return 0;
+}
+
+static int test_ldr_register_offset(void) {
+  uint32_t str_reg = encode_ldst(1, 1, 1, 0, 0, 0, 1, 0, 2);     /* str r0, [r1, r2] */
+  uint32_t ldr_lsl = encode_ldst(1, 1, 1, 0, 0, 1, 1, 4, 0x83u); /* ldr r4, [r1, r3, LSL #1] */
+  if (str_reg != 0xE7810002u || ldr_lsl != 0xE7914083u) {
+    fprintf(stderr, "FAIL(ldr_register_offset): encoder mismatch str=0x%08x ldr=0x%08x\n", str_reg,
+            ldr_lsl);
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A00037u, /* mov r0, #55 */
+      0xE3A01040u, /* mov r1, #64 */
+      0xE3A02008u, /* mov r2, #8 */
+      0xE7810002u, /* str r0, [r1, r2] */
+      0xE3A03004u, /* mov r3, #4 */
+      0xE7914083u, /* ldr r4, [r1, r3, LSL #1] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 7);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0x6161u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x6161u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(ldr_register_offset): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[4] != 55 || bytes_to_u32_le(mem_buf + 72) != 55 || cpu.r[1] != 64) {
+    fprintf(stderr, "FAIL(ldr_register_offset): r4=%u mem[72]=%u r1=%u\n", cpu.r[4],
+            bytes_to_u32_le(mem_buf + 72), cpu.r[1]);
+    return 1;
+  }
+  printf("ok: ldr/str register offset, including LSL #1\n");
+  return 0;
+}
+
+static int test_register_specified_shift(void) {
+  /* mov r1, r0, LSL r2 / mov r3, r1, LSR r2 */
+  static const uint32_t kProgram[] = {
+      0xE3A00003u, /* mov r0, #3 */
+      0xE3A02004u, /* mov r2, #4 */
+      0xE1A01210u, /* mov r1, r0, LSL r2 */
+      0xE1A03231u, /* mov r3, r1, LSR r2 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 5);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0x7171u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x7171u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(register_specified_shift): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[1] != 48 || cpu.r[3] != 3) {
+    fprintf(stderr, "FAIL(register_specified_shift): expected r1=48 r3=3, got r1=%u r3=%u\n",
+            cpu.r[1], cpu.r[3]);
+    return 1;
+  }
+  printf("ok: register-specified shift LSL/LSR Rs\n");
+  return 0;
+}
+
+static int test_shifter_carry_and_rrx(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A00001u, /* mov r0, #1 */
+      0xE1A00F80u, /* mov r0, r0, LSL #31 */
+      0xE1B01080u, /* movs r1, r0, LSL #1 */
+      0xE1B03020u, /* movs r3, r0, LSR #32 */
+      0xE1B02060u, /* movs r2, r0, RRX */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0x8181u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x8181u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(shifter_carry_and_rrx): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[1] != 0 || cpu.r[3] != 0) {
+    fprintf(stderr, "FAIL(shifter_carry_and_rrx): expected r1=0 r3=0, got r1=%u r3=%u\n", cpu.r[1],
+            cpu.r[3]);
+    return 1;
+  }
+  if (cpu.r[2] != 0xC0000000u) {
+    fprintf(stderr, "FAIL(shifter_carry_and_rrx): expected r2=0xc0000000 after RRX, got 0x%08x\n",
+            cpu.r[2]);
+    return 1;
+  }
+  if ((cpu.cpsr & MANGO_CPSR_C) != 0) {
+    fprintf(stderr, "FAIL(shifter_carry_and_rrx): RRX of even r0 should clear C\n");
+    return 1;
+  }
+  if ((cpu.cpsr & MANGO_CPSR_Z) != 0 || (cpu.cpsr & MANGO_CPSR_N) == 0) {
+    fprintf(stderr, "FAIL(shifter_carry_and_rrx): expected N set and Z clear after movs rrx\n");
+    return 1;
+  }
+  printf("ok: shifter carry-out, LSR #32, and RRX\n");
+  return 0;
+}
+
+static int test_ldst_rejected_shapes(void) {
+  MangoInsn insn;
+  uint32_t ldrt = encode_ldst(0, 0, 1, 0, 1, 1, 1, 0, 0); /* ldrt r0, [r1] */
+  if (mango_decode(ldrt, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldst_rejected_shapes): ldrt was decoded\n");
+    return 1;
+  }
+  uint32_t wb_pc = encode_ldst(0, 1, 1, 0, 1, 1, MANGO_REG_PC, 0, 4); /* ldr r0, [pc, #4]! */
+  if (mango_decode(wb_pc, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldst_rejected_shapes): writeback into pc was decoded\n");
+    return 1;
+  }
+  uint32_t ldr_same = encode_ldst(0, 1, 1, 0, 1, 1, 1, 1, 4); /* ldr r1, [r1, #4]! */
+  if (mango_decode(ldr_same, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldst_rejected_shapes): ldr writeback into same dest was decoded\n");
+    return 1;
+  }
+  uint32_t shift_pc = 0xE1A00F11u; /* mov r0, r1, LSL pc */
+  if (mango_decode(shift_pc, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldst_rejected_shapes): LSL pc shift amount was decoded\n");
+    return 1;
+  }
+  printf("ok: ldrt / writeback-pc / ldr-same-dest / LSL-pc shapes rejected\n");
   return 0;
 }
 
@@ -1134,13 +1376,19 @@ int main(void) {
   failures += test_sbc_rsc();
   failures += test_mul();
   failures += test_tst_teq_cmn_dont_write_rd();
-  failures += test_mla_and_s0_compares_rejected();
+  failures += test_s0_compares_rejected();
   failures += test_svc_stops_and_can_resume();
   failures += test_push_pop_roundtrip();
   failures += test_stmia_ldmia_no_writeback();
   failures += test_stmib_and_writeback();
   failures += test_ldm_stm_rejected_shapes();
   failures += test_stm_out_of_bounds_rejected();
+  failures += test_mla();
+  failures += test_ldr_str_writeback_and_postindex();
+  failures += test_ldr_register_offset();
+  failures += test_register_specified_shift();
+  failures += test_shifter_carry_and_rrx();
+  failures += test_ldst_rejected_shapes();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);
