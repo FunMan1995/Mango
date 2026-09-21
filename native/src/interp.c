@@ -86,7 +86,8 @@ static uint32_t mango_flags_for_sub(uint32_t lhs, uint32_t rhs, uint32_t result)
 /* NZCV for ADC (result = lhs + rhs + carry_in); SBC/RSC reuse this too,
  * feeding it ~rhs (see their cases below), the same trick real ALU
  * hardware uses since A-B-1+C == A+~B+C in two's complement. */
-static uint32_t mango_flags_for_adc(uint32_t lhs, uint32_t rhs, uint32_t carry_in, uint32_t result) {
+static uint32_t mango_flags_for_adc(uint32_t lhs, uint32_t rhs, uint32_t carry_in,
+                                    uint32_t result) {
   uint32_t flags = 0;
   uint64_t wide = (uint64_t)lhs + rhs + carry_in;
   flags |= (result == 0) ? MANGO_CPSR_Z : 0;
@@ -198,9 +199,9 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           uint32_t rhs = mango_read_operand2(cpu, addr, &insn);
           uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
           uint32_t result = insn.op == MANGO_OP_AND   ? (lhs & rhs)
-                             : insn.op == MANGO_OP_EOR ? (lhs ^ rhs)
-                             : insn.op == MANGO_OP_ORR ? (lhs | rhs)
-                                                        : (lhs & ~rhs);
+                            : insn.op == MANGO_OP_EOR ? (lhs ^ rhs)
+                            : insn.op == MANGO_OP_ORR ? (lhs | rhs)
+                                                      : (lhs & ~rhs);
           cpu->r[insn.rd] = result;
           if (insn.sets_flags) {
             mango_set_nzcv(cpu, mango_flags_for_logical(cpu, result));
@@ -352,6 +353,58 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             } else {
               mango_store_u32_le(mem->bytes + eaddr, cpu->r[insn.rd]);
             }
+          }
+          break;
+        }
+
+        case MANGO_OP_LDM:
+        case MANGO_OP_STM: {
+          /* Lowest-numbered register always lands at the lowest address,
+           * regardless of IA/IB/DA/DB. P/U only choose the start address
+           * and whether Rn moves; see ARM ARM LDM/STM addressing modes.
+           * PUSH = STMDB sp!, POP = LDMIA sp!. */
+          uint32_t count = 0;
+          for (uint32_t i = 0; i < 16; i++) {
+            if (insn.reglist & (1u << i)) {
+              count++;
+            }
+          }
+          uint32_t base = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t start = insn.u ? (insn.p ? base + 4u : base)
+                                  : (insn.p ? base - 4u * count : base - 4u * count + 4u);
+          if ((start % 4u) != 0) {
+            return -1;
+          }
+          if ((uint64_t)start + (uint64_t)count * 4u > mem->size) {
+            return -1;
+          }
+
+          uint32_t eaddr = start;
+          int loaded_pc = 0;
+          uint32_t new_pc = 0;
+          for (uint32_t i = 0; i < 16; i++) {
+            if ((insn.reglist & (1u << i)) == 0) {
+              continue;
+            }
+            if (insn.op == MANGO_OP_STM) {
+              mango_store_u32_le(mem->bytes + eaddr, mango_read_reg(cpu, addr, i));
+            } else if (i == MANGO_REG_PC) {
+              uint32_t value = mango_load_u32_le(mem->bytes + eaddr);
+              if ((value & 3u) != 0) {
+                return -1; /* Thumb or unaligned ARM PC, not in this subset */
+              }
+              loaded_pc = 1;
+              new_pc = value;
+            } else {
+              cpu->r[i] = mango_load_u32_le(mem->bytes + eaddr);
+            }
+            eaddr += 4u;
+          }
+          if (insn.w) {
+            cpu->r[insn.rn] = insn.u ? base + 4u * count : base - 4u * count;
+          }
+          if (loaded_pc) {
+            next_addr = new_pc;
           }
           break;
         }

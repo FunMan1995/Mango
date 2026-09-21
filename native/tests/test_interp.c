@@ -637,8 +637,9 @@ static int test_full_alu_opcodes(void) {
     uint32_t want;
     const char* name;
   } checks[] = {
-      {cpu.r[1], 0x88, "r1 (and)"}, {cpu.r[2], 0x3C, "r2 (eor)"}, {cpu.r[3], 0xCF, "r3 (orr)"},
-      {cpu.r[4], 0x0C, "r4 (bic)"}, {cpu.r[5], 0xFFFFFFFFu, "r5 (mvn)"}, {cpu.r[6], 0x33, "r6 (rsb)"},
+      {cpu.r[1], 0x88, "r1 (and)"},        {cpu.r[2], 0x3C, "r2 (eor)"},
+      {cpu.r[3], 0xCF, "r3 (orr)"},        {cpu.r[4], 0x0C, "r4 (bic)"},
+      {cpu.r[5], 0xFFFFFFFFu, "r5 (mvn)"}, {cpu.r[6], 0x33, "r6 (rsb)"},
   };
   for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
     if (checks[i].reg != checks[i].want) {
@@ -724,7 +725,8 @@ static int test_sbc_rsc(void) {
     return 1;
   }
   if (cpu.r[0] != 0xFFFFFFFBu || cpu.r[1] != 0xFFFFFFF8u || cpu.r[2] != 4) {
-    fprintf(stderr, "FAIL(sbc_rsc): expected r0=0xfffffffb r1=0xfffffff8 r2=4, got r0=0x%x r1=0x%x r2=%u\n",
+    fprintf(stderr,
+            "FAIL(sbc_rsc): expected r0=0xfffffffb r1=0xfffffff8 r2=4, got r0=0x%x r1=0x%x r2=%u\n",
             cpu.r[0], cpu.r[1], cpu.r[2]);
     return 1;
   }
@@ -797,7 +799,8 @@ static int test_tst_teq_cmn_dont_write_rd(void) {
   }
   if (cpu.r[0] != 0x0F || cpu.r[1] != 0x99) {
     fprintf(stderr,
-            "FAIL(tst_teq_cmn_dont_write_rd): expected r0=0x0f r1=0x99 unchanged, got r0=0x%x r1=0x%x\n",
+            "FAIL(tst_teq_cmn_dont_write_rd): expected r0=0x0f r1=0x99 unchanged, got r0=0x%x "
+            "r1=0x%x\n",
             cpu.r[0], cpu.r[1]);
     return 1;
   }
@@ -843,7 +846,8 @@ static int test_svc_stops_and_can_resume(void) {
   cpu.r[MANGO_REG_PC] += 4;
   rc = mango_interp_run(&cpu, &mem, 0x9999u, 100);
   if (rc != 0 || cpu.r[0] != 99) {
-    fprintf(stderr, "FAIL(svc_stops_and_can_resume): resumed run gave rc=%d r0=%u, want rc=0 r0=99\n", rc,
+    fprintf(stderr,
+            "FAIL(svc_stops_and_can_resume): resumed run gave rc=%d r0=%u, want rc=0 r0=99\n", rc,
             cpu.r[0]);
     return 1;
   }
@@ -851,6 +855,242 @@ static int test_svc_stops_and_can_resume(void) {
   return 0;
 }
 
+/* Independent of mango_decode: cond=AL, bits 27-25=100. Cross-checks the
+ * hand-written LDM/STM words, same "re-derive, don't trust hex blindly"
+ * rule as the rest of this file. */
+static uint32_t encode_ldm_stm(int p, int u, int w, int l, uint32_t rn, uint32_t reglist) {
+  return 0xE0000000u | (1u << 27) | ((uint32_t)p << 24) | ((uint32_t)u << 23) |
+         ((uint32_t)w << 21) | ((uint32_t)l << 20) | ((rn & 0xFu) << 16) | (reglist & 0xFFFFu);
+}
+
+static int test_push_pop_roundtrip(void) {
+  /* Classic A32 prologue/epilogue: PUSH {r4, r5, lr} / POP {r4, r5, pc}.
+   * Callee clobbers r4/r5, then the pop must restore them and return via
+   * the saved LR loaded into PC, no BX. */
+  uint32_t push = encode_ldm_stm(1, 0, 1, 0, MANGO_REG_SP, (1u << 4) | (1u << 5) | (1u << 14));
+  uint32_t pop = encode_ldm_stm(0, 1, 1, 1, MANGO_REG_SP, (1u << 4) | (1u << 5) | (1u << 15));
+  if (push != 0xE92D4030u || pop != 0xE8BD8030u) {
+    fprintf(stderr, "FAIL(push_pop_roundtrip): encoder mismatch, push=0x%08x pop=0x%08x\n", push,
+            pop);
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE92D4030u, /* push {r4, r5, lr}  STMDB sp!, {r4, r5, lr} */
+      0xE3A04001u, /* mov r4, #1 */
+      0xE3A05002u, /* mov r5, #2 */
+      0xE8BD8030u, /* pop {r4, r5, pc}   LDMIA sp!, {r4, r5, pc} */
+  };
+
+  uint8_t mem_buf[256];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 4);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[4] = 0xA1A1A1A1u;
+  cpu.r[5] = 0xB2B2B2B2u;
+  cpu.r[MANGO_REG_SP] = 128;
+  cpu.r[MANGO_REG_LR] = 0xDEAD0000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xDEAD0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(push_pop_roundtrip): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[4] != 0xA1A1A1A1u || cpu.r[5] != 0xB2B2B2B2u) {
+    fprintf(stderr, "FAIL(push_pop_roundtrip): callee-saved regs not restored, r4=0x%x r5=0x%x\n",
+            cpu.r[4], cpu.r[5]);
+    return 1;
+  }
+  if (cpu.r[MANGO_REG_SP] != 128) {
+    fprintf(stderr, "FAIL(push_pop_roundtrip): expected sp == 128 after pop, got %u\n",
+            cpu.r[MANGO_REG_SP]);
+    return 1;
+  }
+  if (cpu.r[MANGO_REG_PC] != 0xDEAD0000u) {
+    fprintf(stderr, "FAIL(push_pop_roundtrip): expected pc == saved lr, got 0x%08x\n",
+            cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: push/pop round trip restores r4/r5 and returns via pc\n");
+  return 0;
+}
+
+static int test_stmia_ldmia_no_writeback(void) {
+  /* STMIA/LDMIA without writeback: lowest register at lowest address, base
+   * left alone. r1 points at byte 64, past the program. */
+  uint32_t stmia = encode_ldm_stm(0, 1, 0, 0, 1, 0x000Du); /* {r0, r2, r3} */
+  uint32_t ldmia = encode_ldm_stm(0, 1, 0, 1, 1, 0x000Du);
+  if (stmia != 0xE881000Du || ldmia != 0xE891000Du) {
+    fprintf(stderr, "FAIL(stmia_ldmia_no_writeback): encoder mismatch\n");
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A0000Au, /* mov r0, #10 */
+      0xE3A02014u, /* mov r2, #20 */
+      0xE3A0301Eu, /* mov r3, #30 */
+      0xE3A01040u, /* mov r1, #64 */
+      0xE881000Du, /* stmia r1, {r0, r2, r3} */
+      0xE3A00000u, /* mov r0, #0 */
+      0xE3A02000u, /* mov r2, #0 */
+      0xE3A03000u, /* mov r3, #0 */
+      0xE891000Du, /* ldmia r1, {r0, r2, r3} */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 10);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(stmia_ldmia_no_writeback): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 10 || cpu.r[2] != 20 || cpu.r[3] != 30) {
+    fprintf(stderr, "FAIL(stmia_ldmia_no_writeback): expected r0=10 r2=20 r3=30, got %u %u %u\n",
+            cpu.r[0], cpu.r[2], cpu.r[3]);
+    return 1;
+  }
+  if (cpu.r[1] != 64) {
+    fprintf(stderr,
+            "FAIL(stmia_ldmia_no_writeback): r1 should be unchanged without writeback, got %u\n",
+            cpu.r[1]);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + 64) != 10 || bytes_to_u32_le(mem_buf + 68) != 20 ||
+      bytes_to_u32_le(mem_buf + 72) != 30) {
+    fprintf(stderr,
+            "FAIL(stmia_ldmia_no_writeback): memory order is not lowest-reg at lowest-addr\n");
+    return 1;
+  }
+  printf("ok: stmia/ldmia without writeback, lowest register at lowest address\n");
+  return 0;
+}
+
+static int test_stmib_and_writeback(void) {
+  /* STMIB (P=1) must skip the word at the base; STMIA! must advance r1. */
+  uint32_t stmib = encode_ldm_stm(1, 1, 0, 0, 1, 0x0005u); /* {r0, r2} */
+  uint32_t stmia_wb = encode_ldm_stm(0, 1, 1, 0, 1, 0x0005u);
+  if (stmib != 0xE9810005u || stmia_wb != 0xE8A10005u) {
+    fprintf(stderr, "FAIL(stmib_and_writeback): encoder mismatch stmib=0x%08x stmia!=0x%08x\n",
+            stmib, stmia_wb);
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE3A00007u, /* mov r0, #7 */
+      0xE3A02009u, /* mov r2, #9 */
+      0xE3A01040u, /* mov r1, #64 */
+      0xE9810005u, /* stmib r1, {r0, r2} */
+      0xE8A10005u, /* stmia r1!, {r0, r2} */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0x4321u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x4321u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(stmib_and_writeback): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  /* STMIB r1=64: stores at 68 and 72, leaves byte 64 alone. Then STMIA!
+   * stores at 64 and 68 and sets r1 to 72. So 64 and 68 are 7 and 9 from
+   * the second store; 72 is still 9 from STMIB. */
+  if (bytes_to_u32_le(mem_buf + 64) != 7 || bytes_to_u32_le(mem_buf + 68) != 9 ||
+      bytes_to_u32_le(mem_buf + 72) != 9) {
+    fprintf(stderr, "FAIL(stmib_and_writeback): mem[64,68,72]=%u,%u,%u want 7,9,9\n",
+            bytes_to_u32_le(mem_buf + 64), bytes_to_u32_le(mem_buf + 68),
+            bytes_to_u32_le(mem_buf + 72));
+    return 1;
+  }
+  if (cpu.r[1] != 72) {
+    fprintf(stderr, "FAIL(stmib_and_writeback): expected r1 == 72 after stmia!, got %u\n",
+            cpu.r[1]);
+    return 1;
+  }
+  printf("ok: stmib addressing and stmia writeback\n");
+  return 0;
+}
+
+static int test_ldm_stm_rejected_shapes(void) {
+  MangoInsn insn;
+  uint32_t empty = encode_ldm_stm(0, 1, 0, 0, 0, 0);
+  if (mango_decode(empty, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): empty reglist was decoded\n");
+    return 1;
+  }
+  uint32_t s_bit = 0xE8C00001u; /* STMIA r0, {r0} with S=1 */
+  if (mango_decode(s_bit, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): S-bit form was decoded\n");
+    return 1;
+  }
+  uint32_t stm_pc = encode_ldm_stm(0, 1, 0, 0, 0, 1u << 15);
+  if (mango_decode(stm_pc, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): stm of pc was decoded\n");
+    return 1;
+  }
+  uint32_t wb_rn = encode_ldm_stm(0, 1, 1, 0, 0, 1u); /* STMIA r0!, {r0} */
+  if (mango_decode(wb_rn, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): writeback with rn in list was decoded\n");
+    return 1;
+  }
+  uint32_t pc_base = encode_ldm_stm(0, 1, 0, 0, MANGO_REG_PC, 1u);
+  if (mango_decode(pc_base, &insn) == 0) {
+    fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): pc as base was decoded\n");
+    return 1;
+  }
+  printf("ok: empty/S-bit/stm-pc/wb-rn-in-list/pc-base ldm/stm shapes rejected\n");
+  return 0;
+}
+
+static int test_stm_out_of_bounds_rejected(void) {
+  /* stmia r1, {r0, r2, r3} at address 24 in a 32-byte buffer: 24+12=36. */
+  static const uint32_t kProgram[] = {
+      0xE3A01018u, /* mov r1, #24 */
+      0xE881000Du, /* stmia r1, {r0, r2, r3} */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xFFFFFFFFu, 100);
+  if (rc == 0) {
+    fprintf(stderr, "FAIL(stm_out_of_bounds_rejected): expected a failure, got success\n");
+    return 1;
+  }
+  printf("ok: out-of-bounds stm correctly rejected\n");
+  return 0;
+}
 
 static int test_mla_and_s0_compares_rejected(void) {
   /* MLA (the A=1 sibling of MUL) and TST/TEQ/CMP/CMN with S=0 both share
@@ -896,6 +1136,11 @@ int main(void) {
   failures += test_tst_teq_cmn_dont_write_rd();
   failures += test_mla_and_s0_compares_rejected();
   failures += test_svc_stops_and_can_resume();
+  failures += test_push_pop_roundtrip();
+  failures += test_stmia_ldmia_no_writeback();
+  failures += test_stmib_and_writeback();
+  failures += test_ldm_stm_rejected_shapes();
+  failures += test_stm_out_of_bounds_rejected();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

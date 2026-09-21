@@ -4,13 +4,15 @@
 
 int mango_decode(uint32_t word, MangoInsn* out) {
   out->cond = (word >> 28) & 0xF;
-  out->rd = out->rn = out->rm = out->rs = out->imm = 0;
+  out->rd = out->rn = out->rm = out->rs = out->imm = out->reglist = 0;
   out->shift_type = 0;
   out->shift_amount = 0;
   out->is_imm = 0;
   out->sets_flags = 0;
   out->u = 0;
   out->b = 0;
+  out->p = 0;
+  out->w = 0;
   out->op = MANGO_OP_UNKNOWN;
 
   if (out->cond == 0xF) {
@@ -184,6 +186,43 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     out->imm = imm12;
     out->u = (int)u;
     out->b = (int)b;
+    return 0;
+  }
+
+  /* LDM/STM: bits 27-25 = 100. PUSH is STMDB sp!, POP is LDMIA sp!. */
+  if (((word >> 25) & 0x7) == 0x4) {
+    uint32_t p = (word >> 24) & 0x1;
+    uint32_t u = (word >> 23) & 0x1;
+    uint32_t s = (word >> 22) & 0x1;
+    uint32_t w = (word >> 21) & 0x1;
+    uint32_t l = (word >> 20) & 0x1;
+    uint32_t rn = (word >> 16) & 0xF;
+    uint32_t reglist = word & 0xFFFFu;
+
+    if (s) {
+      return -1; /* user-bank / SPSR form, not needed for user-mode code */
+    }
+    if (reglist == 0) {
+      return -1; /* empty list is UNPREDICTABLE */
+    }
+    if (rn == MANGO_REG_PC) {
+      return -1; /* PC as base is UNPREDICTABLE */
+    }
+    if (w && (reglist & (1u << rn))) {
+      return -1; /* writeback with Rn in the list is UNPREDICTABLE */
+    }
+    if (!l && (reglist & (1u << MANGO_REG_PC))) {
+      /* STM of PC stores PC+8 or PC+12 depending on the core; refuse to
+       * guess. Real prologues push LR, not PC. */
+      return -1;
+    }
+
+    out->op = l ? MANGO_OP_LDM : MANGO_OP_STM;
+    out->rn = rn;
+    out->reglist = reglist;
+    out->p = (int)p;
+    out->u = (int)u;
+    out->w = (int)w;
     return 0;
   }
 

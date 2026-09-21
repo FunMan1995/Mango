@@ -16,9 +16,17 @@ synthetic programs, not real app code yet.
   `RSC`, `TST`, `TEQ`, `CMP`, `CMN`, `ORR`, `MOV`, `BIC`, `MVN`, all 16
   ARM ALU opcodes), `MUL` (not `MLA`, its accumulate-form sibling, that's
   explicitly rejected rather than misdecoded, see below), `B`, `BL`, `BX`,
-  and `LDR`/`STR`/`LDRB`/`STRB` (immediate offset only: no register-offset
+  `LDR`/`STR`/`LDRB`/`STRB` (immediate offset only: no register-offset
   addressing, no post-indexing or writeback; `LDRB` zero-extends, there's
-  no signed byte load). Register operand2 can carry a shift now:
+  no signed byte load), and `LDM`/`STM` including the `PUSH`/`POP`
+  aliases (`STMDB sp!` / `LDMIA sp!`). Block transfers cover all four
+  addressing modes (IA/IB/DA/DB) with optional writeback. Lowest-numbered
+  register always lands at the lowest address. `LDM` of PC is a real
+  return (used by `POP {..., pc}`); `STM` of PC, an empty register list,
+  the S-bit user-bank/SPSR form, PC as the base register, and writeback
+  with Rn in the list are all rejected rather than guessed at, because
+  each is UNPREDICTABLE or implementation-defined on real hardware.
+  Register operand2 can carry a shift now:
   LSL/LSR/ASR/ROR by an immediate amount, not by a register-specified
   amount yet, and the `LSR #0`/`ASR #0`/`ROR #0` encodings are rejected
   since those actually mean `LSR #32`/`ASR #32`/RRX, not "shift by zero".
@@ -43,16 +51,15 @@ synthetic programs, not real app code yet.
   instruction address + 8" per real hardware semantics, which matters for
   the very common `LDR Rd, [PC, #imm]` literal-pool pattern. This is
   genuinely a subset, real apps will use far more of the ISA (Thumb-2,
-  register-offset addressing, `PUSH`/`POP`/`STM`/`LDM`, NEON, and so on
-  all still need doing).
+  register-offset addressing, NEON, and so on all still need doing).
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
-  Every fetch and every `LDR`/`STR`/`LDRB`/`STRB` is bounds-checked (word
-  accesses are also alignment-checked, byte ones aren't since any address
-  is a valid byte offset); out of range fails the run rather than reading
-  or writing past the buffer, and there are tests specifically proving
-  that (not just asserting it in a comment), see `docs/SECURITY.md` for
-  why that's the priority here.
+  Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDM`/`STM` is
+  bounds-checked (word accesses are also alignment-checked, byte ones
+  aren't since any address is a valid byte offset); out of range fails
+  the run rather than reading or writing past the buffer, and there are
+  tests specifically proving that (not just asserting it in a comment),
+  see `docs/SECURITY.md` for why that's the priority here.
 - `mango_interp_run` takes a `stop_addr` now, not just `max_steps`: it
   returns 0 when PC reaches that address, checked before every fetch.
   `BX` used to unconditionally return 0 on its own, which happened to
@@ -112,16 +119,18 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: twenty test programs, hand-encoded by working
-  out the A32 bit patterns by hand and cross-checked against an
+- `tests/test_interp.c`: twenty-four test programs, hand-encoded by
+  working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why
-  that second encoder exists). All pass under
+  that second encoder exists; `encode_ldm_stm` in the test file is the
+  same idea for block transfers). All pass under
   `-Wall -Wextra -Werror -fsanitize=address,undefined`, including two
   negative tests that specifically try an out-of-bounds and a misaligned
   `LDR` and check they're rejected, not just that the happy path works,
-  and two more checking `MLA` and `S=0` `TST`/`TEQ`/`CMP`/`CMN` shapes are
-  rejected rather than misdecoded. Earlier rounds of this (the `BX`
+  an out-of-bounds `STM`, rejected `LDM`/`STM` shapes (empty list, S-bit,
+  STM of PC, writeback with Rn in the list, PC as base), and `MLA` plus
+  `S=0` `TST`/`TEQ`/`CMP`/`CMN` shapes. Earlier rounds of this (the `BX`
   mask-width bug) caught real bugs during development, which is exactly
   the kind of mistake this subset of the project is prone to; more test
   cases from more people is how this gets more trustworthy, see
@@ -150,16 +159,14 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
 
 ## Where to look if you want to help
 
-- More A32 instructions: `PUSH`/`POP`/`STM`/`LDM` (stack save/restore,
-  needed for any real function's prologue/epilogue), `MLA` (`MUL`'s
-  accumulate-form sibling, decode already rejects it explicitly so it's
-  not silently wrong, just not implemented), register-specified shift
-  amount (`LSL Rs`, not just `LSL #imm`), register-offset and
-  post-indexed/writeback addressing for `LDR`/`STR`/`LDRB`/`STRB`, the
-  logical ops computing C from the shifter's carry-out instead of just
-  leaving it alone, then Thumb-2. Each addition should come with a
-  hand-derived test case the way the existing ones work, see
-  `docs/CONTRIBUTING.md`'s testing section.
+- More A32 instructions: `MLA` (`MUL`'s accumulate-form sibling, decode
+  already rejects it explicitly so it's not silently wrong, just not
+  implemented), register-specified shift amount (`LSL Rs`, not just
+  `LSL #imm`), register-offset and post-indexed/writeback addressing for
+  `LDR`/`STR`/`LDRB`/`STRB`, the logical ops computing C from the
+  shifter's carry-out instead of just leaving it alone, then Thumb-2.
+  Each addition should come with a hand-derived test case the way the
+  existing ones work, see `docs/CONTRIBUTING.md`'s testing section.
 - A real trampoline mechanism for `getTrampoline`: it can already find a
   requested symbol in a loaded guest library (`elf32.c`), but the real
   blocker is deeper than "generate a trampoline". A JNI native method's
