@@ -71,6 +71,9 @@ typedef enum MangoOp {
   MANGO_OP_BFI,
   MANGO_OP_UBFX,
   MANGO_OP_SBFX,
+  MANGO_OP_REV,
+  MANGO_OP_XTEND,
+  MANGO_OP_PKH,
 } MangoOp;
 
 typedef struct MangoInsn {

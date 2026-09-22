@@ -2426,6 +2426,58 @@ static int test_bfc_ubfx(void) {
   return 0;
 }
 
+static int test_rbit_uxt_rev(void) {
+  static const uint32_t kRbit[] = {
+      0xE3A01001u, /* mov r1, #1 */
+      0xE6FF0F31u, /* rbit r0, r1 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kRbit, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x9999u;
+  int rc = mango_interp_run(&cpu, &mem, 0x9999u, 100);
+  if (rc != 0 || cpu.r[0] != 0x80000000u) {
+    fprintf(stderr, "FAIL(rbit): rc=%d r0=0x%x\n", rc, cpu.r[0]);
+    return 1;
+  }
+
+  static const uint32_t kExt[] = {
+      0xE30A1BCDu, /* movw r1, #0xabcd */
+      0xE6FF0071u, /* uxth r0, r1 */
+      0xE6EF2071u, /* uxtb r2, r1 */
+      0xE6BF3071u, /* sxth r3, r1 */
+      0xE12FFF1Eu,
+  };
+  load_words(mem_buf, sizeof(mem_buf), kExt, 5);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x9999u;
+  rc = mango_interp_run(&cpu, &mem, 0x9999u, 100);
+  if (rc != 0 || cpu.r[0] != 0xABCDu || cpu.r[2] != 0xCDu || cpu.r[3] != 0xFFFFABCDu) {
+    fprintf(stderr, "FAIL(uxt): rc=%d r0=0x%x r2=0x%x r3=0x%x\n", rc, cpu.r[0], cpu.r[2],
+            cpu.r[3]);
+    return 1;
+  }
+
+  static const uint32_t kRev[] = {
+      0xE30A1BCDu, /* movw r1, #0xabcd */
+      0xE6BF0F31u, /* rev r0, r1 */
+      0xE12FFF1Eu,
+  };
+  load_words(mem_buf, sizeof(mem_buf), kRev, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x9999u;
+  rc = mango_interp_run(&cpu, &mem, 0x9999u, 100);
+  if (rc != 0 || cpu.r[0] != 0xCDAB0000u) {
+    fprintf(stderr, "FAIL(rev): rc=%d r0=0x%x\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: RBIT, UXTH/UXTB/SXTH, REV\n");
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2489,6 +2541,7 @@ int main(void) {
   failures += test_vaddi_i32();
   failures += test_vpush_vpop();
   failures += test_bfc_ubfx();
+  failures += test_rbit_uxt_rev();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

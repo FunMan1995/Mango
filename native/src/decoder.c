@@ -688,6 +688,91 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
+  /* Media: bits 27-24=0110, bit4=1. REV/RBIT, UXT/SXT, PKH. Must run
+   * before LDR/STR, which would see bit4=1 and reject these as undefined. */
+  if (((word >> 24) & 0xF) == 0x6 && ((word >> 4) & 1u) == 1) {
+    uint32_t op = (word >> 20) & 0xF;
+    uint32_t rn = (word >> 16) & 0xF;
+    uint32_t rd = (word >> 12) & 0xF;
+    uint32_t rm = word & 0xF;
+    uint32_t op2 = (word >> 4) & 0xF;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    if (rn == 0xFu && ((word >> 8) & 0xF) == 0xFu) {
+      if (op == 0xBu && op2 == 0x3u) {
+        out->op = MANGO_OP_REV;
+        out->rd = rd;
+        out->rm = rm;
+        out->imm = 0; /* REV */
+        return 0;
+      }
+      if (op == 0xBu && op2 == 0xBu) {
+        out->op = MANGO_OP_REV;
+        out->rd = rd;
+        out->rm = rm;
+        out->imm = 1; /* REV16 */
+        return 0;
+      }
+      if (op == 0xFu && op2 == 0xBu) {
+        out->op = MANGO_OP_REV;
+        out->rd = rd;
+        out->rm = rm;
+        out->imm = 2; /* REVSH */
+        return 0;
+      }
+      if (op == 0xFu && op2 == 0x3u) {
+        out->op = MANGO_OP_REV;
+        out->rd = rd;
+        out->rm = rm;
+        out->imm = 3; /* RBIT */
+        return 0;
+      }
+    }
+    if (((word >> 4) & 0x3Fu) == 0x07u) {
+      int uns;
+      int half;
+      switch (op) {
+        case 0xA:
+          uns = 0;
+          half = 0;
+          break; /* SXTB / SXTAB */
+        case 0xB:
+          uns = 0;
+          half = 1;
+          break; /* SXTH / SXTAH */
+        case 0xE:
+          uns = 1;
+          half = 0;
+          break; /* UXTB / UXTAB */
+        case 0xF:
+          uns = 1;
+          half = 1;
+          break; /* UXTH / UXTAH */
+        default:
+          return -1;
+      }
+      out->op = MANGO_OP_XTEND;
+      out->rd = rd;
+      out->rn = rn;
+      out->rm = rm;
+      out->imm = ((word >> 10) & 3u) * 8u;
+      out->u = uns;
+      out->b = half;
+      return 0;
+    }
+    if (op == 0x8u && (op2 & 3u) == 1u) {
+      /* PKHBT (bit6=0) / PKHTB (bit6=1), bits 5-4 = 01. */
+      out->op = MANGO_OP_PKH;
+      out->rd = rd;
+      out->rn = rn;
+      out->rm = rm;
+      out->shift_amount = (word >> 7) & 0x1Fu;
+      out->b = (op2 >> 2) & 1; /* 0=PKHBT LSL, 1=PKHTB ASR */
+      return 0;
+    }
+  }
+
   /* LDR/STR: bits 27-26=01. Immediate or register offset, pre/post-index,
    * optional writeback. P=0 W=1 is LDRT/STRT, not this subset. */
   if (((word >> 26) & 0x3) == 0x1) {

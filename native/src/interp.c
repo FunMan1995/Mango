@@ -1036,6 +1036,71 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         case MANGO_OP_NOP:
           break;
 
+        case MANGO_OP_REV: {
+          uint32_t v = mango_read_reg(cpu, addr, insn.rm);
+          uint32_t r;
+          if (insn.imm == 0) { /* REV */
+            r = ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+          } else if (insn.imm == 1) { /* REV16 */
+            r = ((v & 0xFF00FF00u) >> 8) | ((v & 0x00FF00FFu) << 8);
+          } else if (insn.imm == 2) { /* REVSH */
+            uint32_t h = ((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu);
+            r = (h & 0x8000u) ? (h | 0xFFFF0000u) : h;
+          } else { /* RBIT */
+            r = 0;
+            for (uint32_t i = 0; i < 32u; i++) {
+              r = (r << 1) | (v & 1u);
+              v >>= 1;
+            }
+          }
+          cpu->r[insn.rd] = r;
+          break;
+        }
+
+        case MANGO_OP_XTEND: {
+          uint32_t v = mango_read_reg(cpu, addr, insn.rm);
+          uint32_t rot = insn.imm & 31u;
+          if (rot) {
+            v = (v >> rot) | (v << (32u - rot));
+          }
+          if (insn.b) {
+            v &= 0xFFFFu;
+            if (!insn.u && (v & 0x8000u)) {
+              v |= 0xFFFF0000u;
+            }
+          } else {
+            v &= 0xFFu;
+            if (!insn.u && (v & 0x80u)) {
+              v |= 0xFFFFFF00u;
+            }
+          }
+          if (insn.rn != 0xFu) {
+            v += mango_read_reg(cpu, addr, insn.rn);
+          }
+          cpu->r[insn.rd] = v;
+          break;
+        }
+
+        case MANGO_OP_PKH: {
+          uint32_t n = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t m = mango_read_reg(cpu, addr, insn.rm);
+          uint32_t sh = insn.shift_amount;
+          if (insn.b) {
+            if (sh == 0) {
+              m = (m & 0x80000000u) ? 0xFFFFFFFFu : 0;
+            } else {
+              m = (uint32_t)((int32_t)m >> (int)sh);
+            }
+            cpu->r[insn.rd] = (m & 0xFFFFu) | (n & 0xFFFF0000u);
+          } else {
+            if (sh) {
+              m <<= sh;
+            }
+            cpu->r[insn.rd] = (n & 0xFFFFu) | (m & 0xFFFF0000u);
+          }
+          break;
+        }
+
         case MANGO_OP_CLZ: {
           uint32_t v = mango_read_reg(cpu, addr, insn.rm);
           uint32_t n = 0;

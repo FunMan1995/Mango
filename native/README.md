@@ -77,8 +77,10 @@ synthetic programs, not real app code yet.
   registers including D16–D31), `VLDM`/`VSTM` (`VPUSH`/`VPOP`),
   `CLZ`, `LDREX`/`STREX` (always succeed: single-threaded guest),
   `VDUP` from a GPR, extra VFP `VSUB`/`VDIV`/`VABS`/`VNEG`/`VSQRT`,
-  `BFC`/`BFI`/`UBFX`/`SBFX`, and no-op `NOP`/`PLD`/`DMB`/`DSB`/`ISB`/
-  `CLREX`. Guest JNI slots are cleared on `unloadLibrary`.
+  `BFC`/`BFI`/`UBFX`/`SBFX`, `RBIT`/`REV`/`REV16`/`REVSH`,
+  `UXTB`/`UXTH`/`SXTB`/`SXTH` (and `*TA*` accumulate), `PKHBT`/`PKHTB`,
+  and no-op `NOP`/`PLD`/`DMB`/`DSB`/`ISB`/`CLREX`. Guest JNI slots are
+  cleared on `unloadLibrary`.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/
