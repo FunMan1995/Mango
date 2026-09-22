@@ -195,5 +195,8 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   and its `JNI_OnLoad` returns `JNI_VERSION_1_6` using a VFP subset
   (`VLDR`/`VSTR`, `VCVT.F64.S32`, `VADD`/`VMUL.F64`, `VCMP`, `VMRS`,
   `VMOV`). `libmono.so` maps (no `JNI_OnLoad`). libm (`sin`/`cos`/`sqrt`/…)
-  and a few pthread stubs are thunked. `Call*Method` and GLES are still
-  open.
+  and a few pthread stubs are thunked. GLES/EGL/`ANativeWindow` calls
+  return success/dummy sizes. `getTrampoline` finds `RegisterNatives`
+  names (`NativeLoader.load`). `pthread_once` runs the init function.
+  Fake `/proc/cpuinfo` and auxv advertise NEON/VFP. `Call*Method` host
+  JNI and a working Unity `load()` PIC tail are still open.

@@ -52,6 +52,7 @@
 #define MANGO_JNI_GET_STATIC_METHOD_ID 113
 #define MANGO_JNI_GET_STATIC_FIELD_ID 144
 #define MANGO_JNI_NEW_STRING_UTF 167
+#define MANGO_JNI_GET_STRING_UTF_LENGTH 168
 #define MANGO_JNI_GET_STRING_UTF_CHARS 169
 #define MANGO_JNI_RELEASE_STRING_UTF_CHARS 170
 #define MANGO_JNI_REGISTER_NATIVES 215
@@ -111,7 +112,17 @@
 #define MANGO_LIBC_FABSF 44
 #define MANGO_LIBC_PTHREAD_SELF 45
 #define MANGO_LIBC_PTHREAD_CREATE 46
-#define MANGO_LIBC_COUNT 47
+#define MANGO_LIBC_SNPRINTF 47
+#define MANGO_LIBC_EGL_TRUE 48
+#define MANGO_LIBC_EGL_SUCCESS 49
+#define MANGO_LIBC_EGL_PROC 50
+#define MANGO_LIBC_ANW_W 51
+#define MANGO_LIBC_ANW_H 52
+#define MANGO_LIBC_PTHREAD_ONCE 53
+#define MANGO_LIBC_OPEN 54
+#define MANGO_LIBC_READ 55
+#define MANGO_LIBC_CLOSE 56
+#define MANGO_LIBC_COUNT 57
 
 #define MANGO_AS_SIZE 0x2800000u
 #define MANGO_LIB_CAP 0x2000000u
@@ -216,6 +227,16 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "fabsf",
     "pthread_self",
     "pthread_create",
+    "snprintf",
+    "eglGetDisplay",
+    "eglGetError",
+    "eglGetProcAddress",
+    "ANativeWindow_getWidth",
+    "ANativeWindow_getHeight",
+    "pthread_once",
+    "open",
+    "read",
+    "close",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -229,8 +250,19 @@ static uint32_t g_as_size;
 static uint32_t g_as_next;
 static uint32_t g_as_jni_ready;
 static char g_dlerror[128];
+static const char kCpuInfo[] =
+    "Processor\t: ARMv7 Processor rev 1 (v7l)\n"
+    "Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt\n"
+    "CPU architecture: 7\n";
+static const char kCpuList[] = "0-7\n";
+static const uint32_t kAuxv[] = {16u, (1u << 6) | (1u << 12) | (1u << 13) | (1u << 16) | (1u << 17),
+                                 0u, 0u};
+static const char* g_fake_data;
+static uint32_t g_fake_len;
+static uint32_t g_fake_off;
 
 static void* mango_load_library(const char* libpath, int flag);
+static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env);
 
 static uint32_t mango_handle_intern(void* p) {
   if (p == NULL) {
@@ -306,8 +338,9 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
   lib->libc_thunk_base = libc_thunks;
   lib->stub_addr = stub;
   lib->heap_base = heap;
-  lib->heap_used = 4u; /* first word is guest errno */
+  lib->heap_used = 8u; /* errno at +0, stack guard at +4 */
   lib->guest_errno_addr = heap;
+  mango_store_u32_guest(mem, heap + 4u, 0xA5A5A5A5u);
   lib->stack_top = need - 16u;
   lib->host_vm = NULL;
   mango_store_u32_guest(mem, base, vm_table);
@@ -343,7 +376,21 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
     name = "getpid";
   }
   if (strcmp(name, "__stack_chk_guard") == 0) {
-    return lib->guest_errno_addr;
+    return lib->guest_errno_addr + 4u;
+  }
+  if (strcmp(name, "eglGetError") == 0) {
+    name = "eglGetError";
+  } else if (strcmp(name, "eglGetProcAddress") == 0) {
+    name = "eglGetProcAddress";
+  } else if (strcmp(name, "ANativeWindow_getWidth") == 0) {
+    name = "ANativeWindow_getWidth";
+  } else if (strcmp(name, "ANativeWindow_getHeight") == 0) {
+    name = "ANativeWindow_getHeight";
+  } else if (strncmp(name, "egl", 3) == 0 || strncmp(name, "ANative", 7) == 0 ||
+             strncmp(name, "ALooper", 7) == 0 || strncmp(name, "AAsset", 6) == 0) {
+    name = "eglGetDisplay";
+  } else if (name[0] == 'g' && name[1] == 'l') {
+    return lib->stub_addr;
   }
   for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
     if (strcmp(name, kLibcNames[i]) == 0) {
@@ -704,6 +751,111 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_PTHREAD_CREATE:
       cpu->r[0] = 11; /* EAGAIN: do not start a guest thread */
       break;
+    case MANGO_LIBC_OPEN: {
+      const char* path = mango_guest_cstr(lib, r0);
+      g_fake_data = NULL;
+      g_fake_len = 0;
+      g_fake_off = 0;
+      if (path && strstr(path, "cpuinfo") != NULL) {
+        g_fake_data = kCpuInfo;
+        g_fake_len = (uint32_t)sizeof(kCpuInfo) - 1u;
+      } else if (path && (strstr(path, "cpu/present") != NULL || strstr(path, "cpu/possible") != NULL)) {
+        g_fake_data = kCpuList;
+        g_fake_len = (uint32_t)sizeof(kCpuList) - 1u;
+      } else if (path && strstr(path, "auxv") != NULL) {
+        g_fake_data = (const char*)kAuxv;
+        g_fake_len = (uint32_t)sizeof(kAuxv);
+      }
+      cpu->r[0] = g_fake_data ? 100u : (uint32_t)-1;
+      break;
+    }
+    case MANGO_LIBC_READ:
+      if (r0 == 100 && g_fake_data != NULL) {
+        if (g_fake_off >= g_fake_len) {
+          cpu->r[0] = 0;
+        } else if (!mango_guest_range_ok(lib, r1, r2)) {
+          cpu->r[0] = (uint32_t)-1;
+        } else {
+          uint32_t n = g_fake_len - g_fake_off;
+          if (n > r2) {
+            n = r2;
+          }
+          memcpy(lib->guest_mem + r1, g_fake_data + g_fake_off, n);
+          g_fake_off += n;
+          cpu->r[0] = n;
+        }
+      } else {
+        cpu->r[0] = (uint32_t)-1;
+      }
+      break;
+    case MANGO_LIBC_CLOSE:
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_PTHREAD_ONCE: {
+      if (!mango_guest_range_ok(lib, r0, 4u) || r1 == 0) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      uint32_t once = mango_load_u32_guest(lib->guest_mem, r0);
+      if (once == 0) {
+        mango_store_u32_guest(lib->guest_mem, r0, 1u);
+        MangoCpu nested = *cpu;
+        nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+        if (r1 & 1u) {
+          nested.cpsr |= MANGO_CPSR_T;
+          nested.r[MANGO_REG_PC] = r1 & ~1u;
+        } else {
+          nested.cpsr &= ~MANGO_CPSR_T;
+          nested.r[MANGO_REG_PC] = r1;
+        }
+        mango_run_guest(lib, &nested, NULL);
+      }
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_SNPRINTF: {
+      const char* fmt = mango_guest_cstr(lib, r2);
+      if (!fmt || r1 == 0 || !mango_guest_range_ok(lib, r0, r1)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      char tmp[512];
+      if (strcmp(fmt, "%s/%s") == 0) {
+        const char* a = mango_guest_cstr(lib, cpu->r[3]);
+        uint32_t baddr = mango_load_u32_guest(lib->guest_mem, cpu->r[MANGO_REG_SP]);
+        const char* b = mango_guest_cstr(lib, baddr);
+        snprintf(tmp, sizeof(tmp), "%s/%s", a ? a : "", b ? b : "");
+      } else if (strcmp(fmt, "%s") == 0) {
+        const char* a = mango_guest_cstr(lib, cpu->r[3]);
+        snprintf(tmp, sizeof(tmp), "%s", a ? a : "");
+      } else {
+        snprintf(tmp, sizeof(tmp), "%s", fmt);
+      }
+      tmp[sizeof(tmp) - 1u] = 0;
+      size_t n = strlen(tmp);
+      if (n >= r1) {
+        n = r1 - 1u;
+      }
+      memcpy(lib->guest_mem + r0, tmp, n);
+      lib->guest_mem[r0 + (uint32_t)n] = 0;
+      cpu->r[0] = (uint32_t)n;
+      break;
+    }
+    case MANGO_LIBC_EGL_TRUE:
+      cpu->r[0] = 1;
+      break;
+    case MANGO_LIBC_EGL_SUCCESS:
+      cpu->r[0] = 0x3000u; /* EGL_SUCCESS */
+      break;
+    case MANGO_LIBC_EGL_PROC:
+      cpu->r[0] = lib->stub_addr;
+      break;
+    case MANGO_LIBC_ANW_W:
+      cpu->r[0] = 1280;
+      break;
+    case MANGO_LIBC_ANW_H:
+      cpu->r[0] = 720;
+      break;
     case MANGO_LIBC_CLOCK_GETTIME:
       if (!mango_guest_range_ok(lib, r1, 8u)) {
         cpu->r[0] = (uint32_t)-1;
@@ -835,11 +987,29 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       cpu->r[0] = mango_handle_intern(js);
       break;
     }
+    case MANGO_JNI_GET_STRING_UTF_LENGTH: {
+      jstring js = mango_handle_lookup(cpu->r[1]);
+      const char* s = NULL;
+      if (js && mango_host_jni_ok(env)) {
+        s = (*env)->GetStringUTFChars(env, js, NULL);
+        cpu->r[0] = s ? (uint32_t)strlen(s) : 0;
+        if (s) {
+          (*env)->ReleaseStringUTFChars(env, js, s);
+        }
+      } else if (js) {
+        cpu->r[0] = (uint32_t)strlen((const char*)js);
+      } else {
+        cpu->r[0] = 0;
+      }
+      break;
+    }
     case MANGO_JNI_GET_STRING_UTF_CHARS: {
       jstring js = mango_handle_lookup(cpu->r[1]);
       const char* s = NULL;
       if (js && mango_host_jni_ok(env)) {
         s = (*env)->GetStringUTFChars(env, js, NULL);
+      } else if (js) {
+        s = (const char*)js; /* interned host C string from tests/drivers */
       }
       cpu->r[0] = mango_guest_strdup(lib, s ? s : "");
       if (s && mango_host_jni_ok(env)) {
@@ -896,6 +1066,29 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
   }
 }
 
+static char mango_consume_jni_type(const char** pp) {
+  const char* p = *pp;
+  while (*p == '[') {
+    p++;
+  }
+  if (*p == 'L') {
+    while (*p && *p != ';') {
+      p++;
+    }
+    if (*p == ';') {
+      p++;
+    }
+    *pp = p;
+    return 'L';
+  }
+  if (*p == '\0') {
+    return 0;
+  }
+  char t = *p++;
+  *pp = p;
+  return t;
+}
+
 static int mango_parse_shorty(const char* shorty, char* ret, char* args, uint32_t args_max) {
   uint32_t n = 0;
   if (shorty == NULL || shorty[0] == '\0') {
@@ -907,20 +1100,29 @@ static int mango_parse_shorty(const char* shorty, char* ret, char* args, uint32_
       if (n + 1 >= args_max) {
         return -1;
       }
-      args[n++] = *p++;
+      char t = mango_consume_jni_type(&p);
+      if (t == 0) {
+        return -1;
+      }
+      args[n++] = t;
     }
     if (*p != ')' || p[1] == '\0') {
       return -1;
     }
-    *ret = p[1];
+    const char* r = p + 1;
+    *ret = mango_consume_jni_type(&r);
   } else {
-    *ret = shorty[0];
-    const char* p = shorty + 1;
+    const char* p = shorty;
+    *ret = mango_consume_jni_type(&p);
     while (*p) {
       if (n + 1 >= args_max) {
         return -1;
       }
-      args[n++] = *p++;
+      char t = mango_consume_jni_type(&p);
+      if (t == 0) {
+        return -1;
+      }
+      args[n++] = t;
     }
   }
   args[n] = 0;
@@ -933,6 +1135,40 @@ static int mango_is_jni_onload(const MangoJniSlot* slot) {
   }
   /* ART's JNI_OnLoad shorty; tests also use this with mango_add. */
   return slot->shorty[0] == 'I' && slot->shorty[1] == 'L' && slot->shorty[2] == '\0';
+}
+
+static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) {
+  MangoMemory mem = {lib->guest_mem, lib->guest_mem_size};
+  for (;;) {
+    int rc = mango_interp_run(cpu, &mem, MANGO_JNI_STOP, 10000000u);
+    if (rc == 0) {
+      return 0;
+    }
+    if (rc != 1) {
+      uint32_t pc = cpu->r[MANGO_REG_PC];
+      uint32_t w = 0;
+      if (pc + 4u <= mem.size) {
+        w = mango_load_u32_guest(mem.bytes, pc);
+      }
+      fprintf(stderr,
+              "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d r0=%x r1=%x r6=%x r7=%x "
+              "sp=%x\n",
+              pc, cpu->cpsr, w, rc, cpu->r[0], cpu->r[1], cpu->r[6], cpu->r[7],
+              cpu->r[MANGO_REG_SP]);
+      return -1;
+    }
+    uint32_t nr = cpu->r[7];
+    if (nr >= MANGO_JNI_SVC_BASE && nr < MANGO_JNI_SVC_BASE + MANGO_JNI_TABLE_LEN) {
+      mango_jni_svc(lib, cpu, env, nr - MANGO_JNI_SVC_BASE);
+    } else if (nr >= MANGO_JVM_SVC_BASE && nr < MANGO_JVM_SVC_BASE + MANGO_JVM_TABLE_LEN) {
+      mango_jvm_svc(lib, cpu, nr - MANGO_JVM_SVC_BASE);
+    } else if (nr >= MANGO_LIBC_SVC_BASE && nr < MANGO_LIBC_SVC_BASE + MANGO_LIBC_COUNT) {
+      mango_libc_svc(lib, cpu, nr - MANGO_LIBC_SVC_BASE);
+    } else {
+      cpu->r[0] = (uint32_t)-1;
+    }
+    cpu->r[MANGO_REG_PC] += (cpu->cpsr & MANGO_CPSR_T) ? 2u : 4u;
+  }
 }
 
 static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
@@ -1021,33 +1257,8 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
     mango_store_u32_guest(lib->guest_mem, cpu.r[MANGO_REG_SP] + i * 4u, stack[i]);
   }
 
-  MangoMemory mem = {lib->guest_mem, lib->guest_mem_size};
-  for (;;) {
-    int rc = mango_interp_run(&cpu, &mem, MANGO_JNI_STOP, 10000000u);
-    if (rc == 0) {
-      break;
-    }
-    if (rc != 1) {
-      uint32_t pc = cpu.r[MANGO_REG_PC];
-      uint32_t w = 0;
-      if (pc + 4u <= mem.size) {
-        w = mango_load_u32_guest(mem.bytes, pc);
-      }
-      fprintf(stderr, "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d\n", pc, cpu.cpsr, w,
-              rc);
-      return 0;
-    }
-    uint32_t nr = cpu.r[7];
-    if (nr >= MANGO_JNI_SVC_BASE && nr < MANGO_JNI_SVC_BASE + MANGO_JNI_TABLE_LEN) {
-      mango_jni_svc(lib, &cpu, env, nr - MANGO_JNI_SVC_BASE);
-    } else if (nr >= MANGO_JVM_SVC_BASE && nr < MANGO_JVM_SVC_BASE + MANGO_JVM_TABLE_LEN) {
-      mango_jvm_svc(lib, &cpu, nr - MANGO_JVM_SVC_BASE);
-    } else if (nr >= MANGO_LIBC_SVC_BASE && nr < MANGO_LIBC_SVC_BASE + MANGO_LIBC_COUNT) {
-      mango_libc_svc(lib, &cpu, nr - MANGO_LIBC_SVC_BASE);
-    } else {
-      cpu.r[0] = (uint32_t)-1;
-    }
-    cpu.r[MANGO_REG_PC] += (cpu.cpsr & MANGO_CPSR_T) ? 2u : 4u;
+  if (mango_run_guest(lib, &cpu, env) != 0) {
+    return 0;
   }
 
   if (ret == 'J' || ret == 'D') {
@@ -1231,6 +1442,11 @@ static void* mango_get_trampoline(void* handle, const char* name, const char* sh
   MangoLoadedLibrary* lib = handle;
   if (!lib || name == NULL) {
     return NULL;
+  }
+  for (int i = 0; i < g_nslots; i++) {
+    if (g_slots[i].lib == lib && strcmp(g_slots[i].name, name) == 0) {
+      return g_slot_fns[i];
+    }
   }
   uint32_t addr = mango_elf32_find_symbol(&lib->image, name);
   if (addr == 0) {
