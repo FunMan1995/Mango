@@ -1121,6 +1121,15 @@ static uint32_t encode_mla(uint32_t rd, uint32_t rm, uint32_t rs, uint32_t ra) {
   return 0xE0200090u | ((rd & 0xFu) << 16) | ((ra & 0xFu) << 12) | ((rs & 0xFu) << 8) | (rm & 0xFu);
 }
 
+/* Long multiply: UMULL/UMLAL/SMULL/SMLAL. signed=U bit22, acc=A bit21.
+ * Encoding: RdHi RdLo Rm 1001 Rn with product Rn*Rm → RdLo:RdHi. */
+static uint32_t encode_mull(int signed_mul, int acc, int s, uint32_t rdlo, uint32_t rdhi,
+                            uint32_t rn, uint32_t rm) {
+  return 0xE0000090u | (1u << 23) | ((uint32_t)signed_mul << 22) | ((uint32_t)acc << 21) |
+         ((uint32_t)s << 20) | ((rdhi & 0xFu) << 16) | ((rdlo & 0xFu) << 12) | ((rm & 0xFu) << 8) |
+         (rn & 0xFu);
+}
+
 static uint32_t encode_ldst(int i, int p, int u, int b, int w, int l, uint32_t rn, uint32_t rt,
                             uint32_t operand12) {
   return 0xE0000000u | (1u << 26) | ((uint32_t)i << 25) | ((uint32_t)p << 24) |
@@ -1164,6 +1173,162 @@ static int test_mla(void) {
     return 1;
   }
   printf("ok: mla r0, r0, r1, r3 (r0 = %u)\n", cpu.r[0]);
+  return 0;
+}
+
+
+static int test_mull_long(void) {
+  /* OFDP nativeRender stop 0xe0810096: umull r0, r1, r6, r0 (div10 magic). */
+  uint32_t umull_ofdp = encode_mull(0, 0, 0, 0, 1, 6, 0);
+  if (umull_ofdp != 0xE0810096u) {
+    fprintf(stderr, "FAIL(mull): OFDP UMULL encoder got 0x%08x\n", umull_ofdp);
+    return 1;
+  }
+  uint32_t umull = encode_mull(0, 0, 0, 2, 3, 4, 5); /* umull r2, r3, r4, r5 */
+  uint32_t umlal = encode_mull(0, 1, 0, 2, 3, 4, 5);
+  uint32_t smull = encode_mull(1, 0, 0, 2, 3, 4, 5);
+  uint32_t smlal = encode_mull(1, 1, 0, 2, 3, 4, 5);
+  if (umull != 0xE0832594u || umlal != 0xE0A32594u || smull != 0xE0C32594u ||
+      smlal != 0xE0E32594u) {
+    fprintf(stderr, "FAIL(mull): encoder mismatch umull=0x%08x umlal=0x%08x smull=0x%08x smlal=0x%08x\n",
+            umull, umlal, smull, smlal);
+    return 1;
+  }
+
+  /* umull r2,r3,r4,r5 with r4=0x10000 r5=0x10000 → 0x1_0000_0000 */
+  {
+    static const uint32_t kProg[] = {
+        0xE3A04801u, /* mov r4, #0x10000 */
+        0xE3A05801u, /* mov r5, #0x10000 */
+        0xE0832594u, /* umull r2, r3, r4, r5 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 4);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[MANGO_REG_LR] = 0x1111u;
+    int rc = mango_interp_run(&cpu, &mem, 0x1111u, 100);
+    if (rc != 0 || cpu.r[2] != 0u || cpu.r[3] != 1u) {
+      fprintf(stderr, "FAIL(umull): rc=%d r2=0x%x r3=0x%x\n", rc, cpu.r[2], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  /* OFDP-shaped: umull r0,r1,r6,r0 with magic 0xcccccccd */
+  {
+    static const uint32_t kProg[] = {
+        0xE0810096u, /* umull r0, r1, r6, r0 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[0] = 0xCCCCCCCDu;
+    cpu.r[6] = 0x66EFDB57u;
+    cpu.r[MANGO_REG_LR] = 0x2222u;
+    int rc = mango_interp_run(&cpu, &mem, 0x2222u, 100);
+    uint64_t want = (uint64_t)0x66EFDB57u * (uint64_t)0xCCCCCCCDu;
+    if (rc != 0 || cpu.r[0] != (uint32_t)want || cpu.r[1] != (uint32_t)(want >> 32)) {
+      fprintf(stderr, "FAIL(umull_ofdp): rc=%d r0=0x%x r1=0x%x want lo=0x%x hi=0x%x\n", rc,
+              cpu.r[0], cpu.r[1], (uint32_t)want, (uint32_t)(want >> 32));
+      return 1;
+    }
+  }
+
+  /* umlal r2,r3,r4,r5: accumulate prior 1 into hi */
+  {
+    static const uint32_t kProg[] = {
+        0xE0A32594u, /* umlal r2, r3, r4, r5 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[2] = 1u;
+    cpu.r[3] = 1u;
+    cpu.r[4] = 0x10000u;
+    cpu.r[5] = 0x10000u;
+    cpu.r[MANGO_REG_LR] = 0x3333u;
+    int rc = mango_interp_run(&cpu, &mem, 0x3333u, 100);
+    /* 0x1_0000_0000 + 0x1_0000_0001 = 0x2_0000_0001 */
+    if (rc != 0 || cpu.r[2] != 1u || cpu.r[3] != 2u) {
+      fprintf(stderr, "FAIL(umlal): rc=%d r2=0x%x r3=0x%x\n", rc, cpu.r[2], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  /* smull r2,r3,r4,r5: (-2)*(-3)=6 */
+  {
+    static const uint32_t kProg[] = {
+        0xE0C32594u, /* smull r2, r3, r4, r5 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[4] = (uint32_t)-2;
+    cpu.r[5] = (uint32_t)-3;
+    cpu.r[MANGO_REG_LR] = 0x4444u;
+    int rc = mango_interp_run(&cpu, &mem, 0x4444u, 100);
+    if (rc != 0 || cpu.r[2] != 6u || cpu.r[3] != 0u) {
+      fprintf(stderr, "FAIL(smull): rc=%d r2=%u r3=%u\n", rc, cpu.r[2], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  /* smull negative product: (-1)*2 = -2 → lo=0xfffffffe hi=0xffffffff */
+  {
+    static const uint32_t kProg[] = {
+        0xE0C32594u,
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[4] = (uint32_t)-1;
+    cpu.r[5] = 2u;
+    cpu.r[MANGO_REG_LR] = 0x5555u;
+    int rc = mango_interp_run(&cpu, &mem, 0x5555u, 100);
+    if (rc != 0 || cpu.r[2] != 0xFFFFFFFEu || cpu.r[3] != 0xFFFFFFFFu) {
+      fprintf(stderr, "FAIL(smull_neg): rc=%d r2=0x%x r3=0x%x\n", rc, cpu.r[2], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  /* smlal r2,r3,r4,r5: (-1)*2 + (-1) = -3 */
+  {
+    static const uint32_t kProg[] = {
+        0xE0E32594u,
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[2] = 0xFFFFFFFFu; /* acc = -1 */
+    cpu.r[3] = 0xFFFFFFFFu;
+    cpu.r[4] = (uint32_t)-1;
+    cpu.r[5] = 2u;
+    cpu.r[MANGO_REG_LR] = 0x6666u;
+    int rc = mango_interp_run(&cpu, &mem, 0x6666u, 100);
+    if (rc != 0 || cpu.r[2] != 0xFFFFFFFDu || cpu.r[3] != 0xFFFFFFFFu) {
+      fprintf(stderr, "FAIL(smlal): rc=%d r2=0x%x r3=0x%x\n", rc, cpu.r[2], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  printf("ok: UMULL/UMLAL/SMULL/SMLAL (incl. OFDP 0xe0810096 div10)\n");
   return 0;
 }
 
@@ -2847,6 +3012,7 @@ int main(void) {
   failures += test_ldm_stm_rejected_shapes();
   failures += test_stm_out_of_bounds_rejected();
   failures += test_mla();
+  failures += test_mull_long();
   failures += test_ldr_str_writeback_and_postindex();
   failures += test_ldr_register_offset();
   failures += test_register_specified_shift();

@@ -560,6 +560,40 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
         }
 
+        case MANGO_OP_UMULL:
+        case MANGO_OP_UMLAL:
+        case MANGO_OP_SMULL:
+        case MANGO_OP_SMLAL: {
+          /* Read multiplicands first: OFDP div10 does UMULL r0,r1,rN,r0. */
+          uint32_t n = mango_read_reg(cpu, addr, insn.rm);
+          uint32_t m = mango_read_reg(cpu, addr, insn.rs);
+          uint64_t prod;
+          if (insn.op == MANGO_OP_SMULL || insn.op == MANGO_OP_SMLAL) {
+            prod = (uint64_t)((int64_t)(int32_t)n * (int64_t)(int32_t)m);
+          } else {
+            prod = (uint64_t)n * (uint64_t)m;
+          }
+          if (insn.op == MANGO_OP_UMLAL || insn.op == MANGO_OP_SMLAL) {
+            uint64_t acc = ((uint64_t)mango_read_reg(cpu, addr, insn.rn) << 32) |
+                           mango_read_reg(cpu, addr, insn.rd);
+            prod += acc;
+          }
+          cpu->r[insn.rd] = (uint32_t)prod;
+          cpu->r[insn.rn] = (uint32_t)(prod >> 32);
+          if (insn.sets_flags) {
+            /* *S forms: N from bit63, Z if whole 64-bit result is 0; C,V unchanged. */
+            uint32_t flags = cpu->cpsr & (MANGO_CPSR_C | MANGO_CPSR_V);
+            if ((int64_t)prod < 0) {
+              flags |= MANGO_CPSR_N;
+            }
+            if (prod == 0) {
+              flags |= MANGO_CPSR_Z;
+            }
+            mango_set_nzcv(cpu, flags);
+          }
+          break;
+        }
+
         case MANGO_OP_SVC:
           return 1; /* cpu->r[PC] == addr still, caller thunks r7/r0-r6 and resumes, see interp.h */
 

@@ -14,8 +14,9 @@ synthetic programs, not real app code yet.
   `src/decoder.c`, `src/interp.c`: the portable core. Handles the full A32
   data-processing set (`AND`, `EOR`, `SUB`, `RSB`, `ADD`, `ADC`, `SBC`,
   `RSC`, `TST`, `TEQ`, `CMP`, `CMN`, `ORR`, `MOV`, `BIC`, `MVN`, all 16
-  ARM ALU opcodes), `MUL` and `MLA` (PC operands and MUL's non-zero Ra
-  field are rejected rather than misdecoded), `B`, `BL`, `BX`,
+  ARM ALU opcodes), `MUL`/`MLA` and long multiply `UMULL`/`UMLAL`/`SMULL`/`SMLAL` (PC
+  operands, MUL's non-zero Ra, and long-mul RdLo==RdHi are rejected rather
+  than misdecoded), `B`, `BL`, `BX`,
   `LDR`/`STR`/`LDRB`/`STRB` (immediate or register offset, pre-index with
   optional writeback, and post-index; `LDRB` zero-extends; `LDRT`/`STRT`,
   writeback into PC, `LDR` writeback into the same register as the dest,

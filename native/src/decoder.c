@@ -621,6 +621,39 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
+  /* UMULL/UMLAL/SMULL/SMLAL (A8.8.255 / A8.8.189 / A8.8.221 / A8.8.210):
+   * cond 00001 U A S RdHi RdLo Rm 1001 Rn. Bit23=1 distinguishes from MUL.
+   * U=0 unsigned (UMULL/UMLAL), U=1 signed (SMULL/SMLAL). A=accumulate.
+   * RdLo<-rd, RdHi<-rn, multiplicands Rm<-rs / Rn<-rm (same bit lanes as MUL). */
+  if (((word >> 23) & 0x1F) == 0x01 && ((word >> 4) & 0xF) == 0x9) {
+    uint32_t u = (word >> 22) & 0x1;
+    uint32_t a = (word >> 21) & 0x1;
+    uint32_t s = (word >> 20) & 0x1;
+    uint32_t rdhi = (word >> 16) & 0xF;
+    uint32_t rdlo = (word >> 12) & 0xF;
+    uint32_t rm = (word >> 8) & 0xF;
+    uint32_t rn = word & 0xF;
+    if (rdlo == MANGO_REG_PC || rdhi == MANGO_REG_PC || rm == MANGO_REG_PC ||
+        rn == MANGO_REG_PC || rdlo == rdhi) {
+      return -1; /* PC or RdLo==RdHi is UNPREDICTABLE */
+    }
+    if (!u && !a) {
+      out->op = MANGO_OP_UMULL;
+    } else if (!u && a) {
+      out->op = MANGO_OP_UMLAL;
+    } else if (u && !a) {
+      out->op = MANGO_OP_SMULL;
+    } else {
+      out->op = MANGO_OP_SMLAL;
+    }
+    out->rd = rdlo;
+    out->rn = rdhi;
+    out->rm = rn; /* ARM Rn (bits 3-0), same lane as MUL's Rm */
+    out->rs = rm; /* ARM Rm (bits 11-8), same lane as MUL's Rs */
+    out->sets_flags = (int)s;
+    return 0;
+  }
+
   /* SWP/SWPB: cond 00010 B 00 Rn Rt SBZ 1001 Rm. Bits 7-4 match MUL, but
    * bits 27-23 are 00010 rather than MUL's 00000. */
   if (((word >> 23) & 0x1F) == 0x02 && ((word >> 20) & 0x3) == 0x0 && ((word >> 4) & 0xF) == 0x9) {
