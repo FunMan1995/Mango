@@ -595,6 +595,28 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
         }
 
+        case MANGO_OP_SMLA:
+        case MANGO_OP_SMUL: {
+          /* Halfword signed mul: product of selected 16-bit halves of Rn/Rm.
+           * Decoder: rm=Rn, rs=Rm, b=N (Rn top), u=M (Rm top); rn=Ra for SMLA. */
+          uint32_t rn_val = mango_read_reg(cpu, addr, insn.rm);
+          uint32_t rm_val = mango_read_reg(cpu, addr, insn.rs);
+          int32_t n = insn.b ? (int32_t)(int16_t)(rn_val >> 16) : (int32_t)(int16_t)(rn_val & 0xFFFFu);
+          int32_t m = insn.u ? (int32_t)(int16_t)(rm_val >> 16) : (int32_t)(int16_t)(rm_val & 0xFFFFu);
+          int32_t prod = n * m; /* 16x16 signed always fits in 32 bits */
+          if (insn.op == MANGO_OP_SMLA) {
+            int32_t acc = (int32_t)mango_read_reg(cpu, addr, insn.rn);
+            int64_t sum = (int64_t)prod + (int64_t)acc;
+            if (sum != (int64_t)(int32_t)sum) {
+              cpu->cpsr |= MANGO_CPSR_Q; /* sticky accumulate overflow */
+            }
+            mango_write_rd(cpu, insn.rd, (uint32_t)sum, stop_addr, &next_addr);
+          } else {
+            mango_write_rd(cpu, insn.rd, (uint32_t)prod, stop_addr, &next_addr);
+          }
+          break;
+        }
+
         case MANGO_OP_SVC:
           return 1; /* cpu->r[PC] == addr still, caller thunks r7/r0-r6 and resumes, see interp.h */
 

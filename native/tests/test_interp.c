@@ -1332,6 +1332,270 @@ static int test_mull_long(void) {
   return 0;
 }
 
+
+/* SMLAxy / SMULxy: signed halfword multiply (+accumulate). N=bit5 Rn half,
+ * M=bit6 Rm half. Encoding A8.8.207 / A8.8.220. */
+static uint32_t encode_smlaxy(int n, int m, uint32_t rd, uint32_t rn, uint32_t rm, uint32_t ra) {
+  return 0xE1000000u | ((rd & 0xFu) << 16) | ((ra & 0xFu) << 12) | ((rm & 0xFu) << 8) |
+         (1u << 7) | ((uint32_t)m << 6) | ((uint32_t)n << 5) | (rn & 0xFu);
+}
+
+static uint32_t encode_smulxy(int n, int m, uint32_t rd, uint32_t rn, uint32_t rm) {
+  return 0xE1600000u | ((rd & 0xFu) << 16) | ((rm & 0xFu) << 8) | (1u << 7) |
+         ((uint32_t)m << 6) | ((uint32_t)n << 5) | (rn & 0xFu);
+}
+
+static int test_smlaxy_smulxy(void) {
+  /* OFDP nativeRender stop 0xe10cc687: smlabb r12, r7, r6, r12 */
+  uint32_t ofdp = encode_smlaxy(0, 0, 12, 7, 6, 12);
+  if (ofdp != 0xE10CC687u) {
+    fprintf(stderr, "FAIL(smlaxy): OFDP SMLABB encoder got 0x%08x\n", ofdp);
+    return 1;
+  }
+  uint32_t smlabb = encode_smlaxy(0, 0, 0, 1, 2, 3);
+  uint32_t smlabt = encode_smlaxy(0, 1, 0, 1, 2, 3);
+  uint32_t smlatb = encode_smlaxy(1, 0, 0, 1, 2, 3);
+  uint32_t smlatt = encode_smlaxy(1, 1, 0, 1, 2, 3);
+  uint32_t smulbb = encode_smulxy(0, 0, 0, 1, 2);
+  uint32_t smulbt = encode_smulxy(0, 1, 0, 1, 2);
+  uint32_t smultb = encode_smulxy(1, 0, 0, 1, 2);
+  uint32_t smultt = encode_smulxy(1, 1, 0, 1, 2);
+  if (smlabb != 0xE1003281u || smlabt != 0xE10032C1u || smlatb != 0xE10032A1u ||
+      smlatt != 0xE10032E1u || smulbb != 0xE1600281u || smulbt != 0xE16002C1u ||
+      smultb != 0xE16002A1u || smultt != 0xE16002E1u) {
+    fprintf(stderr,
+            "FAIL(smlaxy): encoder mismatch smlabb=0x%08x smlabt=0x%08x smlatb=0x%08x "
+            "smlatt=0x%08x smulbb=0x%08x smulbt=0x%08x smultb=0x%08x smultt=0x%08x\n",
+            smlabb, smlabt, smlatb, smlatt, smulbb, smulbt, smultb, smultt);
+    return 1;
+  }
+
+  /* Decode OFDP word */
+  {
+    MangoInsn insn;
+    memset(&insn, 0, sizeof(insn));
+    if (mango_decode(0xE10CC687u, &insn) != 0 || insn.op != MANGO_OP_SMLA || insn.rd != 12 ||
+        insn.rn != 12 || insn.rm != 7 || insn.rs != 6 || insn.b != 0 || insn.u != 0) {
+      fprintf(stderr, "FAIL(smlaxy): decode OFDP op=%d rd=%u rn=%u rm=%u rs=%u b=%d u=%d\n",
+              (int)insn.op, insn.rd, insn.rn, insn.rm, insn.rs, insn.b, insn.u);
+      return 1;
+    }
+  }
+
+  /* smlabb r0, r1, r2, r3: bottom*bottom + acc. r1=0x0005, r2=0x0007, r3=10 → 45 */
+  {
+    static const uint32_t kProg[] = {
+        0xE1003281u, /* smlabb r0, r1, r2, r3 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 5u;
+    cpu.r[2] = 7u;
+    cpu.r[3] = 10u;
+    cpu.r[MANGO_REG_LR] = 0x1111u;
+    int rc = mango_interp_run(&cpu, &mem, 0x1111u, 100);
+    if (rc != 0 || cpu.r[0] != 45u) {
+      fprintf(stderr, "FAIL(smlabb): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+
+  /* OFDP-shaped: smlabb r12, r7, r6, r12 with r7=4 r6=3 r12=19 → 12+19=31 */
+  {
+    static const uint32_t kProg[] = {
+        0xE10CC687u,
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[6] = 3u;
+    cpu.r[7] = 4u;
+    cpu.r[12] = 19u;
+    cpu.r[MANGO_REG_LR] = 0x2222u;
+    int rc = mango_interp_run(&cpu, &mem, 0x2222u, 100);
+    if (rc != 0 || cpu.r[12] != 31u) {
+      fprintf(stderr, "FAIL(smlabb_ofdp): rc=%d r12=%u\n", rc, cpu.r[12]);
+      return 1;
+    }
+  }
+
+  /* smlabt: bottom(Rn)*top(Rm). r1=0x0003, r2=0x00050000 → 3*5=15 + 1 = 16 */
+  {
+    static const uint32_t kProg[] = {
+        0xE10032C1u, /* smlabt r0, r1, r2, r3 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 3u;
+    cpu.r[2] = 0x00050000u;
+    cpu.r[3] = 1u;
+    cpu.r[MANGO_REG_LR] = 0x3333u;
+    int rc = mango_interp_run(&cpu, &mem, 0x3333u, 100);
+    if (rc != 0 || cpu.r[0] != 16u) {
+      fprintf(stderr, "FAIL(smlabt): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+
+  /* smlatb: top(Rn)*bottom(Rm). r1=0xfffe0000 (-2), r2=4 → -8 + 10 = 2 */
+  {
+    static const uint32_t kProg[] = {
+        0xE10032A1u,
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 0xFFFE0000u;
+    cpu.r[2] = 4u;
+    cpu.r[3] = 10u;
+    cpu.r[MANGO_REG_LR] = 0x4444u;
+    int rc = mango_interp_run(&cpu, &mem, 0x4444u, 100);
+    if (rc != 0 || cpu.r[0] != 2u) {
+      fprintf(stderr, "FAIL(smlatb): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+
+  /* smlatt: top*top. r1=0x00070000, r2=0x00060000 → 42 + 0 */
+  {
+    static const uint32_t kProg[] = {
+        0xE10032E1u,
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 0x00070000u;
+    cpu.r[2] = 0x00060000u;
+    cpu.r[3] = 0u;
+    cpu.r[MANGO_REG_LR] = 0x5555u;
+    int rc = mango_interp_run(&cpu, &mem, 0x5555u, 100);
+    if (rc != 0 || cpu.r[0] != 42u) {
+      fprintf(stderr, "FAIL(smlatt): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+
+  /* smulbb / smulbt / smultb / smultt (no accumulate) */
+  {
+    static const uint32_t kProg[] = {
+        0xE1600281u, /* smulbb r0, r1, r2 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 0xFFFFu; /* -1 bottom */
+    cpu.r[2] = 5u;
+    cpu.r[MANGO_REG_LR] = 0x6666u;
+    int rc = mango_interp_run(&cpu, &mem, 0x6666u, 100);
+    if (rc != 0 || cpu.r[0] != (uint32_t)-5) {
+      fprintf(stderr, "FAIL(smulbb): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+  {
+    static const uint32_t kProg[] = {
+        0xE16002C1u, /* smulbt r0, r1, r2 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 2u;
+    cpu.r[2] = 0x00030000u;
+    cpu.r[MANGO_REG_LR] = 0x7777u;
+    int rc = mango_interp_run(&cpu, &mem, 0x7777u, 100);
+    if (rc != 0 || cpu.r[0] != 6u) {
+      fprintf(stderr, "FAIL(smulbt): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+  {
+    static const uint32_t kProg[] = {
+        0xE16002A1u, /* smultb r0, r1, r2 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 0x00040000u;
+    cpu.r[2] = 5u;
+    cpu.r[MANGO_REG_LR] = 0x8888u;
+    int rc = mango_interp_run(&cpu, &mem, 0x8888u, 100);
+    if (rc != 0 || cpu.r[0] != 20u) {
+      fprintf(stderr, "FAIL(smultb): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+  {
+    static const uint32_t kProg[] = {
+        0xE16002E1u, /* smultt r0, r1, r2 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 0xFFFE0000u; /* -2 top */
+    cpu.r[2] = 0x00030000u;
+    cpu.r[MANGO_REG_LR] = 0x9999u;
+    int rc = mango_interp_run(&cpu, &mem, 0x9999u, 100);
+    if (rc != 0 || cpu.r[0] != (uint32_t)-6) {
+      fprintf(stderr, "FAIL(smultt): rc=%d r0=%u\n", rc, cpu.r[0]);
+      return 1;
+    }
+  }
+
+  /* SMLA Q flag: 0x7fffffff + 1 overflows sticky Q */
+  {
+    static const uint32_t kProg[] = {
+        0xE1003281u, /* smlabb r0, r1, r2, r3 */
+        0xE12FFF1Eu,
+    };
+    uint8_t mem_buf[32];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[1] = 1u;
+    cpu.r[2] = 1u;
+    cpu.r[3] = 0x7FFFFFFFu;
+    cpu.r[MANGO_REG_LR] = 0xAAAAu;
+    int rc = mango_interp_run(&cpu, &mem, 0xAAAAu, 100);
+    if (rc != 0 || cpu.r[0] != 0x80000000u || (cpu.cpsr & MANGO_CPSR_Q) == 0) {
+      fprintf(stderr, "FAIL(smlabb_q): rc=%d r0=0x%x cpsr=0x%x\n", rc, cpu.r[0], cpu.cpsr);
+      return 1;
+    }
+  }
+
+  printf("ok: SMLAxy/SMULxy (incl. OFDP 0xe10cc687 SMLABB)\n");
+  return 0;
+}
+
 static int test_ldr_str_writeback_and_postindex(void) {
   uint32_t str_pre = encode_ldst(0, 1, 1, 0, 1, 0, 1, 0, 4);  /* str r0, [r1, #4]! */
   uint32_t str_post = encode_ldst(0, 0, 1, 0, 0, 0, 1, 3, 4); /* str r3, [r1], #4 */
@@ -3013,6 +3277,7 @@ int main(void) {
   failures += test_stm_out_of_bounds_rejected();
   failures += test_mla();
   failures += test_mull_long();
+  failures += test_smlaxy_smulxy();
   failures += test_ldr_str_writeback_and_postindex();
   failures += test_ldr_register_offset();
   failures += test_register_specified_shift();

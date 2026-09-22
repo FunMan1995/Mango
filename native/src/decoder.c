@@ -492,6 +492,37 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
+  /* SMLAxy / SMULxy (A8.8.207 / A8.8.220): signed 16x16→32 halfword multiply.
+   * SMLA: cond 00010000 Rd Ra Rm 1 M N 0 Rn → Rd = halfN(Rn)*halfM(Rm) + Ra
+   * SMUL: cond 00010110 Rd SBZ Rm 1 M N 0 Rn → Rd = halfN(Rn)*halfM(Rm)
+   * N=bit5 selects Rn half (0=bottom/B, 1=top/T); M=bit6 selects Rm half.
+   * Shared decode: b=N, u=M; rm=Rn, rs=Rm, rn=Ra (SMLA only). */
+  if ((((word >> 20) & 0xFF) == 0x10 || ((word >> 20) & 0xFF) == 0x16) &&
+      ((word >> 7) & 1u) == 1u && ((word >> 4) & 1u) == 0u) {
+    uint32_t smul = ((word >> 20) & 0xFF) == 0x16;
+    uint32_t rd = (word >> 16) & 0xF;
+    uint32_t ra = (word >> 12) & 0xF;
+    uint32_t rm = (word >> 8) & 0xF;
+    uint32_t rn = word & 0xF;
+    uint32_t n_bit = (word >> 5) & 1u;
+    uint32_t m_bit = (word >> 6) & 1u;
+    if (smul && ra != 0) {
+      return -1; /* SMULxy Ra is SBZ */
+    }
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC ||
+        (!smul && ra == MANGO_REG_PC)) {
+      return -1;
+    }
+    out->op = smul ? MANGO_OP_SMUL : MANGO_OP_SMLA;
+    out->rd = rd;
+    out->rn = smul ? 0 : ra; /* accumulate for SMLA */
+    out->rm = rn;            /* ARM Rn (bits 3-0): first halfword source */
+    out->rs = rm;            /* ARM Rm (bits 11-8): second halfword source */
+    out->b = (int)n_bit;     /* 1 = top half of Rn */
+    out->u = (int)m_bit;     /* 1 = top half of Rm */
+    return 0;
+  }
+
   /* BLX Rm: cond 0001 0010 1111 1111 1111 0011 Rm. JNI vtable calls. */
   if (((word >> 20) & 0xFF) == 0x12 && ((word >> 4) & 0xFFFF) == 0xFFF3) {
     uint32_t rm = word & 0xF;

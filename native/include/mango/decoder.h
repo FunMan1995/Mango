@@ -29,6 +29,8 @@ typedef enum MangoOp {
   MANGO_OP_UMLAL,
   MANGO_OP_SMULL,
   MANGO_OP_SMLAL,
+  MANGO_OP_SMLA, /* SMLABB/BT/TB/TT: halfword signed mul-accumulate */
+  MANGO_OP_SMUL, /* SMULBB/BT/TB/TT: halfword signed multiply */
   MANGO_OP_SVC,
   MANGO_OP_B,
   MANGO_OP_BL,
