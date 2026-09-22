@@ -73,8 +73,8 @@ int mango_decode(uint32_t word, MangoInsn* out);
  * mango_decode_t32 for those. */
 int mango_decode_t16(uint16_t hw, MangoInsn* out);
 
-/* Thumb-32: BL/BLX/B.W/Bcond.W, MOVW/MOVT, and LDR/STR/LDRB/STRB/LDRH/STRH
- * imm12 plus LDR literal. */
+/* Thumb-32: BL/BLX/B.W/Bcond.W, MOVW/MOVT, ADDW/SUBW, and LDR/STR/LDRB/STRB/
+ * LDRH/STRH imm12 plus LDR literal. */
 int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out);
 
 #endif /* MANGO_DECODER_H_ */

@@ -179,6 +179,91 @@ int main(void) {
   NativeBridgeItf.unloadLibrary(handle);
   unlink(path);
 
+  /* Guest dlopen of a second ARM32 .so via SVC. */
+  char path_b[256];
+  if (snprintf(path_b, sizeof(path_b), "%s/mango_shim_test_XXXXXX", tmpdir) >= (int)sizeof(path_b)) {
+    fprintf(stderr, "FAIL: TMPDIR is too long for the dlopen fixture B\n");
+    return 1;
+  }
+  int fd_b = mkstemp(path_b);
+  if (fd_b < 0 || write(fd_b, kSynthElf, sizeof(kSynthElf)) != (ssize_t)sizeof(kSynthElf)) {
+    fprintf(stderr, "FAIL: couldn't write dlopen fixture B\n");
+    return 1;
+  }
+  close(fd_b);
+
+  uint8_t dl_elf[512];
+  memset(dl_elf, 0, sizeof(dl_elf));
+  memcpy(dl_elf, kSynthElf, sizeof(kSynthElf));
+  dl_elf[0x44] = 0x00;
+  dl_elf[0x45] = 0x02; /* p_filesz = 0x200 */
+  dl_elf[0x48] = 0x00;
+  dl_elf[0x49] = 0x02;
+  for (size_t i = 4; i + 4 < sizeof(kSynthElf); i++) {
+    if (dl_elf[i] == 0x40 && dl_elf[i + 1] == 0 && dl_elf[i + 2] == 0 && dl_elf[i + 3] == 0 &&
+        dl_elf[i - 4] == 0x01 && dl_elf[i - 3] == 0 && dl_elf[i - 2] == 0 && dl_elf[i - 1] == 0) {
+      dl_elf[i] = 0x00;
+      dl_elf[i + 1] = 0x01;
+      break;
+    }
+  }
+  static const uint32_t kDlopen[] = {
+      0xE3000180u, /* movw r0, #0x180 */
+      0xE3A01000u, /* mov r1, #0 */
+      0xE3027010u, /* movw r7, #0x2010  dlopen svc */
+      0xEF000000u, /* svc 0 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+  for (size_t i = 0; i < sizeof(kDlopen) / sizeof(kDlopen[0]); i++) {
+    uint32_t w = kDlopen[i];
+    dl_elf[0x100 + i * 4 + 0] = (uint8_t)(w & 0xFFu);
+    dl_elf[0x100 + i * 4 + 1] = (uint8_t)((w >> 8) & 0xFFu);
+    dl_elf[0x100 + i * 4 + 2] = (uint8_t)((w >> 16) & 0xFFu);
+    dl_elf[0x100 + i * 4 + 3] = (uint8_t)((w >> 24) & 0xFFu);
+  }
+  memcpy(dl_elf + 0x180, path_b, strlen(path_b) + 1);
+
+  if (snprintf(path, sizeof(path), "%s/mango_shim_test_XXXXXX", tmpdir) >= (int)sizeof(path)) {
+    fprintf(stderr, "FAIL: TMPDIR is too long for the dlopen fixture A\n");
+    unlink(path_b);
+    return 1;
+  }
+  fd = mkstemp(path);
+  if (fd < 0 || write(fd, dl_elf, 0x200) != 0x200) {
+    fprintf(stderr, "FAIL: couldn't write dlopen fixture A\n");
+    unlink(path_b);
+    return 1;
+  }
+  close(fd);
+  handle = NativeBridgeItf.loadLibrary(path, 0);
+  if (!handle) {
+    fprintf(stderr, "FAIL: loadLibrary rejected the dlopen fixture\n");
+    unlink(path);
+    unlink(path_b);
+    return 1;
+  }
+  void* dlfn = NativeBridgeItf.getTrampoline(handle, "mango_add", "I", 1);
+  if (!dlfn) {
+    fprintf(stderr, "FAIL: getTrampoline for dlopen fixture returned NULL\n");
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    unlink(path_b);
+    return 1;
+  }
+  typedef jint (*mango_dl_fn)(JNIEnv*, jobject);
+  jint hid = ((mango_dl_fn)dlfn)((JNIEnv*)(uintptr_t)1, (jobject)(uintptr_t)2);
+  if (hid < 2) {
+    fprintf(stderr, "FAIL: guest dlopen returned %d, want handle >= 2\n", (int)hid);
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    unlink(path_b);
+    return 1;
+  }
+  printf("ok: guest dlopen loaded a second ARM32 .so (handle %d)\n", (int)hid);
+  NativeBridgeItf.unloadLibrary(handle);
+  unlink(path);
+  unlink(path_b);
+
   /* JNI_OnLoad shape from Unity's libmain.so: AttachCurrentThread via the
    * JavaVM vtable, RegisterNatives, return JNI_VERSION_1_6 with MOVW/MOVT. */
   uint8_t onload_elf[512];

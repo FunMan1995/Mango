@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -38,7 +39,17 @@
 #define MANGO_JNI_IS_SAME_OBJECT 24
 #define MANGO_JNI_GET_OBJECT_CLASS 31
 #define MANGO_JNI_GET_METHOD_ID 33
+#define MANGO_JNI_CALL_OBJECT_METHOD 34
+#define MANGO_JNI_CALL_BOOLEAN_METHOD 37
+#define MANGO_JNI_CALL_INT_METHOD 49
+#define MANGO_JNI_CALL_VOID_METHOD 61
+#define MANGO_JNI_GET_FIELD_ID 94
+#define MANGO_JNI_GET_OBJECT_FIELD 95
+#define MANGO_JNI_GET_INT_FIELD 100
+#define MANGO_JNI_SET_OBJECT_FIELD 104
+#define MANGO_JNI_SET_INT_FIELD 109
 #define MANGO_JNI_GET_STATIC_METHOD_ID 113
+#define MANGO_JNI_GET_STATIC_FIELD_ID 144
 #define MANGO_JNI_NEW_STRING_UTF 167
 #define MANGO_JNI_GET_STRING_UTF_CHARS 169
 #define MANGO_JNI_RELEASE_STRING_UTF_CHARS 170
@@ -68,7 +79,16 @@
 #define MANGO_LIBC_AEABI_MEMCPY 13
 #define MANGO_LIBC_ERRNO 14
 #define MANGO_LIBC_STRTOL 15
-#define MANGO_LIBC_COUNT 16
+#define MANGO_LIBC_DLOPEN 16
+#define MANGO_LIBC_DLSYM 17
+#define MANGO_LIBC_DLCLOSE 18
+#define MANGO_LIBC_DLERROR 19
+#define MANGO_LIBC_ALOG 20
+#define MANGO_LIBC_COUNT 21
+
+#define MANGO_AS_SIZE 0x2000000u
+#define MANGO_LIB_CAP 0x1000000u
+#define MANGO_MAX_LIBS 16
 
 static bool mango_is_arm32_elf(const char* libpath) {
   int fd = open(libpath, O_RDONLY);
@@ -107,7 +127,9 @@ typedef struct MangoLoadedLibrary {
   uint32_t heap_base;
   uint32_t heap_used;
   uint32_t guest_errno_addr;
+  uint32_t load_bias;
   void* host_vm;
+  char path[512];
   MangoElf32Image image;
 } MangoLoadedLibrary;
 
@@ -119,14 +141,24 @@ typedef struct MangoJniSlot {
 } MangoJniSlot;
 
 static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
-    "malloc", "free",    "memcpy", "memmove", "memset", "memcmp",         "memchr",  "strlen",
-    "strcmp", "strncmp", "strcpy", "abort",   "memmem", "__aeabi_memcpy", "__errno", "strtol",
+    "malloc",  "free",   "memcpy",  "memmove", "memset",         "memcmp", "memchr",
+    "strlen",  "strcmp", "strncmp", "strcpy",  "abort",          "memmem", "__aeabi_memcpy",
+    "__errno", "strtol", "dlopen",  "dlsym",   "dlclose",        "dlerror", "__android_log_print",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
 static int g_nslots;
 static void* g_handles[MANGO_HANDLE_MAX];
 static uint32_t g_nhandles = 1; /* 0 is JNI NULL */
+static MangoLoadedLibrary* g_libs[MANGO_MAX_LIBS];
+static int g_nlibs;
+static uint8_t* g_as_mem;
+static uint32_t g_as_size;
+static uint32_t g_as_next;
+static uint32_t g_as_jni_ready;
+static char g_dlerror[128];
+
+static void* mango_load_library(const char* libpath, int flag);
 
 static uint32_t mango_handle_intern(void* p) {
   if (p == NULL) {
@@ -167,8 +199,8 @@ static void mango_write_jni_thunk(uint8_t* mem, uint32_t addr, uint32_t imm) {
   mango_store_u32_guest(mem, addr + 12u, imm);
 }
 
-static int mango_setup_guest_jni(MangoLoadedLibrary* lib, uint32_t elf_end) {
-  uint32_t base = (elf_end + 15u) & ~15u;
+static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
+  uint32_t base = MANGO_LIB_CAP;
   uint32_t vm_table = base + 4u;
   uint32_t vm_thunks = vm_table + MANGO_JVM_TABLE_LEN * 4u;
   uint32_t env_ptr = vm_thunks + MANGO_JVM_TABLE_LEN * MANGO_JNI_THUNK_SIZE;
@@ -177,16 +209,24 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib, uint32_t elf_end) {
   uint32_t libc_thunks = thunks + MANGO_JNI_TABLE_LEN * MANGO_JNI_THUNK_SIZE;
   uint32_t heap = libc_thunks + MANGO_LIBC_COUNT * MANGO_JNI_THUNK_SIZE;
   uint32_t need = heap + MANGO_HEAP_SIZE + MANGO_STACK_SIZE;
-  if ((uint64_t)need > UINT32_MAX) {
+  if (need > g_as_size) {
     return -1;
   }
-  uint8_t* grown = realloc(lib->guest_mem, need);
-  if (!grown) {
-    return -1;
+  lib->guest_mem = g_as_mem;
+  lib->guest_mem_size = g_as_size;
+  if (g_as_jni_ready && g_nlibs > 0) {
+    MangoLoadedLibrary* first = g_libs[0];
+    lib->jni_vm_addr = first->jni_vm_addr;
+    lib->jni_env_addr = first->jni_env_addr;
+    lib->libc_thunk_base = first->libc_thunk_base;
+    lib->heap_base = first->heap_base;
+    lib->heap_used = first->heap_used;
+    lib->guest_errno_addr = first->guest_errno_addr;
+    lib->stack_top = first->stack_top;
+    lib->host_vm = first->host_vm;
+    return 0;
   }
-  memset(grown + lib->guest_mem_size, 0, need - lib->guest_mem_size);
-  lib->guest_mem = grown;
-  lib->guest_mem_size = need;
+  uint8_t* mem = g_as_mem;
   lib->jni_vm_addr = base;
   lib->jni_env_addr = env_ptr;
   lib->libc_thunk_base = libc_thunks;
@@ -195,21 +235,22 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib, uint32_t elf_end) {
   lib->guest_errno_addr = heap;
   lib->stack_top = need - 16u;
   lib->host_vm = NULL;
-  mango_store_u32_guest(grown, base, vm_table);
+  mango_store_u32_guest(mem, base, vm_table);
   for (uint32_t i = 0; i < MANGO_JVM_TABLE_LEN; i++) {
     uint32_t thunk = vm_thunks + i * MANGO_JNI_THUNK_SIZE;
-    mango_write_jni_thunk(grown, thunk, MANGO_JVM_SVC_BASE + i);
-    mango_store_u32_guest(grown, vm_table + i * 4u, thunk);
+    mango_write_jni_thunk(mem, thunk, MANGO_JVM_SVC_BASE + i);
+    mango_store_u32_guest(mem, vm_table + i * 4u, thunk);
   }
-  mango_store_u32_guest(grown, env_ptr, table);
+  mango_store_u32_guest(mem, env_ptr, table);
   for (uint32_t i = 0; i < MANGO_JNI_TABLE_LEN; i++) {
     uint32_t thunk = thunks + i * MANGO_JNI_THUNK_SIZE;
-    mango_write_jni_thunk(grown, thunk, MANGO_JNI_SVC_BASE + i);
-    mango_store_u32_guest(grown, table + i * 4u, thunk);
+    mango_write_jni_thunk(mem, thunk, MANGO_JNI_SVC_BASE + i);
+    mango_store_u32_guest(mem, table + i * 4u, thunk);
   }
   for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
-    mango_write_jni_thunk(grown, libc_thunks + i * MANGO_JNI_THUNK_SIZE, MANGO_LIBC_SVC_BASE + i);
+    mango_write_jni_thunk(mem, libc_thunks + i * MANGO_JNI_THUNK_SIZE, MANGO_LIBC_SVC_BASE + i);
   }
+  g_as_jni_ready = 1;
   return 0;
 }
 
@@ -224,6 +265,12 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
   for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
     if (strcmp(name, kLibcNames[i]) == 0) {
       return lib->libc_thunk_base + i * MANGO_JNI_THUNK_SIZE;
+    }
+  }
+  for (int i = 0; i < g_nlibs; i++) {
+    uint32_t st = mango_elf32_find_symbol(&g_libs[i]->image, name);
+    if (st != 0) {
+      return st + g_libs[i]->load_bias;
     }
   }
   return 0;
@@ -399,6 +446,66 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = s ? (uint32_t)strtol(s, NULL, (int)r2) : 0;
       break;
     }
+    case MANGO_LIBC_DLOPEN: {
+      const char* nm = mango_guest_cstr(lib, r0);
+      char path[512];
+      if (!nm) {
+        cpu->r[0] = 0;
+        break;
+      }
+      if (nm[0] == '/') {
+        snprintf(path, sizeof(path), "%s", nm);
+      } else if (lib->path[0] && strrchr(lib->path, '/')) {
+        const char* slash = strrchr(lib->path, '/');
+        snprintf(path, sizeof(path), "%.*s/%s", (int)(slash - lib->path), lib->path, nm);
+      } else {
+        snprintf(path, sizeof(path), "%s", nm);
+      }
+      {
+        void* h = mango_load_library(path, (int)r1);
+        uint32_t id = 0;
+        if (h) {
+          for (int i = 0; i < g_nlibs; i++) {
+            if (g_libs[i] == h) {
+              id = (uint32_t)(i + 1);
+              break;
+            }
+          }
+        }
+        if (id == 0) {
+          snprintf(g_dlerror, sizeof(g_dlerror), "dlopen failed: %s", path);
+        }
+        cpu->r[0] = id;
+      }
+      break;
+    }
+    case MANGO_LIBC_DLSYM: {
+      const char* nm = mango_guest_cstr(lib, r1);
+      cpu->r[0] = 0;
+      if (nm) {
+        if (r0 == 0) {
+          cpu->r[0] = mango_resolve_import(lib, nm, 0, 0);
+        } else if (r0 >= 1u && r0 <= (uint32_t)g_nlibs) {
+          MangoLoadedLibrary* other = g_libs[r0 - 1u];
+          uint32_t st = mango_elf32_find_symbol(&other->image, nm);
+          if (st) {
+            cpu->r[0] = st + other->load_bias;
+          }
+        }
+      }
+      break;
+    }
+    case MANGO_LIBC_DLCLOSE:
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_DLERROR: {
+      uint32_t a = mango_guest_strdup(lib, g_dlerror);
+      cpu->r[0] = a;
+      break;
+    }
+    case MANGO_LIBC_ALOG:
+      cpu->r[0] = 0;
+      break;
     case MANGO_LIBC_ABORT:
     default:
       cpu->r[0] = (uint32_t)-1;
@@ -483,6 +590,24 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       }
 #endif
       cpu->r[0] = mango_handle_intern(mid);
+      break;
+    }
+    case MANGO_JNI_CALL_OBJECT_METHOD:
+    case MANGO_JNI_CALL_BOOLEAN_METHOD:
+    case MANGO_JNI_CALL_INT_METHOD:
+    case MANGO_JNI_GET_OBJECT_FIELD:
+    case MANGO_JNI_GET_INT_FIELD:
+      cpu->r[0] = 0;
+      break;
+    case MANGO_JNI_CALL_VOID_METHOD:
+    case MANGO_JNI_SET_OBJECT_FIELD:
+    case MANGO_JNI_SET_INT_FIELD:
+      cpu->r[0] = 0;
+      break;
+    case MANGO_JNI_GET_FIELD_ID:
+    case MANGO_JNI_GET_STATIC_FIELD_ID: {
+      const char* name = mango_guest_cstr(lib, cpu->r[2]);
+      cpu->r[0] = name ? mango_handle_intern((void*)(uintptr_t)(cpu->r[2] | 1u)) : 0;
       break;
     }
     case MANGO_JNI_NEW_STRING_UTF: {
@@ -590,6 +715,7 @@ static int mango_is_jni_onload(const MangoJniSlot* slot) {
   if (strcmp(slot->name, "JNI_OnLoad") == 0 || strcmp(slot->name, "JNI_OnUnload") == 0) {
     return 1;
   }
+  /* ART's JNI_OnLoad shorty; tests also use this with mango_add. */
   return slot->shorty[0] == 'I' && slot->shorty[1] == 'L' && slot->shorty[2] == '\0';
 }
 
@@ -776,7 +902,15 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
 
 static void* mango_load_library(const char* libpath, int flag) {
   (void)flag;
-  if (!mango_is_arm32_elf(libpath)) {
+  if (!libpath || !mango_is_arm32_elf(libpath)) {
+    return NULL;
+  }
+  for (int i = 0; i < g_nlibs; i++) {
+    if (strcmp(g_libs[i]->path, libpath) == 0) {
+      return g_libs[i];
+    }
+  }
+  if (g_nlibs >= MANGO_MAX_LIBS) {
     return NULL;
   }
 
@@ -809,48 +943,59 @@ static void* mango_load_library(const char* libpath, int flag) {
     return NULL;
   }
 
-  uint64_t guest_mem_size = 0;
+  uint64_t span = 0;
   for (uint32_t i = 0; i < image.segment_count; i++) {
     uint64_t seg_end = (uint64_t)image.segments[i].vaddr + image.segments[i].memsz;
-    if (seg_end > guest_mem_size) {
-      guest_mem_size = seg_end;
+    if (seg_end > span) {
+      span = seg_end;
     }
   }
-  if (guest_mem_size == 0 || guest_mem_size > UINT32_MAX) {
+  if (span == 0 || span > MANGO_LIB_CAP) {
     free(file_data);
     return NULL;
   }
 
-  uint8_t* guest_mem = calloc(1, (size_t)guest_mem_size);
-  if (!guest_mem) {
+  if (g_as_mem == NULL) {
+    g_as_mem = calloc(1, MANGO_AS_SIZE);
+    if (!g_as_mem) {
+      free(file_data);
+      return NULL;
+    }
+    g_as_size = MANGO_AS_SIZE;
+    g_as_next = 0;
+  }
+
+  uint32_t bias = (g_as_next + 0xFFFu) & ~0xFFFu;
+  if ((uint64_t)bias + span > MANGO_LIB_CAP) {
     free(file_data);
     return NULL;
   }
+
   for (uint32_t i = 0; i < image.segment_count; i++) {
-    memcpy(guest_mem + image.segments[i].vaddr, file_data + image.segments[i].file_offset,
+    memcpy(g_as_mem + bias + image.segments[i].vaddr, file_data + image.segments[i].file_offset,
            image.segments[i].filesz);
   }
 
-  MangoLoadedLibrary* lib = malloc(sizeof(MangoLoadedLibrary));
+  MangoLoadedLibrary* lib = calloc(1, sizeof(MangoLoadedLibrary));
   if (!lib) {
     free(file_data);
-    free(guest_mem);
     return NULL;
   }
   lib->file_data = file_data;
-  lib->guest_mem = guest_mem;
-  lib->guest_mem_size = (uint32_t)guest_mem_size;
   lib->image = image;
-  if (mango_setup_guest_jni(lib, (uint32_t)guest_mem_size) != 0) {
+  lib->load_bias = bias;
+  strncpy(lib->path, libpath, sizeof(lib->path) - 1u);
+  if (mango_setup_guest_jni(lib) != 0) {
     free(lib->file_data);
-    free(lib->guest_mem);
     free(lib);
     return NULL;
   }
-  if (mango_elf32_apply_relocs(&lib->image, lib->guest_mem, lib->guest_mem_size, 0,
+  g_libs[g_nlibs++] = lib;
+  g_as_next = bias + (uint32_t)span;
+  if (mango_elf32_apply_relocs(&lib->image, lib->guest_mem, lib->guest_mem_size, bias,
                                mango_resolve_import, lib) != 0) {
+    g_nlibs--;
     free(lib->file_data);
-    free(lib->guest_mem);
     free(lib);
     return NULL;
   }
@@ -868,6 +1013,7 @@ static void* mango_get_trampoline(void* handle, const char* name, const char* sh
   if (addr == 0) {
     return NULL;
   }
+  addr += lib->load_bias;
   if (g_nslots >= MANGO_JNI_SLOTS) {
     return NULL;
   }
@@ -921,10 +1067,22 @@ static int mango_unload_library(void* handle) {
   if (!lib) {
     return -1;
   }
-  free(lib->file_data);
-  free(lib->guest_mem);
-  free(lib);
-  return 0;
+  for (int i = 0; i < g_nlibs; i++) {
+    if (g_libs[i] == lib) {
+      free(lib->file_data);
+      free(lib);
+      for (int j = i; j + 1 < g_nlibs; j++) {
+        g_libs[j] = g_libs[j + 1];
+      }
+      g_nlibs--;
+      if (g_nlibs == 0) {
+        g_as_next = 0;
+        g_as_jni_ready = 0;
+      }
+      return 0;
+    }
+  }
+  return -1;
 }
 
 /* No per-call error state tracked yet (loadLibrary/getTrampoline just

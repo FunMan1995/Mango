@@ -2070,6 +2070,38 @@ static int test_thumb32_ldr_str_imm(void) {
   return 0;
 }
 
+static int test_thumb32_addw(void) {
+  /* addw r0, r0, #8; bx lr */
+  static const uint16_t kProg[] = {
+      0xF200u, 0x0008u, /* addw r0, r0, #8 */
+      0x4770u,          /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[0] = 10;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb32_addw): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 18) {
+    fprintf(stderr, "FAIL(thumb32_addw): expected r0==18, got %u\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: T32 ADDW r0, r0, #8 (r0=%u)\n", cpu.r[0]);
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2122,6 +2154,7 @@ int main(void) {
   failures += test_arm_blx_reg();
   failures += test_thumb_blx_reg();
   failures += test_thumb32_ldr_str_imm();
+  failures += test_thumb32_addw();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

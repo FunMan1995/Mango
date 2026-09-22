@@ -798,6 +798,42 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* ADDW Rd, Rn, #imm12: 11110 i 100000 Rn / 0 imm3 Rd imm8 */
+  if ((hw1 & 0xFBF0u) == 0xF200u && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_ADD;
+    out->rd = rd;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = (i << 11) | (imm3 << 8) | imm8;
+    return 0;
+  }
+
+  /* SUBW Rd, Rn, #imm12: 11110 i 101010 Rn / 0 imm3 Rd imm8 */
+  if ((hw1 & 0xFBF0u) == 0xF2A0u && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_SUB;
+    out->rd = rd;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = (i << 11) | (imm3 << 8) | imm8;
+    return 0;
+  }
+
   /* MOVT: 11110 i 101100 imm4 / 0 imm3 Rd imm8 */
   if ((hw1 & 0xFBF0u) == 0xF2C0u && (hw2 & 0x8000u) == 0) {
     uint32_t i = (hw1 >> 10) & 1u;

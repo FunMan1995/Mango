@@ -151,7 +151,7 @@ static int test_applies_relative_and_jump_slot(void) {
    * a fake UND we need a name; force index 1's shndx by using resolve on
    * a zero shndx. The JUMP_SLOT above uses sym 1, which is mango_add at
    * 0x40, defined, so it should write 0x40 not call resolve. */
-  if (mango_elf32_apply_relocs(&image, mem, sizeof(mem), 0x1000u, test_resolve_malloc, NULL) != 0) {
+  if (mango_elf32_apply_relocs(&image, mem, sizeof(mem), 0, test_resolve_malloc, NULL) != 0) {
     fprintf(stderr, "FAIL(applies_relocs): apply returned -1\n");
     return 1;
   }
@@ -159,15 +159,15 @@ static int test_applies_relative_and_jump_slot(void) {
                  ((uint32_t)mem[19] << 24);
   uint32_t slot = (uint32_t)mem[20] | ((uint32_t)mem[21] << 8) | ((uint32_t)mem[22] << 16) |
                   ((uint32_t)mem[23] << 24);
-  if (rel != 0x1100u) {
-    fprintf(stderr, "FAIL(applies_relocs): RELATIVE wrote 0x%x, want 0x1100\n", rel);
+  if (rel != 0x100u) {
+    fprintf(stderr, "FAIL(applies_relocs): RELATIVE wrote 0x%x, want 0x100\n", rel);
     return 1;
   }
-  if (slot != 0x40u + 0x1000u) {
-    fprintf(stderr, "FAIL(applies_relocs): JUMP_SLOT wrote 0x%x, want mango_add+bias\n", slot);
+  if (slot != 0x40u) {
+    fprintf(stderr, "FAIL(applies_relocs): JUMP_SLOT wrote 0x%x, want mango_add\n", slot);
     return 1;
   }
-  printf("ok: R_ARM_RELATIVE (+bias) and JUMP_SLOT (defined symbol) apply\n");
+  printf("ok: R_ARM_RELATIVE and JUMP_SLOT (defined symbol) apply\n");
   return 0;
 }
 

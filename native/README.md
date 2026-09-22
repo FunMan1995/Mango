@@ -142,7 +142,7 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: fifty test programs, hand-encoded by
+- `tests/test_interp.c`: fifty-one test programs, hand-encoded by
   working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why
@@ -188,7 +188,7 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
 - Remaining 32-bit Thumb (more addressing modes, data-processing), then NEON.
   Each addition should come with a hand-derived test case the way the
   existing ones work, see `docs/CONTRIBUTING.md`'s testing section.
-- Guest `dlopen`/`dlsym` so Unity's `JNI_OnLoad` can pull in `libunity.so`,
-  GLES/libandroid thunks, and VFP. Integer JNI plus `JNI_OnLoad`'s
-  JavaVM/`RegisterNatives` path is in place; float/double returns and
-  `Call*Method` are not.
+- Guest `dlopen`/`dlsym`/`dlclose` map extra ARM32 `.so`s into a shared
+  32 MiB address space (Unity `libunity.so` / `libmono.so`). `Call*Method`
+  and field get/set are no-op stubs until host JNI is wired; float/double
+  returns, GLES, and VFP/NEON are still open.

@@ -219,28 +219,30 @@ static int mango_elf32_apply_rel_table(const MangoElf32Image* image, uint8_t* me
   if (table_size == 0) {
     return 0;
   }
-  if (table_size % 8u != 0 || (uint64_t)table_vaddr + table_size > mem_size) {
+  uint32_t table_at = table_vaddr + load_bias;
+  if (table_size % 8u != 0 || (uint64_t)table_at + table_size > mem_size) {
     return -1;
   }
   for (uint32_t i = 0; i < table_size; i += 8u) {
     uint32_t r_offset =
-        (uint32_t)mem[table_vaddr + i] | ((uint32_t)mem[table_vaddr + i + 1u] << 8) |
-        ((uint32_t)mem[table_vaddr + i + 2u] << 16) | ((uint32_t)mem[table_vaddr + i + 3u] << 24);
+        (uint32_t)mem[table_at + i] | ((uint32_t)mem[table_at + i + 1u] << 8) |
+        ((uint32_t)mem[table_at + i + 2u] << 16) | ((uint32_t)mem[table_at + i + 3u] << 24);
     uint32_t r_info =
-        (uint32_t)mem[table_vaddr + i + 4u] | ((uint32_t)mem[table_vaddr + i + 5u] << 8) |
-        ((uint32_t)mem[table_vaddr + i + 6u] << 16) | ((uint32_t)mem[table_vaddr + i + 7u] << 24);
+        (uint32_t)mem[table_at + i + 4u] | ((uint32_t)mem[table_at + i + 5u] << 8) |
+        ((uint32_t)mem[table_at + i + 6u] << 16) | ((uint32_t)mem[table_at + i + 7u] << 24);
     uint32_t type = r_info & 0xFFu;
     uint32_t sym = r_info >> 8;
-    if ((uint64_t)r_offset + 4u > mem_size) {
+    uint32_t loc = r_offset + load_bias;
+    if ((uint64_t)loc + 4u > mem_size) {
       return -1;
     }
-    uint32_t addend = (uint32_t)mem[r_offset] | ((uint32_t)mem[r_offset + 1u] << 8) |
-                      ((uint32_t)mem[r_offset + 2u] << 16) | ((uint32_t)mem[r_offset + 3u] << 24);
+    uint32_t addend = (uint32_t)mem[loc] | ((uint32_t)mem[loc + 1u] << 8) |
+                      ((uint32_t)mem[loc + 2u] << 16) | ((uint32_t)mem[loc + 3u] << 24);
     if (type == 0) {
       continue;
     }
     if (type == MANGO_R_ARM_RELATIVE) {
-      store_u32_le(mem + r_offset, addend + load_bias);
+      store_u32_le(mem + loc, addend + load_bias);
       continue;
     }
     if (type != MANGO_R_ARM_ABS32 && type != MANGO_R_ARM_GLOB_DAT &&
@@ -264,7 +266,7 @@ static int mango_elf32_apply_rel_table(const MangoElf32Image* image, uint8_t* me
     if (type == MANGO_R_ARM_ABS32) {
       addr += addend;
     }
-    store_u32_le(mem + r_offset, addr);
+    store_u32_le(mem + loc, addr);
   }
   return 0;
 }
