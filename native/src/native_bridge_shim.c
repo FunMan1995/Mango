@@ -144,7 +144,8 @@
 #define MANGO_LIBC_PTHREAD_GETSPECIFIC 64
 #define MANGO_LIBC_PTHREAD_SETSPECIFIC 65
 #define MANGO_LIBC_PTHREAD_KEY_DELETE 66
-#define MANGO_LIBC_COUNT 67
+#define MANGO_LIBC_REALLOC 67
+#define MANGO_LIBC_COUNT 68
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x2800000u
@@ -270,6 +271,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "pthread_getspecific",
     "pthread_setspecific",
     "pthread_key_delete",
+    "realloc",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -624,6 +626,28 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         cpu->r[0] = lib->heap_base + lib->heap_used;
         lib->heap_used += n;
       }
+      break;
+    }
+    case MANGO_LIBC_REALLOC: {
+      /* Unity MemoryManager realloc: r0=old (may be 0), r1=new bytes. */
+      uint32_t old = r0;
+      uint32_t n = (r1 + 7u) & ~7u;
+      uint32_t neu;
+      if (n == 0) {
+        n = 8u;
+      }
+      if (lib->heap_used + n > MANGO_HEAP_SIZE) {
+        cpu->r[0] = 0;
+        break;
+      }
+      neu = lib->heap_base + lib->heap_used;
+      if (old != 0 && old >= lib->heap_base && old < lib->heap_base + lib->heap_used) {
+        uint32_t avail = (lib->heap_base + lib->heap_used) - old;
+        uint32_t copy = n < avail ? n : avail;
+        memmove(lib->guest_mem + neu, lib->guest_mem + old, copy);
+      }
+      lib->heap_used += n;
+      cpu->r[0] = neu;
       break;
     }
     case MANGO_LIBC_FREE:
@@ -1673,6 +1697,12 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  * (0x82ec07ee, a VFP word mid-image) becomes the branch target — PC far above
  * the 40 MiB guest AS. Redirect that site through a trampoline that skips the
  * virtual call when the lookup returns NULL (same as the sibling sites).
+ *
+ * Vector grow uses sibling realloc at VA 0x103a64 (r0=old, r1=bytes). With no
+ * MemoryManager that path fails open and leaves dynamic_array data pointing at
+ * a shader label string ("_Object2World") while size holds a near-pointer
+ * (strlen into the same pool) — quicksort then LDR-reg-offsets OOB (ASCII
+ * "Worl"). Route that realloc onto guest realloc like the malloc hook above.
  */
 static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
   const char* base;
@@ -1685,17 +1715,22 @@ static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
 }
 
 static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
-  uint32_t alloc_fn, hdr, sen;
+  uint32_t alloc_fn, realloc_fn, hdr, sen;
   if (!mango_is_ofdp_unity(lib)) {
     return;
   }
   alloc_fn = lib->load_bias + 0x102b78u;
-  if (!mango_guest_range_ok(lib, alloc_fn, MANGO_JNI_THUNK_SIZE) ||
-      mango_load_u32_guest(lib->guest_mem, alloc_fn) != 0xe92d4bf0u) {
-    return;
+  if (mango_guest_range_ok(lib, alloc_fn, MANGO_JNI_THUNK_SIZE) &&
+      mango_load_u32_guest(lib->guest_mem, alloc_fn) == 0xe92d4bf0u) {
+    /* r0 is the byte size at every call site we inspected; route to guest malloc. */
+    mango_write_jni_thunk(lib->guest_mem, alloc_fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_MALLOC);
   }
-  /* r0 is the byte size at every call site we inspected; route to guest malloc. */
-  mango_write_jni_thunk(lib->guest_mem, alloc_fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_MALLOC);
+  /* Sibling realloc VA 0x103a64: r0=old, r1=bytes (vector grow when capacity>=0). */
+  realloc_fn = lib->load_bias + 0x103a64u;
+  if (mango_guest_range_ok(lib, realloc_fn, MANGO_JNI_THUNK_SIZE) &&
+      mango_load_u32_guest(lib->guest_mem, realloc_fn) == 0xe92d4bf0u) {
+    mango_write_jni_thunk(lib->guest_mem, realloc_fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_REALLOC);
+  }
 
   hdr = lib->load_bias + 0x12d3d80u;
   if (!mango_guest_range_ok(lib, hdr, 0x40u)) {

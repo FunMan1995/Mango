@@ -218,12 +218,14 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   `libmono.so`. Dummy `FindClass` lets Unity `RegisterNatives` bind
   `nativeRender` / `nativePause` / `initJni` and the rest. OFDP
   `libunity.so` routes the internal MemoryManager allocator (VA
-  `0x102b78`) to guest `malloc`, seeds the keyword-tree sentinel, after
-  constructors seeds MemoryManager list2 (BSS `0x12c1630`), and seeds the
-  Hash128 interval tree (BSS `0x12d7fa0`, redirect ctor alloc, disable reset
-  VA `0x87fb30`), and null-checks the label-lookup site at VA `0x103f54`
-  (siblings already check; without it a NULL walk uses guest `[0]=0xffffff`
-  as a vtable and BLXs to `0x82ec07ee`) so `nativeRender` does not OOB on
-  ASCII `NAL_` / `C_TE`, LDRD at bogus node `0x4000000`, or jump outside
-  the guest AS via a corrupt callback. Host `Call*Method`
-  and real GLES are still open.
+  `0x102b78`) to guest `malloc` and its sibling realloc (VA `0x103a64`,
+  `r0`=old / `r1`=bytes) so vector grow does not leave `dynamic_array` data
+  pointing at shader label strings (`_Object2World` / ASCII `Worl`), seeds
+  the keyword-tree sentinel, after constructors seeds MemoryManager list2
+  (BSS `0x12c1630`), and seeds the Hash128 interval tree (BSS `0x12d7fa0`,
+  redirect ctor alloc, disable reset VA `0x87fb30`), and null-checks the
+  label-lookup site at VA `0x103f54` (siblings already check; without it a
+  NULL walk uses guest `[0]=0xffffff` as a vtable and BLXs to `0x82ec07ee`)
+  so `nativeRender` does not OOB on ASCII `NAL_` / `C_TE` / `Worl`, LDRD at
+  bogus node `0x4000000`, or jump outside the guest AS via a corrupt
+  callback. Host `Call*Method` and real GLES are still open.
