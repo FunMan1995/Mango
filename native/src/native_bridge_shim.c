@@ -1703,6 +1703,13 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  * a shader label string ("_Object2World") while size holds a near-pointer
  * (strlen into the same pool) — quicksort then LDR-reg-offsets OOB (ASCII
  * "Worl"). Route that realloc onto guest realloc like the malloc hook above.
+ *
+ * A second typed allocator at VA 0x102c48 (same prologue; call sites pass size
+ * in r0, e.g. nativeRender VA 0x780b24/0x780b68) also returned NULL. That left
+ * BSS object 0x12d3ee0 +8 as 0, so the helper at VA 0x7810fc took its empty-path
+ * count++ on every call while the caller looped on that same count — interpreter
+ * step-limit then looked like a failing LDMIA POP at VA 0x781280. Hook 0x102c48
+ * to guest malloc as well.
  */
 static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
   const char* base;
@@ -1715,7 +1722,7 @@ static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
 }
 
 static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
-  uint32_t alloc_fn, realloc_fn, hdr, sen;
+  uint32_t alloc_fn, alloc2_fn, realloc_fn, hdr, sen;
   if (!mango_is_ofdp_unity(lib)) {
     return;
   }
@@ -1724,6 +1731,12 @@ static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
       mango_load_u32_guest(lib->guest_mem, alloc_fn) == 0xe92d4bf0u) {
     /* r0 is the byte size at every call site we inspected; route to guest malloc. */
     mango_write_jni_thunk(lib->guest_mem, alloc_fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_MALLOC);
+  }
+  /* Sibling typed alloc VA 0x102c48: r0=bytes at OFDP sites (labels in r1+). */
+  alloc2_fn = lib->load_bias + 0x102c48u;
+  if (mango_guest_range_ok(lib, alloc2_fn, MANGO_JNI_THUNK_SIZE) &&
+      mango_load_u32_guest(lib->guest_mem, alloc2_fn) == 0xe92d4bf0u) {
+    mango_write_jni_thunk(lib->guest_mem, alloc2_fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_MALLOC);
   }
   /* Sibling realloc VA 0x103a64: r0=old, r1=bytes (vector grow when capacity>=0). */
   realloc_fn = lib->load_bias + 0x103a64u;
