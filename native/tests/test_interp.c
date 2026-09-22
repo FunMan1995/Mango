@@ -2692,6 +2692,106 @@ static int test_vmov_f32_scalar_imm(void) {
   return 0;
 }
 
+
+static int test_ofdp_native_render_vmul_vcmp(void) {
+  /* OFDP nativeRender scale loop fragment: s4 = (float)r0 * 0.5; VCMPE; VMRS.
+   * Prior VCMP GT left NZCV clear → BLS always taken → r0 doubles to 0 → BCC spin. */
+  static const uint32_t kProg[] = {
+      0xEEB60A00u, /* vmov.f32 s0, #0.5 */
+      0xF2C00050u, /* vmov.i32 q8, #0  (must not clobber s0) */
+      0xEE010A10u, /* vmov s2, r0 */
+      0xEEB81A41u, /* vcvt.f32.u32 s2, s2 */
+      0xEE212A00u, /* vmul.f32 s4, s2, s0 */
+      0xEEB52AC0u, /* vcmpe.f32 s4, #0 */
+      0xEEF1FA10u, /* vmrs apsr_nzcv, fpscr */
+      0xE12FFF1Eu, /* bx lr */
+  };
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kProg, 8);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[0] = 0x20000u;
+  cpu.r[1] = 0x20000u;
+  cpu.r[MANGO_REG_LR] = 0x0FDBu;
+  int rc = mango_interp_run(&cpu, &mem, 0x0FDBu, 100);
+  uint32_t nzcv = cpu.cpsr & 0xF0000000u;
+  int ls = ((cpu.cpsr & MANGO_CPSR_Z) != 0) || ((cpu.cpsr & MANGO_CPSR_C) == 0);
+  if (rc != 0 || cpu.s[0] != 0x3F000000u || cpu.s[2] != 0x48000000u ||
+      cpu.s[4] != 0x47800000u || nzcv != MANGO_CPSR_C || ls) {
+    fprintf(stderr,
+            "FAIL(ofdp_vmul_vcmp): rc=%d s0=0x%x s2=0x%x s4=0x%x cpsr=0x%x ls=%d\n", rc,
+            cpu.s[0], cpu.s[2], cpu.s[4], cpu.cpsr, ls);
+    return 1;
+  }
+  printf("ok: OFDP VMOV#0.5/VMUL/VCMPE GT sets C (BLS not taken)\n");
+  return 0;
+}
+
+static int test_vcmp_fpscr_nzcv(void) {
+  /* ARM-correct VCMP FPSCR: EQ=Z|C, LT=N, GT=C, Unordered=C|V */
+  static const uint32_t kEq[] = {0xEEB50AC0u, 0xEEF1FA10u, 0xE12FFF1Eu};
+  static const uint32_t kLt[] = {
+      0xEEB50AC0u, /* vcmpe.f32 s0, #0 — s0 = -1.0f */
+      0xEEF1FA10u,
+      0xE12FFF1Eu,
+  };
+  static const uint32_t kGt[] = {
+      0xEEB50AC0u, /* vcmpe.f32 s0, #0 — s0 = +1.0f */
+      0xEEF1FA10u,
+      0xE12FFF1Eu,
+  };
+  static const uint32_t kUn[] = {
+      0xEEB50AC0u, /* vcmpe.f32 s0, #0 — s0 = qNaN */
+      0xEEF1FA10u,
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+
+  load_words(mem_buf, sizeof(mem_buf), kEq, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x1111u;
+  if (mango_interp_run(&cpu, &mem, 0x1111u, 100) != 0 ||
+      (cpu.cpsr & 0xF0000000u) != (MANGO_CPSR_Z | MANGO_CPSR_C)) {
+    fprintf(stderr, "FAIL(vcmp_eq): cpsr=0x%x\n", cpu.cpsr);
+    return 1;
+  }
+
+  load_words(mem_buf, sizeof(mem_buf), kLt, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[0] = 0xBF800000u; /* -1.0f */
+  cpu.r[MANGO_REG_LR] = 0x2222u;
+  if (mango_interp_run(&cpu, &mem, 0x2222u, 100) != 0 ||
+      (cpu.cpsr & 0xF0000000u) != MANGO_CPSR_N) {
+    fprintf(stderr, "FAIL(vcmp_lt): cpsr=0x%x\n", cpu.cpsr);
+    return 1;
+  }
+
+  load_words(mem_buf, sizeof(mem_buf), kGt, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[0] = 0x3F800000u; /* +1.0f */
+  cpu.r[MANGO_REG_LR] = 0x3333u;
+  if (mango_interp_run(&cpu, &mem, 0x3333u, 100) != 0 ||
+      (cpu.cpsr & 0xF0000000u) != MANGO_CPSR_C) {
+    fprintf(stderr, "FAIL(vcmp_gt): cpsr=0x%x\n", cpu.cpsr);
+    return 1;
+  }
+
+  load_words(mem_buf, sizeof(mem_buf), kUn, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[0] = 0x7FC00000u; /* qNaN */
+  cpu.r[MANGO_REG_LR] = 0x4444u;
+  if (mango_interp_run(&cpu, &mem, 0x4444u, 100) != 0 ||
+      (cpu.cpsr & 0xF0000000u) != (MANGO_CPSR_C | MANGO_CPSR_V)) {
+    fprintf(stderr, "FAIL(vcmp_unord): cpsr=0x%x\n", cpu.cpsr);
+    return 1;
+  }
+  printf("ok: VCMP FPSCR EQ/LT/GT/Unordered\n");
+  return 0;
+}
+
 static int test_strexd(void) {
   static const uint32_t kProg[] = {
       0xE3A00040u, /* mov r0, #64 */
@@ -2792,6 +2892,8 @@ int main(void) {
   failures += test_vcvt_s32_f64();
   failures += test_vmov_f32_imm_and_smmul();
   failures += test_vmov_f32_scalar_imm();
+  failures += test_ofdp_native_render_vmul_vcmp();
+  failures += test_vcmp_fpscr_nzcv();
   failures += test_strexd();
 
   if (failures != 0) {

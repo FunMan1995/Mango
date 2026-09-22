@@ -949,12 +949,17 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_VCMP: {
-          int lt, eq;
+          /* ARM FPSCR NZCV after VCMP: EQ=Z|C, LT=N (C clear), GT=C, Unordered=C|V. */
+          int lt = 0, eq = 0, unord = 0;
           if (insn.b) {
             double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rd));
             double b = insn.imm ? 0.0 : mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
-            eq = a == b;
-            lt = a < b;
+            if (a != a || b != b) {
+              unord = 1;
+            } else {
+              eq = a == b;
+              lt = a < b;
+            }
           } else {
             float a, b;
             uint32_t ua = cpu->s[insn.rd & 31u];
@@ -965,14 +970,22 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               uint32_t ub = cpu->s[insn.rm & 31u];
               memcpy(&b, &ub, 4);
             }
-            eq = a == b;
-            lt = a < b;
+            if (a != a || b != b) {
+              unord = 1;
+            } else {
+              eq = a == b;
+              lt = a < b;
+            }
           }
           cpu->fpscr &= ~0xF0000000u;
-          if (eq) {
+          if (unord) {
+            cpu->fpscr |= MANGO_CPSR_C | MANGO_CPSR_V;
+          } else if (eq) {
             cpu->fpscr |= MANGO_CPSR_Z | MANGO_CPSR_C;
           } else if (lt) {
-            cpu->fpscr |= MANGO_CPSR_N | MANGO_CPSR_C;
+            cpu->fpscr |= MANGO_CPSR_N;
+          } else {
+            cpu->fpscr |= MANGO_CPSR_C; /* GT */
           }
           break;
         }
