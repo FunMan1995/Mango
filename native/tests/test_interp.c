@@ -3100,6 +3100,64 @@ static int test_vmov_f32_imm_and_smmul(void) {
 }
 
 
+
+static int test_vmov_f32_ss(void) {
+  /* OFDP nativeRender stop 0xeeb00a48: VMOV.F32 s0, s16 (high S via M/Vm). */
+  MangoInsn insn;
+  memset(&insn, 0, sizeof(insn));
+  if (mango_decode(0xEEB00A48u, &insn) != 0 || insn.op != MANGO_OP_VMOV ||
+      insn.u != 6 || insn.rd != 0u || insn.rm != 16u || insn.b != 0) {
+    fprintf(stderr, "FAIL(vmov_f32_ss): decode op=%d u=%d rd=%u rm=%u b=%d\n", (int)insn.op,
+            insn.u, insn.rd, insn.rm, insn.b);
+    return 1;
+  }
+
+  static const uint32_t kProg[] = {
+      0xEEB00A48u, /* vmov.f32 s0, s16 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[16] = 0x3F800000u; /* 1.0f */
+  cpu.s[0] = 0xDEADBEEFu;
+  cpu.r[MANGO_REG_LR] = 0x5656u;
+  int rc = mango_interp_run(&cpu, &mem, 0x5656u, 100);
+  if (rc != 0 || cpu.s[0] != 0x3F800000u || cpu.s[16] != 0x3F800000u) {
+    fprintf(stderr, "FAIL(vmov_f32_ss): rc=%d s0=0x%x s16=0x%x\n", rc, cpu.s[0], cpu.s[16]);
+    return 1;
+  }
+
+  /* Same encoding group: VMOV.F64 d0, d1 */
+  memset(&insn, 0, sizeof(insn));
+  if (mango_decode(0xEEB00B41u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 6 ||
+      insn.rd != 0u || insn.rm != 1u || insn.b != 1) {
+    fprintf(stderr, "FAIL(vmov_f64_dd): decode op=%d u=%d rd=%u rm=%u b=%d\n", (int)insn.op,
+            insn.u, insn.rd, insn.rm, insn.b);
+    return 1;
+  }
+  static const uint32_t kD[] = {
+      0xEEB00B41u, /* vmov.f64 d0, d1 */
+      0xE12FFF1Eu,
+  };
+  load_words(mem_buf, sizeof(mem_buf), kD, 2);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[2] = 0x00000000u;
+  cpu.s[3] = 0x3FF00000u; /* d1 = 1.0 */
+  cpu.s[0] = 0xCAFEu;
+  cpu.s[1] = 0xBABEu;
+  cpu.r[MANGO_REG_LR] = 0x5757u;
+  rc = mango_interp_run(&cpu, &mem, 0x5757u, 100);
+  if (rc != 0 || cpu.s[0] != 0u || cpu.s[1] != 0x3FF00000u) {
+    fprintf(stderr, "FAIL(vmov_f64_dd): rc=%d s0=0x%x s1=0x%x\n", rc, cpu.s[0], cpu.s[1]);
+    return 1;
+  }
+  printf("ok: VMOV.F32 s0,s16 (0xeeb00a48) and VMOV.F64 d0,d1\n");
+  return 0;
+}
+
 static int test_vmov_f32_scalar_imm(void) {
   /* OFDP nativeRender stop: VMOV.F32 s0, #0.5 (imm8=0x60 → 0x3f000000). */
   static const uint32_t kProg[] = {
@@ -3322,6 +3380,7 @@ int main(void) {
   failures += test_vcvt_s32_f32();
   failures += test_vcvt_s32_f64();
   failures += test_vmov_f32_imm_and_smmul();
+  failures += test_vmov_f32_ss();
   failures += test_vmov_f32_scalar_imm();
   failures += test_ofdp_native_render_vmul_vcmp();
   failures += test_vcmp_fpscr_nzcv();

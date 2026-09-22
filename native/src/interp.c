@@ -1085,6 +1085,19 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               }
               cpu->s[insn.rd] = insn.imm;
             }
+          } else if (insn.u == 6) {
+            /* VFP VMOV Sd,Sm / Dd,Dm */
+            if (insn.b) {
+              if (insn.rd >= 32u || insn.rm >= 32u) {
+                return -1;
+              }
+              mango_vfp_set_d(cpu, insn.rd, mango_vfp_get_d(cpu, insn.rm));
+            } else {
+              if (insn.rd >= 32u || insn.rm >= 32u) {
+                return -1;
+              }
+              cpu->s[insn.rd] = cpu->s[insn.rm];
+            }
           } else {
             mango_vfp_set_d(cpu, insn.rd, mango_vfp_get_d(cpu, insn.rm));
           }

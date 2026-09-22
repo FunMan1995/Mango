@@ -80,7 +80,7 @@ synthetic programs, not real app code yet.
   `VDUP` from a GPR, extra VFP `VSUB`/`VDIV`/`VABS`/`VNEG`/`VSQRT`,
   `BFC`/`BFI`/`UBFX`/`SBFX`, `RBIT`/`REV`/`REV16`/`REVSH`,
   `UXTB`/`UXTH`/`SXTB`/`SXTH` (and `*TA*` accumulate), `PKHBT`/`PKHTB`,
-  `VMOV` between an S register and a GPR, VFP single `VADD`/`VSUB`/`VMUL`/
+  `VMOV` between an S register and a GPR, VFP `VMOV.F32`/`F64` Sd/Dd←Sm/Dm, VFP single `VADD`/`VSUB`/`VMUL`/
   `VDIV`/`VCMP`, `VCVT.F32.F64`/`VCVT.S32.F64`/`VCVT.S32.F32`, dummy JNI `Call*Method`/`Get*Field`
   returning interned objects, EGL init/create/query thunks, and
   `pthread_key_create`/`getspecific`/`setspecific` TLS. `loadLibrary`

@@ -409,8 +409,17 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       out->op = MANGO_OP_VMRS;
       return 0;
     }
-    if (dbl && ((word >> 16) & 0xFFu) == 0xF0u && ((word >> 4) & 0xFu) == 0x6u) {
+    /* VMOV.F32 Sd,Sm / VMOV.F64 Dd,Dm (A8.8.340): opc=1011, Vn=0000, bits7-4=01M0.
+     * Must run before VMOV#imm — Vm=0,M=0 (e.g. 0xeeb00a40) aliases the imm mask. */
+    if (((word >> 16) & 0xBFu) == 0xB0u && ((word >> 4) & 0xDu) == 0x4u) {
+      if (fd >= 32u || fm >= 32u) {
+        return -1;
+      }
       out->op = MANGO_OP_VMOV;
+      out->u = 6; /* scalar Sn←Sm / Dn←Dm */
+      out->rd = fd;
+      out->rm = fm;
+      out->b = dbl;
       return 0;
     }
     /* VMOV.F32 Sd,#imm / VMOV.F64 Dd,#imm (A8.8.343): bits23=1,21-20=11, bits3-0=0. */
