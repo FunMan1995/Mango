@@ -152,7 +152,9 @@
 #define MANGO_LIBC_MPROTECT 72
 #define MANGO_LIBC_GETPAGESIZE 73
 #define MANGO_LIBC_PTHREAD_EQUAL 74
-#define MANGO_LIBC_COUNT 75
+#define MANGO_LIBC_EXIT 75
+#define MANGO_LIBC_EXIT_UNDERSCORE 76
+#define MANGO_LIBC_COUNT 77
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x2800000u
@@ -287,6 +289,8 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "mprotect",
     "getpagesize",
     "pthread_equal",
+    "exit",
+    "_exit",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -1188,6 +1192,13 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = (r0 == r1) ? 1u : 0u;
       break;
     case MANGO_LIBC_ABORT:
+    case MANGO_LIBC_EXIT:
+    case MANGO_LIBC_EXIT_UNDERSCORE:
+      /* Noreturn: mono/Unity BL exit/abort with LR on the next literal pool.
+       * The default mov-r0-#0 stub returned there (OFDP pc=0x17101c word=0x0022ff98).
+       * Point LR at the JNI stop sentinel so the thunk's bx lr ends the trampoline. */
+      cpu->r[MANGO_REG_LR] = MANGO_JNI_STOP;
+      break;
     default:
       cpu->r[0] = (uint32_t)-1;
       break;
