@@ -212,7 +212,7 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   and a few pthread stubs are thunked. GLES/EGL/`ANativeWindow` calls
   return success/dummy sizes. `getTrampoline` finds `RegisterNatives`
   names (`NativeLoader.load`). `pthread_once` runs the init function.
-  Fake `/proc/cpuinfo` and auxv advertise NEON/VFP. Guest `write` reports the full requested count (discard sink) so libmono write-all loops do not spin on the default `mov r0,#0` stub. JNI thunks preserve
+  Fake `/proc/cpuinfo` and auxv advertise NEON/VFP. Guest `write` reports the full requested count (discard sink) so libmono write-all loops do not spin on the default `mov r0,#0` stub. Bionic `__page_size` resolves to a real 4096 word (not the `mov r0,#0` stub) so Boehm does not set `GC_page_size=0xe3a00000` and abort GET_MEM with `Bad GET_MEM arg`; `pthread_equal` compares thread ids so GC does not abort with `Collecting from unknown thread`; `sysconf`/`getpagesize`/`mmap`/`munmap`/`mprotect` back the same. JNI thunks preserve
   r4–r11 (SVC number is the word after `bx lr`). Unity
   `NativeLoader.load` returns true and `dlopen`s `libunity.so` and
   `libmono.so`. Dummy `FindClass` lets Unity `RegisterNatives` bind

@@ -146,7 +146,13 @@
 #define MANGO_LIBC_PTHREAD_KEY_DELETE 66
 #define MANGO_LIBC_REALLOC 67
 #define MANGO_LIBC_WRITE 68
-#define MANGO_LIBC_COUNT 69
+#define MANGO_LIBC_SYSCONF 69
+#define MANGO_LIBC_MMAP 70
+#define MANGO_LIBC_MUNMAP 71
+#define MANGO_LIBC_MPROTECT 72
+#define MANGO_LIBC_GETPAGESIZE 73
+#define MANGO_LIBC_PTHREAD_EQUAL 74
+#define MANGO_LIBC_COUNT 75
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x2800000u
@@ -190,6 +196,7 @@ typedef struct MangoLoadedLibrary {
   uint32_t heap_base;
   uint32_t heap_used;
   uint32_t guest_errno_addr;
+  uint32_t page_size_addr;
   uint32_t load_bias;
   uint32_t stub_addr;
   void* host_vm;
@@ -274,6 +281,12 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "pthread_key_delete",
     "realloc",
     "write",
+    "sysconf",
+    "mmap",
+    "munmap",
+    "mprotect",
+    "getpagesize",
+    "pthread_equal",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -368,6 +381,26 @@ static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n) {
   return a;
 }
 
+/* Page-aligned anonymous mapping for Boehm GC GET_MEM (mmap). */
+static uint32_t mango_guest_alloc_pages(MangoLoadedLibrary* lib, uint32_t n) {
+  const uint32_t page = 4096u;
+  uint32_t cur, aligned, pad, total;
+  if (n == 0) {
+    return 0;
+  }
+  n = (n + page - 1u) & ~(page - 1u);
+  cur = lib->heap_base + lib->heap_used;
+  aligned = (cur + page - 1u) & ~(page - 1u);
+  pad = aligned - cur;
+  total = pad + n;
+  if (lib->heap_used + total > MANGO_HEAP_SIZE) {
+    return 0;
+  }
+  lib->heap_used += total;
+  memset(lib->guest_mem + aligned, 0, n);
+  return aligned;
+}
+
 static void* mango_handle_lookup(uint32_t id) {
   if (id == 0) {
     return NULL;
@@ -425,6 +458,7 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
     lib->heap_base = first->heap_base;
     lib->heap_used = first->heap_used;
     lib->guest_errno_addr = first->guest_errno_addr;
+    lib->page_size_addr = first->page_size_addr;
     lib->stack_top = first->stack_top;
     lib->host_vm = first->host_vm;
     return 0;
@@ -435,9 +469,11 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
   lib->libc_thunk_base = libc_thunks;
   lib->stub_addr = stub;
   lib->heap_base = heap;
-  lib->heap_used = 8u; /* errno at +0, stack guard at +4 */
+  lib->heap_used = 12u; /* errno +0, stack guard +4, __page_size +8 */
   lib->guest_errno_addr = heap;
+  lib->page_size_addr = heap + 8u;
   mango_store_u32_guest(mem, heap + 4u, 0xA5A5A5A5u);
+  mango_store_u32_guest(mem, heap + 8u, 4096u); /* bionic __page_size */
   lib->stack_top = need - 16u;
   lib->host_vm = NULL;
   mango_store_u32_guest(mem, base, vm_table);
@@ -474,6 +510,11 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
   }
   if (strcmp(name, "__stack_chk_guard") == 0) {
     return lib->guest_errno_addr + 4u;
+  }
+  if (strcmp(name, "__page_size") == 0) {
+    /* Bionic data symbol; Boehm GC reads *(__page_size). Must not be the
+     * mov-r0-#0 stub (that made GC_page_size=0xe3a00000 → Bad GET_MEM arg). */
+    return lib->page_size_addr;
   }
   if (strcmp(name, "eglGetError") == 0) {
     name = "eglGetError";
@@ -1106,6 +1147,46 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         cpu->r[0] = r0;
       }
       break;
+    case MANGO_LIBC_SYSCONF:
+      /* bionic: _SC_PAGESIZE=0x27, _SC_CLK_TCK=0x28, _SC_NPROCESSORS_*=0x60/0x61,
+       * _SC_PHYS_PAGES=0x62; glibc pagesize=30. Unresolved/zero pagesize left
+       * Boehm GC_page_size as garbage (saw 0xe3a00000) → "Bad GET_MEM arg". */
+      if (r0 == 0x27u || r0 == 30u || r0 == 39u) {
+        cpu->r[0] = 4096u;
+      } else if (r0 == 0x28u || r0 == 40u || r0 == 2u) {
+        cpu->r[0] = 100u; /* CLK_TCK */
+      } else if (r0 == 0x60u || r0 == 0x61u || r0 == 83u || r0 == 84u || r0 == 97u) {
+        cpu->r[0] = 4u; /* NPROCESSORS */
+      } else if (r0 == 0x62u || r0 == 0x63u || r0 == 98u || r0 == 99u) {
+        cpu->r[0] = 256u * 1024u; /* PHYS/AVPHYS pages (~1GiB) */
+      } else {
+        cpu->r[0] = (uint32_t)-1;
+      }
+      break;
+    case MANGO_LIBC_MMAP: {
+      /* Anon guest pages for Boehm GC GET_MEM. Reject absurd lengths (seen
+       * 0xe3a00000 when GC_page_size was an ARM 'mov r0,#0' opcode). */
+      uint32_t a = 0;
+      if (r1 != 0 && r1 <= (MANGO_HEAP_SIZE / 2u)) {
+        a = mango_guest_alloc_pages(lib, r1);
+      }
+      cpu->r[0] = a ? a : (uint32_t)-1; /* MAP_FAILED */
+      break;
+    }
+    case MANGO_LIBC_MUNMAP:
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_MPROTECT:
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_GETPAGESIZE:
+      cpu->r[0] = 4096u;
+      break;
+    case MANGO_LIBC_PTHREAD_EQUAL:
+      /* Default stub returned 0 (not equal), so Boehm GC_lookup_thread never
+       * matched the registered main thread → "Collecting from unknown thread." */
+      cpu->r[0] = (r0 == r1) ? 1u : 0u;
+      break;
     case MANGO_LIBC_ABORT:
     default:
       cpu->r[0] = (uint32_t)-1;
@@ -1722,6 +1803,31 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  * step-limit then looked like a failing LDMIA POP at VA 0x781280. Hook 0x102c48
  * to guest malloc as well.
  */
+
+static int mango_is_ofdp_mono(const MangoLoadedLibrary* lib) {
+  const char* base;
+  if (lib == NULL || lib->path[0] == '\0') {
+    return 0;
+  }
+  base = strrchr(lib->path, '/');
+  base = base ? base + 1 : lib->path;
+  return strcmp(base, "libmono.so") == 0;
+}
+
+/* Boehm GC in OFDP libmono: GC_page_size BSS at ELF VA 0x3b7d90. Primary fix
+ * is resolving bionic __page_size to a real 4096 word (see mango_resolve_import);
+ * re-seed after ctors in case an early probe still ran before that reloc. */
+static void mango_seed_ofdp_mono_gc(MangoLoadedLibrary* lib) {
+  uint32_t addr;
+  if (!mango_is_ofdp_mono(lib)) {
+    return;
+  }
+  addr = lib->load_bias + 0x3b7d90u;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    mango_store_u32_guest(lib->guest_mem, addr, 4096u);
+  }
+}
+
 static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
   const char* base;
   if (lib == NULL || lib->path[0] == '\0') {
@@ -2008,7 +2114,9 @@ static void* mango_load_library(const char* libpath, int flag) {
     return NULL;
   }
   mango_patch_ofdp_unity(lib);
+  mango_seed_ofdp_mono_gc(lib);
   mango_run_constructors(lib);
+  mango_seed_ofdp_mono_gc(lib);
   mango_seed_ofdp_memory_manager(lib);
   mango_seed_ofdp_hash_tree(lib);
   mango_patch_ofdp_label_lookup_null(lib);
