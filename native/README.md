@@ -72,16 +72,23 @@ synthetic programs, not real app code yet.
   rejected. A32 `MOVW`/`MOVT` and `BLX Rm` (and T16 `BLX Rm`) are
   implemented so JNI vtable calls and `JNI_VERSION` returns work.
   `BX PC`, ALU to PC, and `LDR PC` are real branches (Thumb-to-ARM PLT
-  veneers).
+  veneers). A NEON subset covers `VMOV.I32`/`VMOV.I8`/`VMOV.I64`
+  immediates, integer `VADD`/`VSUB`, `VLD1`/`VST1` multiple (1–4 D
+  registers including D16–D31), `VLDM`/`VSTM` (`VPUSH`/`VPOP`),
+  `CLZ`, `LDREX`/`STREX` (always succeed: single-threaded guest),
+  `VDUP` from a GPR, extra VFP `VSUB`/`VDIV`/`VABS`/`VNEG`/`VSQRT`,
+  `BFC`/`BFI`/`UBFX`/`SBFX`, and no-op `NOP`/`PLD`/`DMB`/`DSB`/`ISB`/
+  `CLREX`. Guest JNI slots are cleared on `unloadLibrary`.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/
-  `LDRSH`/`SWP`/`LDM`/`STM` is bounds-checked (word accesses are 4-byte
-  aligned, halfword ones 2-byte aligned, byte ones aren't since any
-  address is a valid byte offset); out of range fails the run rather
-  than reading or writing past the buffer, and there are
-  tests specifically proving that (not just asserting it in a comment),
-  see `docs/SECURITY.md` for why that's the priority here.
+  `LDRSH`/`SWP`/`LDM`/`STM` is bounds-checked. Instruction fetch, `LDM`/
+  `STM`, and `SWP` stay naturally aligned; `LDR`/`STR`/`LDRH`/`STRH`/
+  `LDRD` data accesses follow ARMv7 unaligned rules (Android's default
+  SCTLR.A=0) so Unity's odd-address halfword stores work. Out of range
+  fails the run rather than reading or writing past the buffer, and
+  there are tests specifically proving that (not just asserting it in a
+  comment), see `docs/SECURITY.md` for why that's the priority here.
 - `mango_interp_run` takes a `stop_addr` now, not just `max_steps`: it
   returns 0 when PC reaches that address, checked before every fetch.
   `BX` used to unconditionally return 0 on its own, which happened to

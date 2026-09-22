@@ -230,8 +230,8 @@ static int test_load_out_of_bounds_rejected(void) {
   return 0;
 }
 
-static int test_load_misaligned_rejected(void) {
-  /* mov r1, #1 ; ldr r0, [r1] ; bx lr -- address 1 is never word-aligned. */
+static int test_load_unaligned_ok(void) {
+  /* ARMv7 (Android) allows unaligned LDR. Bytes at 1..4: 10 a0 e3 00. */
   static const uint32_t kProgram[] = {
       0xE3A01001u, /* mov r1, #1 */
       0xE5910000u, /* ldr r0, [r1] */
@@ -247,13 +247,14 @@ static int test_load_misaligned_rejected(void) {
     cpu.r[i] = 0;
   }
   cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xFFFFFFFFu;
 
   int rc = mango_interp_run(&cpu, &mem, 0xFFFFFFFFu, 100);
-  if (rc == 0) {
-    fprintf(stderr, "FAIL(load_misaligned_rejected): expected a failure, got success\n");
+  if (rc != 0 || cpu.r[0] != 0x00E3A010u) {
+    fprintf(stderr, "FAIL(load_unaligned_ok): rc=%d r0=0x%x, want 0x00e3a010\n", rc, cpu.r[0]);
     return 1;
   }
-  printf("ok: misaligned ldr correctly rejected\n");
+  printf("ok: unaligned ldr loads little-endian word\n");
   return 0;
 }
 
@@ -1513,7 +1514,7 @@ static int test_extra_ldst_writeback_and_reg_offset(void) {
   return 0;
 }
 
-static int test_ldrh_misaligned_rejected(void) {
+static int test_ldrh_unaligned_ok(void) {
   static const uint32_t kProgram[] = {
       0xE3A01041u, /* mov r1, #65 */
       0xE1D100B0u, /* ldrh r0, [r1] */
@@ -1522,6 +1523,8 @@ static int test_ldrh_misaligned_rejected(void) {
 
   uint8_t mem_buf[128];
   load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  mem_buf[65] = 0x34;
+  mem_buf[66] = 0x12;
   MangoMemory mem = {mem_buf, sizeof(mem_buf)};
 
   MangoCpu cpu;
@@ -1529,13 +1532,14 @@ static int test_ldrh_misaligned_rejected(void) {
     cpu.r[i] = 0;
   }
   cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xFFFFFFFFu;
 
   int rc = mango_interp_run(&cpu, &mem, 0xFFFFFFFFu, 100);
-  if (rc == 0) {
-    fprintf(stderr, "FAIL(ldrh_misaligned_rejected): expected a failure, got success\n");
+  if (rc != 0 || cpu.r[0] != 0x1234u) {
+    fprintf(stderr, "FAIL(ldrh_unaligned_ok): rc=%d r0=0x%x, want 0x1234\n", rc, cpu.r[0]);
     return 1;
   }
-  printf("ok: misaligned ldrh correctly rejected\n");
+  printf("ok: unaligned ldrh loads little-endian halfword\n");
   return 0;
 }
 
@@ -2207,6 +2211,221 @@ static int test_vldr_s_from_stack(void) {
   return 0;
 }
 
+static int test_vmov_i32_and_clz(void) {
+  static const uint32_t kProgram[] = {
+      0xF2C00050u, /* vmov.i32 q8, #0 */
+      0xE3A01008u, /* mov r1, #8 */
+      0xE16F0F11u, /* clz r0, r1 */
+      0xE320F000u, /* nop */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 5);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[32] = cpu.s[33] = cpu.s[34] = cpu.s[35] = 0xA5A5A5A5u;
+  cpu.r[MANGO_REG_LR] = 0x2222u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x2222u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(vmov_i32_and_clz): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.s[32] != 0 || cpu.s[33] != 0 || cpu.s[34] != 0 || cpu.s[35] != 0) {
+    fprintf(stderr, "FAIL(vmov_i32_and_clz): q8 not zeroed\n");
+    return 1;
+  }
+  if (cpu.r[0] != 28u) {
+    fprintf(stderr, "FAIL(vmov_i32_and_clz): clz(8) r0=%u want 28\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: VMOV.I32 q8,#0 and CLZ (r0=%u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_vld1_vst1(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A01040u, /* mov r1, #64 */
+      0xE3A02050u, /* mov r2, #80 */
+      0xF4210ACFu, /* vld1.64 {d0, d1}, [r1] */
+      0xF4020ACFu, /* vst1.64 {d0, d1}, [r2] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 5);
+  for (int i = 0; i < 16; i++) {
+    mem_buf[64 + i] = (uint8_t)(0xA0 + i);
+  }
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x3333u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x3333u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(vld1_vst1): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (memcmp(mem_buf + 80, mem_buf + 64, 16) != 0) {
+    fprintf(stderr, "FAIL(vld1_vst1): 16-byte copy mismatch\n");
+    return 1;
+  }
+  printf("ok: VLD1/VST1.64 {d0,d1} 16-byte copy\n");
+  return 0;
+}
+
+static int test_ldrex_strex(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A01040u, /* mov r1, #64 */
+      0xE1910F9Fu, /* ldrex r0, [r1] */
+      0xE2800001u, /* add r0, r0, #1 */
+      0xE1812F90u, /* strex r2, r0, [r1] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 5);
+  mem_buf[64] = 41;
+  mem_buf[65] = 0;
+  mem_buf[66] = 0;
+  mem_buf[67] = 0;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x4444u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x4444u, 100);
+  if (rc != 0 || cpu.r[0] != 42u || cpu.r[2] != 0 || mem_buf[64] != 42) {
+    fprintf(stderr, "FAIL(ldrex_strex): rc=%d r0=%u r2=%u mem=%u\n", rc, cpu.r[0], cpu.r[2],
+            mem_buf[64]);
+    return 1;
+  }
+  printf("ok: LDREX/STREX increment (r0=42, strex status=0)\n");
+  return 0;
+}
+
+static int test_vdup_q9(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A020AAu, /* mov r2, #170 */
+      0xEEA22B90u, /* vdup.32 q9, r2 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x5555u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x5555u, 100);
+  if (rc != 0 || cpu.s[36] != 0xAAu || cpu.s[37] != 0xAAu || cpu.s[38] != 0xAAu ||
+      cpu.s[39] != 0xAAu) {
+    fprintf(stderr, "FAIL(vdup_q9): rc=%d s36-39=%x %x %x %x\n", rc, cpu.s[36], cpu.s[37],
+            cpu.s[38], cpu.s[39]);
+    return 1;
+  }
+  printf("ok: VDUP.32 q9, r2 replicates 0xaa\n");
+  return 0;
+}
+
+static int test_vaddi_i32(void) {
+  static const uint32_t kProgram[] = {
+      0xF2C00052u, /* vmov.i32 q8, #2 */
+      0xF2C02051u, /* vmov.i32 q9, #1 */
+      0xF26208E0u, /* vadd.i32 q8, q9, q8 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 4);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x6666u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x6666u, 100);
+  if (rc != 0 || cpu.s[32] != 3u || cpu.s[33] != 3u || cpu.s[34] != 3u || cpu.s[35] != 3u) {
+    fprintf(stderr, "FAIL(vaddi_i32): rc=%d s32-35=%x %x %x %x\n", rc, cpu.s[32], cpu.s[33],
+            cpu.s[34], cpu.s[35]);
+    return 1;
+  }
+  printf("ok: VADD.I32 q8, q9, q8 (lanes=3)\n");
+  return 0;
+}
+
+static int test_vpush_vpop(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A0D050u, /* mov sp, #80 */
+      0xED2D8B02u, /* vpush {d8} */
+      0xECBD8B02u, /* vpop {d8} */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 4);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[16] = 0x11111111u;
+  cpu.s[17] = 0x22222222u;
+  cpu.r[MANGO_REG_LR] = 0x7777u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x7777u, 100);
+  if (rc != 0 || cpu.r[MANGO_REG_SP] != 80u || cpu.s[16] != 0x11111111u ||
+      cpu.s[17] != 0x22222222u) {
+    fprintf(stderr, "FAIL(vpush_vpop): rc=%d sp=%u s16=%x s17=%x\n", rc, cpu.r[MANGO_REG_SP],
+            cpu.s[16], cpu.s[17]);
+    return 1;
+  }
+  printf("ok: VPUSH/VPOP {d8} roundtrip\n");
+  return 0;
+}
+
+static int test_bfc_ubfx(void) {
+  static const uint32_t kBfc[] = {
+      0xE3E00000u, /* mvn r0, #0 */
+      0xE7C1001Fu, /* bfc r0, #0, #2 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kBfc, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x8888u;
+  int rc = mango_interp_run(&cpu, &mem, 0x8888u, 100);
+  if (rc != 0 || cpu.r[0] != 0xFFFFFFFCu) {
+    fprintf(stderr, "FAIL(bfc): rc=%d r0=0x%x\n", rc, cpu.r[0]);
+    return 1;
+  }
+
+  static const uint32_t kUbfx[] = {
+      0xE3A010FCu, /* mov r1, #252 */
+      0xE7E40151u, /* ubfx r0, r1, #2, #5 */
+      0xE12FFF1Eu,
+  };
+  load_words(mem_buf, sizeof(mem_buf), kUbfx, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x8888u;
+  rc = mango_interp_run(&cpu, &mem, 0x8888u, 100);
+  if (rc != 0 || cpu.r[0] != 31u) {
+    fprintf(stderr, "FAIL(ubfx): rc=%d r0=%u\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: BFC r0,#0,#2 and UBFX r0,r1,#2,#5\n");
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2214,7 +2433,7 @@ int main(void) {
   failures += test_load_store_roundtrip();
   failures += test_pc_relative_add();
   failures += test_load_out_of_bounds_rejected();
-  failures += test_load_misaligned_rejected();
+  failures += test_load_unaligned_ok();
   failures += test_load_store_byte_roundtrip();
   failures += test_conditional_branch_taken();
   failures += test_signed_vs_unsigned_condition_flags();
@@ -2243,7 +2462,7 @@ int main(void) {
   failures += test_ldrh_strh_roundtrip();
   failures += test_ldrsb_ldrsh_sign_extend();
   failures += test_extra_ldst_writeback_and_reg_offset();
-  failures += test_ldrh_misaligned_rejected();
+  failures += test_ldrh_unaligned_ok();
   failures += test_extra_ldst_rejected_shapes();
   failures += test_swp_and_swpb();
   failures += test_ldrd_strd_roundtrip();
@@ -2263,6 +2482,13 @@ int main(void) {
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
   failures += test_vldr_s_from_stack();
+  failures += test_vmov_i32_and_clz();
+  failures += test_vld1_vst1();
+  failures += test_ldrex_strex();
+  failures += test_vdup_q9();
+  failures += test_vaddi_i32();
+  failures += test_vpush_vpop();
+  failures += test_bfc_ubfx();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

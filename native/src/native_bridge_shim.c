@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "mango/cpu.h"
+#include "mango/decoder.h"
 #include "mango/elf32.h"
 #include "mango/interp.h"
 #include "mango/native_bridge.h"
@@ -266,6 +267,18 @@ static uint32_t g_fake_off;
 
 static void* mango_load_library(const char* libpath, int flag);
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env);
+
+static int mango_alloc_slot(void) {
+  for (int i = 0; i < g_nslots; i++) {
+    if (g_slots[i].lib == NULL) {
+      return i;
+    }
+  }
+  if (g_nslots >= MANGO_JNI_SLOTS) {
+    return -1;
+  }
+  return g_nslots++;
+}
 
 static uint32_t mango_handle_intern(void* p) {
   if (p == NULL) {
@@ -1048,17 +1061,19 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
         uint32_t fn_a = mango_load_u32_guest(lib->guest_mem, methods + i * 12u + 8u);
         const char* nm = mango_guest_cstr(lib, name_a);
         const char* sg = mango_guest_cstr(lib, sig_a);
-        if (g_nslots < MANGO_JNI_SLOTS && fn_a != 0) {
-          int si = g_nslots++;
-          g_slots[si].lib = lib;
-          g_slots[si].guest_pc = fn_a;
-          memset(g_slots[si].shorty, 0, sizeof(g_slots[si].shorty));
-          memset(g_slots[si].name, 0, sizeof(g_slots[si].name));
-          if (nm) {
-            strncpy(g_slots[si].name, nm, sizeof(g_slots[si].name) - 1u);
-          }
-          if (sg) {
-            strncpy(g_slots[si].shorty, sg, sizeof(g_slots[si].shorty) - 1u);
+        if (fn_a != 0) {
+          int si = mango_alloc_slot();
+          if (si >= 0) {
+            g_slots[si].lib = lib;
+            g_slots[si].guest_pc = fn_a;
+            memset(g_slots[si].shorty, 0, sizeof(g_slots[si].shorty));
+            memset(g_slots[si].name, 0, sizeof(g_slots[si].name));
+            if (nm) {
+              strncpy(g_slots[si].name, nm, sizeof(g_slots[si].name) - 1u);
+            }
+            if (sg) {
+              strncpy(g_slots[si].shorty, sg, sizeof(g_slots[si].shorty) - 1u);
+            }
           }
         }
       }
@@ -1164,8 +1179,14 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
       if (pc + 4u <= mem.size) {
         w = mango_load_u32_guest(mem.bytes, pc);
       }
-      fprintf(stderr, "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d\n", pc, cpu->cpsr, w,
-              rc);
+      MangoInsn ins;
+      int dec = (cpu->cpsr & MANGO_CPSR_T) ? -2 : mango_decode(w, &ins);
+      fprintf(stderr,
+              "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d decode=%d op=%d "
+              "r0=%x r1=%x r2=%x r3=%x r4=%x r5=%x r6=%x r7=%x sp=%x lr=%x\n",
+              pc, cpu->cpsr, w, rc, dec, dec == 0 ? (int)ins.op : -1, cpu->r[0], cpu->r[1],
+              cpu->r[2], cpu->r[3], cpu->r[4], cpu->r[5], cpu->r[6], cpu->r[7],
+              cpu->r[MANGO_REG_SP], cpu->r[MANGO_REG_LR]);
       return -1;
     }
     uint32_t nr = cpu->r[7];
@@ -1195,7 +1216,10 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
 }
 
 static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
-  MangoLoadedLibrary* lib = slot->lib;
+  MangoLoadedLibrary* lib = slot ? slot->lib : NULL;
+  if (!lib) {
+    return 0;
+  }
   char ret = 'V';
   char args[24];
   int nargs = mango_parse_shorty(slot->shorty, &ret, args, sizeof(args));
@@ -1515,7 +1539,7 @@ static void* mango_get_trampoline(void* handle, const char* name, const char* sh
     }
   }
   for (int i = 0; i < g_nslots; i++) {
-    if (strcmp(g_slots[i].name, name) == 0) {
+    if (g_slots[i].lib != NULL && g_slots[i].lib != lib && strcmp(g_slots[i].name, name) == 0) {
       return g_slot_fns[i];
     }
   }
@@ -1524,10 +1548,10 @@ static void* mango_get_trampoline(void* handle, const char* name, const char* sh
     return NULL;
   }
   addr += lib->load_bias;
-  if (g_nslots >= MANGO_JNI_SLOTS) {
+  int i = mango_alloc_slot();
+  if (i < 0) {
     return NULL;
   }
-  int i = g_nslots++;
   g_slots[i].lib = lib;
   g_slots[i].guest_pc = addr;
   memset(g_slots[i].shorty, 0, sizeof(g_slots[i].shorty));
@@ -1579,6 +1603,11 @@ static int mango_unload_library(void* handle) {
   }
   for (int i = 0; i < g_nlibs; i++) {
     if (g_libs[i] == lib) {
+      for (int s = 0; s < g_nslots; s++) {
+        if (g_slots[s].lib == lib) {
+          memset(&g_slots[s], 0, sizeof(g_slots[s]));
+        }
+      }
       free(lib->file_data);
       free(lib);
       for (int j = i; j + 1 < g_nlibs; j++) {
@@ -1588,6 +1617,7 @@ static int mango_unload_library(void* handle) {
       if (g_nlibs == 0) {
         g_as_next = 0;
         g_as_jni_ready = 0;
+        g_nslots = 0;
       }
       return 0;
     }

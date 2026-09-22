@@ -16,12 +16,160 @@ static void mango_insn_clear(MangoInsn* out) {
   out->op = MANGO_OP_UNKNOWN;
 }
 
+/* NEON VMOV.I* imm8 → 64-bit D-lane pattern (repeated across Q). */
+static int mango_neon_expand_imm(uint32_t cmode, uint32_t op, uint32_t imm8, uint64_t* out) {
+  if (op != 0) {
+    return -1;
+  }
+  if (cmode <= 0x3u) {
+    uint32_t w = imm8 << ((cmode & 3u) * 8u);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+    return 0;
+  }
+  if (cmode == 0x8u) {
+    uint64_t p = 0;
+    for (uint32_t i = 0; i < 8u; i++) {
+      p |= (uint64_t)imm8 << (8u * i);
+    }
+    *out = p;
+    return 0;
+  }
+  if (cmode == 0xEu) {
+    uint64_t p = 0;
+    for (uint32_t i = 0; i < 8u; i++) {
+      if (imm8 & (1u << i)) {
+        p |= 0xFFull << (8u * i);
+      }
+    }
+    *out = p;
+    return 0;
+  }
+  return -1;
+}
+
 int mango_decode(uint32_t word, MangoInsn* out) {
   mango_insn_clear(out);
   out->cond = (word >> 28) & 0xF;
 
   if (out->cond == 0xF) {
-    return -1; /* 0xF is ARMv5+'s unconditional-extension selector, not a real cond */
+    /* Advanced SIMD data-processing: 1111 001x */
+    if (((word >> 25) & 0x7) == 0x1) {
+      /* VMOV immediate: 1111 001 i 1 D 000 imm3 Vd cmode 0 Q op 1 imm4 */
+      /* Three registers of the same type: bit23=0, bit4=0. VADD/VSUB integer. */
+      if (((word >> 23) & 1u) == 0 && ((word >> 4) & 1u) == 0) {
+        uint32_t u = (word >> 24) & 1u;
+        uint32_t size = (word >> 20) & 3u;
+        uint32_t opc = (word >> 8) & 0xFu;
+        uint32_t q = (word >> 6) & 1u;
+        uint32_t d = (((word >> 22) & 1u) << 4) | ((word >> 12) & 0xFu);
+        uint32_t n = (((word >> 7) & 1u) << 4) | ((word >> 16) & 0xFu);
+        uint32_t m = (((word >> 5) & 1u) << 4) | (word & 0xFu);
+        if (q && ((d | n | m) & 1u)) {
+          return -1;
+        }
+        if (opc == 0x8u && size != 3u) {
+          out->op = u ? MANGO_OP_VSUBI : MANGO_OP_VADDI;
+          out->cond = 0xE;
+          out->rd = d;
+          out->rn = n;
+          out->rm = m;
+          out->b = (int)q;
+          out->imm = 1u << size;
+          return 0;
+        }
+        return -1;
+      }
+      if (((word >> 23) & 1u) == 1 && ((word >> 19) & 7u) == 0 && ((word >> 7) & 1u) == 0 &&
+          ((word >> 4) & 1u) == 1) {
+        uint32_t imm8 =
+            (((word >> 24) & 1u) << 7) | (((word >> 16) & 7u) << 4) | (word & 0xFu);
+        uint32_t cmode = (word >> 8) & 0xFu;
+        uint32_t opbit = (word >> 5) & 1u;
+        uint32_t q = (word >> 6) & 1u;
+        uint32_t d = (((word >> 22) & 1u) << 4) | ((word >> 12) & 0xFu);
+        uint64_t pat;
+        if (q && (d & 1u)) {
+          return -1;
+        }
+        if (mango_neon_expand_imm(cmode, opbit, imm8, &pat) != 0) {
+          return -1;
+        }
+        out->op = MANGO_OP_VMOV;
+        out->cond = 0xE;
+        out->u = 3;
+        out->rd = d;
+        out->b = (int)q;
+        out->imm = (uint32_t)pat;
+        out->rs = (uint32_t)(pat >> 32);
+        return 0;
+      }
+      return -1;
+    }
+    /* Advanced SIMD element/structure load/store: 1111 010x */
+    if (((word >> 25) & 0x7) == 0x2) {
+      /* VLD1/VST1 multiple: 1111 0100 0 D L 0 Rn Vd type size align Rm */
+      if (((word >> 23) & 1u) == 0 && ((word >> 20) & 1u) == 0) {
+        uint32_t l = (word >> 21) & 1u;
+        uint32_t type = (word >> 8) & 0xFu;
+        uint32_t nd;
+        uint32_t d;
+        switch (type) {
+          case 0x7:
+            nd = 1;
+            break;
+          case 0xA:
+            nd = 2;
+            break;
+          case 0x6:
+            nd = 3;
+            break;
+          case 0x2:
+            nd = 4;
+            break;
+          default:
+            return -1;
+        }
+        d = (((word >> 22) & 1u) << 4) | ((word >> 12) & 0xFu);
+        if (d + nd > 32u) {
+          return -1;
+        }
+        out->op = l ? MANGO_OP_VLD1 : MANGO_OP_VST1;
+        out->cond = 0xE;
+        out->rd = d;
+        out->rn = (word >> 16) & 0xFu;
+        out->rm = word & 0xFu;
+        out->imm = nd;
+        return 0;
+      }
+    }
+    /* PLD/PLDW/PLI */
+    if (((word >> 24) & 0xFEu) == 0xF4u && ((word >> 12) & 0xFu) == 0xFu) {
+      out->op = MANGO_OP_NOP;
+      out->cond = 0xE;
+      return 0;
+    }
+    /* DMB/DSB/ISB/CLREX */
+    if ((word & 0xFFFFFFF0u) == 0xF57FF050u || (word & 0xFFFFFFF0u) == 0xF57FF040u ||
+        (word & 0xFFFFFFF0u) == 0xF57FF060u || word == 0xF57FF01Fu) {
+      out->op = MANGO_OP_NOP;
+      out->cond = 0xE;
+      return 0;
+    }
+    /* BLX imm: 1111 101 H imm24 */
+    if (((word >> 25) & 0x7) == 0x5) {
+      uint32_t h = (word >> 24) & 1u;
+      uint32_t imm24 = word & 0xFFFFFFu;
+      uint32_t offset = (imm24 << 2) | (h << 1);
+      if (imm24 & 0x800000u) {
+        offset |= 0xFC000000u;
+      }
+      out->op = MANGO_OP_BLX;
+      out->cond = 0xE;
+      out->is_imm = 1;
+      out->imm = offset;
+      return 0;
+    }
+    return -1;
   }
 
   /* SVC/SWI: bits 27-24 = 1111, the rest is a legacy immediate EABI code
@@ -58,7 +206,21 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       return 0;
     }
     if (!p || w) {
-      return -1; /* unindexed / writeback forms */
+      /* VLDM/VSTM / VPUSH/VPOP: IA (P=0 U=1) or DB (P=1 U=0). */
+      uint32_t first = dbl ? ((dbit << 4) | vd) : ((vd << 1) | dbit);
+      uint32_t nregs = dbl ? (imm8 / 2u) : imm8;
+      if (nregs == 0 || (dbl && (imm8 & 1u)) || first + nregs > 32u) {
+        return -1;
+      }
+      out->op = l ? MANGO_OP_VLDM : MANGO_OP_VSTM;
+      out->rn = rn;
+      out->rd = first;
+      out->b = dbl;
+      out->imm = nregs;
+      out->u = (int)u;
+      out->p = (int)p;
+      out->w = (int)w;
+      return 0;
     }
     out->op = l ? MANGO_OP_VLDR : MANGO_OP_VSTR;
     out->rn = rn;
@@ -89,18 +251,55 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     out->rd = fd;
     out->rn = fn;
     out->rm = fm;
+    /* VDUP.<size> Qd/Dd, Rt: bit4=1, coproc 1011, bit23=1, bit20=0. */
+    if (dbl && ((word >> 4) & 1u) && ((word >> 23) & 1u) && ((word >> 20) & 1u) == 0) {
+      uint32_t q = (word >> 21) & 1u;
+      uint32_t d = (nbit << 4) | vn; /* D is bit 7, Vd is bits 19-16 */
+      uint32_t bbit = (word >> 22) & 1u;
+      uint32_t ebit = (word >> 5) & 1u;
+      uint32_t esize = bbit ? 1u : (ebit ? 2u : 4u);
+      if (q && (d & 1u)) {
+        return -1;
+      }
+      out->op = MANGO_OP_VDUP;
+      out->rd = d;
+      out->rn = vd; /* Rt lives in the CRd/Vd field (bits 15-12) */
+      out->b = (int)q;
+      out->imm = esize;
+      return 0;
+    }
     if (dbl && ((word >> 16) & 0xFFu) == 0xF8u && ((word >> 4) & 0xDu) == 0xCu) {
       out->op = MANGO_OP_VCVT; /* vcvt.f64.s32 Dd, Sm */
       out->rd = (dbit << 4) | vd;
       out->rn = (vm << 1) | mbit;
       return 0;
     }
-    if (dbl && (word & 0x0EB00B00u) == 0x0E300B00u) {
+    if (dbl && (word & 0x0FB00F50u) == 0x0E300B00u) {
       out->op = MANGO_OP_VADD;
       return 0;
     }
-    if (dbl && (word & 0x0EB00B00u) == 0x0E200B00u) {
+    if (dbl && (word & 0x0FB00F50u) == 0x0E300B40u) {
+      out->op = MANGO_OP_VSUB;
+      return 0;
+    }
+    if (dbl && (word & 0x0FB00F50u) == 0x0E200B00u) {
       out->op = MANGO_OP_VMUL;
+      return 0;
+    }
+    if (dbl && (word & 0x0FB00F50u) == 0x0E800B00u) {
+      out->op = MANGO_OP_VDIV;
+      return 0;
+    }
+    if (dbl && (word & 0x0FBF0FD0u) == 0x0EB00BC0u) {
+      out->op = MANGO_OP_VABS;
+      return 0;
+    }
+    if (dbl && (word & 0x0FBF0FD0u) == 0x0EB10B40u) {
+      out->op = MANGO_OP_VNEG;
+      return 0;
+    }
+    if (dbl && (word & 0x0FBF0FD0u) == 0x0EB10BC0u) {
+      out->op = MANGO_OP_VSQRT;
       return 0;
     }
     if (dbl && ((word >> 16) & 0xFFu) == 0xF5u && ((word >> 4) & 0xFu) == 0xCu) {
@@ -127,6 +326,48 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
+  /* Hint NOP/YIELD/WFE/WFI/SEV: cond 0011 0010 0000 1111 0000 xxxx */
+  if ((word & 0x0FFFFFF0u) == 0x0320F000u) {
+    out->op = MANGO_OP_NOP;
+    return 0;
+  }
+
+  /* LDREX/STREX family: bits 27-24=0001, bits 11-4=11111001. Single-threaded
+   * guest: load/store with STREX always reporting success. */
+  if (((word >> 24) & 0xF) == 0x1 && ((word >> 4) & 0xFFu) == 0xF9u) {
+    uint32_t opc = (word >> 20) & 0xFu;
+    uint32_t rn = (word >> 16) & 0xF;
+    uint32_t rd = (word >> 12) & 0xF;
+    uint32_t rt = word & 0xF;
+    int load = opc & 1u;
+    uint32_t size = (opc >> 1) & 3u; /* 0=word, 1=dword, 2=byte, 3=half */
+    if (rn == MANGO_REG_PC || rd == MANGO_REG_PC || (!load && rt == MANGO_REG_PC)) {
+      return -1;
+    }
+    if (size == 1u && (rd & 1u)) {
+      return -1; /* LDREXD/STREXD pair must be even */
+    }
+    out->op = load ? MANGO_OP_LDREX : MANGO_OP_STREX;
+    out->rn = rn;
+    out->rd = rd;
+    out->rm = load ? 0 : rt;
+    out->b = (int)size;
+    return 0;
+  }
+
+  /* CLZ Rd, Rm: cond 0001 0110 1111 Rd 1111 0001 Rm */
+  if (((word >> 16) & 0xFFFu) == 0x16Fu && ((word >> 4) & 0xFFu) == 0xF1u) {
+    uint32_t rd = (word >> 12) & 0xF;
+    uint32_t rm = word & 0xF;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_CLZ;
+    out->rd = rd;
+    out->rm = rm;
+    return 0;
+  }
+
   /* BLX Rm: cond 0001 0010 1111 1111 1111 0011 Rm. JNI vtable calls. */
   if (((word >> 20) & 0xFF) == 0x12 && ((word >> 4) & 0xFFFF) == 0xFFF3) {
     uint32_t rm = word & 0xF;
@@ -137,6 +378,41 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     out->rm = rm;
     out->is_imm = 0;
     return 0;
+  }
+
+  /* Bitfield BFC/BFI/SBFX/UBFX: bits 27-24=0111, bit4=1. */
+  if (((word >> 24) & 0xF) == 0x7 && ((word >> 4) & 1u) == 1) {
+    uint32_t opc = (word >> 21) & 7u;
+    uint32_t rd = (word >> 12) & 0xF;
+    uint32_t lsb = (word >> 7) & 0x1Fu;
+    uint32_t msb = (word >> 16) & 0x1Fu;
+    uint32_t rn = word & 0xF;
+    uint32_t op2 = (word >> 4) & 7u;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    if (op2 == 1u && opc == 6u) {
+      if (msb < lsb) {
+        return -1;
+      }
+      out->op = (rn == 0xFu) ? MANGO_OP_BFC : MANGO_OP_BFI;
+      out->rd = rd;
+      out->rm = rn;
+      out->imm = lsb;
+      out->rs = msb;
+      return 0;
+    }
+    if (op2 == 5u && (opc == 5u || opc == 7u)) {
+      if ((uint32_t)lsb + msb > 31u) {
+        return -1;
+      }
+      out->op = (opc == 7u) ? MANGO_OP_UBFX : MANGO_OP_SBFX;
+      out->rd = rd;
+      out->rn = rn;
+      out->imm = lsb;
+      out->rs = msb; /* width-1 */
+      return 0;
+    }
   }
 
   /* MOVW: cond 0011 0000 imm4 Rd imm12. Overlaps S=0 TST, which we reject. */

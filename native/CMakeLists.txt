@@ -17,7 +17,7 @@ set_target_properties(mango_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 enable_testing()
 add_executable(mango_core_tests tests/test_interp.c)
-target_link_libraries(mango_core_tests PRIVATE mango_core)
+target_link_libraries(mango_core_tests PRIVATE mango_core m)
 add_test(NAME interp_smoke_test COMMAND mango_core_tests)
 
 add_executable(mango_elf32_tests tests/test_elf32.c)

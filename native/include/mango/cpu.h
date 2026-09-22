@@ -7,7 +7,7 @@
 typedef struct MangoCpu {
   uint32_t r[16];
   uint32_t cpsr; /* NZCV in bits 31-28 */
-  uint32_t s[32]; /* VFP S0-S31; D0 is s[0]|s[1]<<32 little-endian pairs */
+  uint32_t s[64]; /* S0-S31 and D16-D31 (NEON Q0-Q15); D n is s[2n]|s[2n+1]<<32 */
   uint32_t fpscr;
 } MangoCpu;
 
