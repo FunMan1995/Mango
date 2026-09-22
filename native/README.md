@@ -79,8 +79,10 @@ synthetic programs, not real app code yet.
   `VDUP` from a GPR, extra VFP `VSUB`/`VDIV`/`VABS`/`VNEG`/`VSQRT`,
   `BFC`/`BFI`/`UBFX`/`SBFX`, `RBIT`/`REV`/`REV16`/`REVSH`,
   `UXTB`/`UXTH`/`SXTB`/`SXTH` (and `*TA*` accumulate), `PKHBT`/`PKHTB`,
-  and no-op `NOP`/`PLD`/`DMB`/`DSB`/`ISB`/`CLREX`. Guest JNI slots are
-  cleared on `unloadLibrary`.
+  `VMOV` between an S register and a GPR, VFP single `VADD`/`VSUB`/`VMUL`/
+  `VDIV`/`VCMP`, `VCVT.F32.F64`, dummy JNI `Call*Method`/`Get*Field`
+  returning interned objects, and EGL init/create/query thunks. Guest JNI
+  slots are cleared on `unloadLibrary`.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/

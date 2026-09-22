@@ -2478,6 +2478,115 @@ static int test_rbit_uxt_rev(void) {
   return 0;
 }
 
+static int test_vmov_s_gpr(void) {
+  static const uint32_t kProgram[] = {
+      0xE3001000u, /* movw r1, #0 */
+      0xE3431F80u, /* movt r1, #0x3f80 */
+      0xEE001A10u, /* vmov s0, r1 */
+      0xEE100A10u, /* vmov r0, s0 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 5);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0xAAAAu;
+  int rc = mango_interp_run(&cpu, &mem, 0xAAAAu, 100);
+  if (rc != 0 || cpu.r[0] != 0x3F800000u || cpu.s[0] != 0x3F800000u) {
+    fprintf(stderr, "FAIL(vmov_s_gpr): rc=%d r0=0x%x s0=0x%x\n", rc, cpu.r[0], cpu.s[0]);
+    return 1;
+  }
+  printf("ok: VMOV s0, r1 / r0, s0 (1.0f)\n");
+  return 0;
+}
+
+static int test_vcvt_f32_f64(void) {
+  static const uint32_t kProgram[] = {
+      0xEEB70BC0u, /* vcvt.f32.f64 s0, d0 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[0] = 0x00000000u;
+  cpu.s[1] = 0x3FF00000u; /* d0 = 1.0 */
+  cpu.r[MANGO_REG_LR] = 0xBBBBu;
+  int rc = mango_interp_run(&cpu, &mem, 0xBBBBu, 100);
+  if (rc != 0 || cpu.s[0] != 0x3F800000u) {
+    fprintf(stderr, "FAIL(vcvt_f32_f64): rc=%d s0=0x%x\n", rc, cpu.s[0]);
+    return 1;
+  }
+  printf("ok: VCVT.F32.F64 s0, d0 (1.0)\n");
+  return 0;
+}
+
+static int test_vcmpe_f32_zero(void) {
+  static const uint32_t kProgram[] = {
+      0xEEB50AC0u, /* vcmpe.f32 s0, #0 */
+      0xEEF1FA10u, /* vmrs apsr_nzcv, fpscr */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0xCCCCu;
+  int rc = mango_interp_run(&cpu, &mem, 0xCCCCu, 100);
+  if (rc != 0 || (cpu.cpsr & (MANGO_CPSR_Z | MANGO_CPSR_C)) != (MANGO_CPSR_Z | MANGO_CPSR_C)) {
+    fprintf(stderr, "FAIL(vcmpe_f32_zero): rc=%d cpsr=0x%x\n", rc, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: VCMPE.F32 s0, #0 (Z+C)\n");
+  return 0;
+}
+
+static int test_vadd_f32(void) {
+  static const uint32_t kProgram[] = {
+      0xEE300A20u, /* vadd.f32 s0, s0, s1 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[0] = 0x3F800000u;
+  cpu.s[1] = 0x3F800000u;
+  cpu.r[MANGO_REG_LR] = 0xDDDDu;
+  int rc = mango_interp_run(&cpu, &mem, 0xDDDDu, 100);
+  if (rc != 0 || cpu.s[0] != 0x40000000u) {
+    fprintf(stderr, "FAIL(vadd_f32): rc=%d s0=0x%x\n", rc, cpu.s[0]);
+    return 1;
+  }
+  printf("ok: VADD.F32 s0, s0, s1 (2.0f)\n");
+  return 0;
+}
+
+static int test_vcvt_s32_f32(void) {
+  static const uint32_t kProgram[] = {
+      0xEEBD0AC0u, /* vcvt.s32.f32 s0, s0 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[0] = 0x40000000u; /* 2.0f */
+  cpu.r[MANGO_REG_LR] = 0xEEEEu;
+  int rc = mango_interp_run(&cpu, &mem, 0xEEEEu, 100);
+  if (rc != 0 || cpu.s[0] != 2u) {
+    fprintf(stderr, "FAIL(vcvt_s32_f32): rc=%d s0=%u\n", rc, cpu.s[0]);
+    return 1;
+  }
+  printf("ok: VCVT.S32.F32 s0, s0 (2.0f -> 2)\n");
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2542,6 +2651,11 @@ int main(void) {
   failures += test_vpush_vpop();
   failures += test_bfc_ubfx();
   failures += test_rbit_uxt_rev();
+  failures += test_vmov_s_gpr();
+  failures += test_vcvt_f32_f64();
+  failures += test_vcmpe_f32_zero();
+  failures += test_vadd_f32();
+  failures += test_vcvt_s32_f32();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

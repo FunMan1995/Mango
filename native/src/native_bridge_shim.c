@@ -44,17 +44,25 @@
 #define MANGO_JNI_IS_SAME_OBJECT 24
 #define MANGO_JNI_GET_OBJECT_CLASS 31
 #define MANGO_JNI_GET_METHOD_ID 33
+#define MANGO_JNI_NEW_OBJECT 28
 #define MANGO_JNI_CALL_OBJECT_METHOD 34
 #define MANGO_JNI_CALL_BOOLEAN_METHOD 37
 #define MANGO_JNI_CALL_INT_METHOD 49
 #define MANGO_JNI_CALL_VOID_METHOD 61
 #define MANGO_JNI_GET_FIELD_ID 94
 #define MANGO_JNI_GET_OBJECT_FIELD 95
+#define MANGO_JNI_GET_BOOLEAN_FIELD 96
 #define MANGO_JNI_GET_INT_FIELD 100
 #define MANGO_JNI_SET_OBJECT_FIELD 104
 #define MANGO_JNI_SET_INT_FIELD 109
 #define MANGO_JNI_GET_STATIC_METHOD_ID 113
+#define MANGO_JNI_CALL_STATIC_OBJECT_METHOD 114
+#define MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD 117
+#define MANGO_JNI_CALL_STATIC_INT_METHOD 129
+#define MANGO_JNI_CALL_STATIC_VOID_METHOD 141
 #define MANGO_JNI_GET_STATIC_FIELD_ID 144
+#define MANGO_JNI_GET_STATIC_OBJECT_FIELD 145
+#define MANGO_JNI_GET_STATIC_INT_FIELD 150
 #define MANGO_JNI_NEW_STRING_UTF 167
 #define MANGO_JNI_GET_STRING_UTF_LENGTH 168
 #define MANGO_JNI_GET_STRING_UTF_CHARS 169
@@ -126,7 +134,13 @@
 #define MANGO_LIBC_OPEN 54
 #define MANGO_LIBC_READ 55
 #define MANGO_LIBC_CLOSE 56
-#define MANGO_LIBC_COUNT 57
+#define MANGO_LIBC_EGL_INIT 57
+#define MANGO_LIBC_EGL_CHOOSE 58
+#define MANGO_LIBC_EGL_SURFACE 59
+#define MANGO_LIBC_EGL_CONTEXT 60
+#define MANGO_LIBC_EGL_QUERY 61
+#define MANGO_LIBC_ANW_FROM 62
+#define MANGO_LIBC_COUNT 63
 
 #define MANGO_AS_SIZE 0x2800000u
 #define MANGO_LIB_CAP 0x2000000u
@@ -241,6 +255,12 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "open",
     "read",
     "close",
+    "eglInitialize",
+    "eglChooseConfig",
+    "eglCreateWindowSurface",
+    "eglCreateContext",
+    "eglQueryString",
+    "ANativeWindow_fromSurface",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -296,6 +316,9 @@ static uint32_t mango_handle_intern(void* p) {
   g_handles[id] = p;
   return id;
 }
+
+static char g_dummy_java;
+static uint32_t mango_dummy_jobject(void) { return mango_handle_intern(&g_dummy_java); }
 
 static void* mango_handle_lookup(uint32_t id) {
   if (id == 0 || id >= g_nhandles) {
@@ -400,6 +423,19 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
     name = "eglGetError";
   } else if (strcmp(name, "eglGetProcAddress") == 0) {
     name = "eglGetProcAddress";
+  } else if (strcmp(name, "eglInitialize") == 0) {
+    name = "eglInitialize";
+  } else if (strcmp(name, "eglChooseConfig") == 0 || strcmp(name, "eglGetConfigs") == 0) {
+    name = "eglChooseConfig";
+  } else if (strcmp(name, "eglCreateWindowSurface") == 0 ||
+             strcmp(name, "eglCreatePbufferSurface") == 0) {
+    name = "eglCreateWindowSurface";
+  } else if (strcmp(name, "eglCreateContext") == 0) {
+    name = "eglCreateContext";
+  } else if (strcmp(name, "eglQueryString") == 0) {
+    name = "eglQueryString";
+  } else if (strcmp(name, "ANativeWindow_fromSurface") == 0) {
+    name = "ANativeWindow_fromSurface";
   } else if (strcmp(name, "ANativeWindow_getWidth") == 0) {
     name = "ANativeWindow_getWidth";
   } else if (strcmp(name, "ANativeWindow_getHeight") == 0) {
@@ -868,6 +904,50 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_EGL_PROC:
       cpu->r[0] = lib->stub_addr;
       break;
+    case MANGO_LIBC_EGL_INIT:
+      if (r1 && mango_guest_range_ok(lib, r1, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r1, 1u);
+      }
+      if (r2 && mango_guest_range_ok(lib, r2, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r2, 4u);
+      }
+      cpu->r[0] = 1;
+      break;
+    case MANGO_LIBC_EGL_CHOOSE: {
+      uint32_t nptr = 0;
+      if (mango_guest_range_ok(lib, cpu->r[MANGO_REG_SP], 4u)) {
+        nptr = mango_load_u32_guest(lib->guest_mem, cpu->r[MANGO_REG_SP]);
+      }
+      if (nptr && mango_guest_range_ok(lib, nptr, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, nptr, 1u);
+      }
+      if (r2 && cpu->r[3] && mango_guest_range_ok(lib, r2, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r2, 1u);
+      }
+      cpu->r[0] = 1;
+      break;
+    }
+    case MANGO_LIBC_EGL_SURFACE:
+      cpu->r[0] = 2;
+      break;
+    case MANGO_LIBC_EGL_CONTEXT:
+      cpu->r[0] = 3;
+      break;
+    case MANGO_LIBC_EGL_QUERY: {
+      const char* s = "OpenGL_ES";
+      if (r1 == 0x3053u) {
+        s = "mango";
+      } else if (r1 == 0x3054u) {
+        s = "1.4";
+      } else if (r1 == 0x3055u) {
+        s = "";
+      }
+      cpu->r[0] = mango_guest_strdup(lib, s);
+      break;
+    }
+    case MANGO_LIBC_ANW_FROM:
+      cpu->r[0] = 4;
+      break;
     case MANGO_LIBC_ANW_W:
       cpu->r[0] = 1280;
       break;
@@ -962,7 +1042,7 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       cpu->r[0] =
           mango_host_jni_ok(env)
               ? mango_handle_intern((*env)->GetObjectClass(env, mango_handle_lookup(cpu->r[1])))
-              : (cpu->r[1] ? cpu->r[1] : mango_handle_intern((void*)(uintptr_t)1));
+              : (cpu->r[1] ? cpu->r[1] : mango_dummy_jobject());
       break;
     case MANGO_JNI_GET_METHOD_ID:
     case MANGO_JNI_GET_STATIC_METHOD_ID: {
@@ -985,14 +1065,44 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       cpu->r[0] = mango_handle_intern(mid);
       break;
     }
+    case MANGO_JNI_NEW_OBJECT:
+    case MANGO_JNI_NEW_OBJECT + 1:
+    case MANGO_JNI_NEW_OBJECT + 2:
     case MANGO_JNI_CALL_OBJECT_METHOD:
-    case MANGO_JNI_CALL_BOOLEAN_METHOD:
-    case MANGO_JNI_CALL_INT_METHOD:
+    case MANGO_JNI_CALL_OBJECT_METHOD + 1:
+    case MANGO_JNI_CALL_OBJECT_METHOD + 2:
+    case MANGO_JNI_CALL_STATIC_OBJECT_METHOD:
+    case MANGO_JNI_CALL_STATIC_OBJECT_METHOD + 1:
+    case MANGO_JNI_CALL_STATIC_OBJECT_METHOD + 2:
     case MANGO_JNI_GET_OBJECT_FIELD:
+    case MANGO_JNI_GET_STATIC_OBJECT_FIELD:
+      cpu->r[0] = mango_dummy_jobject();
+      break;
+    case MANGO_JNI_CALL_BOOLEAN_METHOD:
+    case MANGO_JNI_CALL_BOOLEAN_METHOD + 1:
+    case MANGO_JNI_CALL_BOOLEAN_METHOD + 2:
+    case MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD:
+    case MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD + 1:
+    case MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD + 2:
+    case MANGO_JNI_GET_BOOLEAN_FIELD:
+      cpu->r[0] = 1;
+      break;
+    case MANGO_JNI_CALL_INT_METHOD:
+    case MANGO_JNI_CALL_INT_METHOD + 1:
+    case MANGO_JNI_CALL_INT_METHOD + 2:
+    case MANGO_JNI_CALL_STATIC_INT_METHOD:
+    case MANGO_JNI_CALL_STATIC_INT_METHOD + 1:
+    case MANGO_JNI_CALL_STATIC_INT_METHOD + 2:
     case MANGO_JNI_GET_INT_FIELD:
-      cpu->r[0] = 0;
+    case MANGO_JNI_GET_STATIC_INT_FIELD:
+      cpu->r[0] = 1;
       break;
     case MANGO_JNI_CALL_VOID_METHOD:
+    case MANGO_JNI_CALL_VOID_METHOD + 1:
+    case MANGO_JNI_CALL_VOID_METHOD + 2:
+    case MANGO_JNI_CALL_STATIC_VOID_METHOD:
+    case MANGO_JNI_CALL_STATIC_VOID_METHOD + 1:
+    case MANGO_JNI_CALL_STATIC_VOID_METHOD + 2:
     case MANGO_JNI_SET_OBJECT_FIELD:
     case MANGO_JNI_SET_INT_FIELD:
       cpu->r[0] = 0;
@@ -1074,6 +1184,8 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
             if (sg) {
               strncpy(g_slots[si].shorty, sg, sizeof(g_slots[si].shorty) - 1u);
             }
+            fprintf(stderr, "mango: RegisterNatives %s %s pc=0x%x\n", nm ? nm : "?",
+                    sg ? sg : "?", fn_a);
           }
         }
       }

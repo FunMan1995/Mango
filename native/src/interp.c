@@ -848,36 +848,73 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_VCVT: {
-          int32_t si = (int32_t)cpu->s[insn.rn & 31u];
-          mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64((double)si));
+          if (insn.imm == 1) {
+            double d = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
+            float f = (float)d;
+            uint32_t u;
+            memcpy(&u, &f, 4);
+            if (insn.rd < 32u) {
+              cpu->s[insn.rd] = u;
+            }
+          } else if (insn.imm == 2) {
+            float f;
+            uint32_t u = cpu->s[insn.rn & 31u];
+            memcpy(&f, &u, 4);
+            mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64((double)f));
+          } else if (insn.imm == 3 || insn.imm == 4) {
+            float f;
+            uint32_t u = cpu->s[insn.rn & 31u];
+            memcpy(&f, &u, 4);
+            cpu->s[insn.rd & 31u] = insn.imm == 3 ? (uint32_t)(int32_t)f : (uint32_t)f;
+          } else if (insn.imm == 5) {
+            int32_t si = (int32_t)cpu->s[insn.rn & 31u];
+            float f = (float)si;
+            uint32_t u;
+            memcpy(&u, &f, 4);
+            cpu->s[insn.rd & 31u] = u;
+          } else {
+            int32_t si = (int32_t)cpu->s[insn.rn & 31u];
+            mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64((double)si));
+          }
           break;
         }
 
-        case MANGO_OP_VADD: {
-          double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rn));
-          double b = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
-          mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(a + b));
-          break;
-        }
-
-        case MANGO_OP_VSUB: {
-          double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rn));
-          double b = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
-          mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(a - b));
-          break;
-        }
-
-        case MANGO_OP_VMUL: {
-          double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rn));
-          double b = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
-          mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(a * b));
-          break;
-        }
-
+        case MANGO_OP_VADD:
+        case MANGO_OP_VSUB:
+        case MANGO_OP_VMUL:
         case MANGO_OP_VDIV: {
-          double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rn));
-          double b = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
-          mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(b == 0.0 ? 0.0 : a / b));
+          if (insn.b) {
+            double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rn));
+            double b = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
+            double r;
+            if (insn.op == MANGO_OP_VSUB) {
+              r = a - b;
+            } else if (insn.op == MANGO_OP_VMUL) {
+              r = a * b;
+            } else if (insn.op == MANGO_OP_VDIV) {
+              r = b == 0.0 ? 0.0 : a / b;
+            } else {
+              r = a + b;
+            }
+            mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(r));
+          } else {
+            float a, b, r;
+            uint32_t ua = cpu->s[insn.rn & 31u];
+            uint32_t ub = cpu->s[insn.rm & 31u];
+            memcpy(&a, &ua, 4);
+            memcpy(&b, &ub, 4);
+            if (insn.op == MANGO_OP_VSUB) {
+              r = a - b;
+            } else if (insn.op == MANGO_OP_VMUL) {
+              r = a * b;
+            } else if (insn.op == MANGO_OP_VDIV) {
+              r = b == 0.0f ? 0.0f : a / b;
+            } else {
+              r = a + b;
+            }
+            memcpy(&ua, &r, 4);
+            cpu->s[insn.rd & 31u] = ua;
+          }
           break;
         }
 
@@ -900,12 +937,29 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_VCMP: {
-          double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rd));
-          double b = insn.imm ? 0.0 : mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
+          int lt, eq;
+          if (insn.b) {
+            double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rd));
+            double b = insn.imm ? 0.0 : mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
+            eq = a == b;
+            lt = a < b;
+          } else {
+            float a, b;
+            uint32_t ua = cpu->s[insn.rd & 31u];
+            memcpy(&a, &ua, 4);
+            if (insn.imm) {
+              b = 0.0f;
+            } else {
+              uint32_t ub = cpu->s[insn.rm & 31u];
+              memcpy(&b, &ub, 4);
+            }
+            eq = a == b;
+            lt = a < b;
+          }
           cpu->fpscr &= ~0xF0000000u;
-          if (a == b) {
+          if (eq) {
             cpu->fpscr |= MANGO_CPSR_Z | MANGO_CPSR_C;
-          } else if (a < b) {
+          } else if (lt) {
             cpu->fpscr |= MANGO_CPSR_N | MANGO_CPSR_C;
           }
           break;
@@ -928,6 +982,15 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             uint32_t nd = insn.b ? 2u : 1u;
             for (uint32_t i = 0; i < nd; i++) {
               mango_vfp_set_d(cpu, insn.rd + i, v);
+            }
+          } else if (insn.u == 4) {
+            if (insn.rd >= 32u) {
+              return -1;
+            }
+            if (insn.b) {
+              cpu->r[insn.rn] = cpu->s[insn.rd];
+            } else {
+              cpu->s[insn.rd] = cpu->r[insn.rn];
             }
           } else {
             mango_vfp_set_d(cpu, insn.rd, mango_vfp_get_d(cpu, insn.rm));
