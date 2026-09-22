@@ -1658,6 +1658,13 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  * head/sentinel at +0x30/+0x34 left 0. Contains() then walks address 0 as a
  * node; [0+4] holds a label pointer into "ALLOC_TEMP_THREAD", whose +4 word
  * is ASCII "C_TE" and OOB-loads as a next pointer.
+ *
+ * nativeRender also probes a Hash128 interval tree via BSS object 0x12d7fa0.
+ * Without a tree, Contains() treats address 0 as the root, loads a bogus head
+ * from [8] (corrupted ELF header / prior NULL stores), and LDRDs OOB at node
+ * 0x4000000. Seed an empty tree at obj+0x40, redirect ctor VA 0x87fa84's Unity
+ * alloc onto that BSS tree (so method pointers still install), and disable
+ * reset VA 0x87fb30 which would free/clear obj+4.
  */
 static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
   const char* base;
@@ -1708,6 +1715,48 @@ static void mango_seed_ofdp_memory_manager(MangoLoadedLibrary* lib) {
     sen = mm + 0x30u;
     mango_store_u32_guest(lib->guest_mem, mm + 0x30u, sen);
     mango_store_u32_guest(lib->guest_mem, mm + 0x34u, sen);
+  }
+}
+
+static void mango_seed_ofdp_hash_tree(MangoLoadedLibrary* lib) {
+  uint32_t obj, tree, sen, alloc_site, dtor;
+  if (!mango_is_ofdp_unity(lib)) {
+    return;
+  }
+  obj = lib->load_bias + 0x12d7fa0u;
+  /* Carve empty tree from unused BSS just past the object (obj ends ~+0x40). */
+  tree = obj + 0x40u;
+  if (!mango_guest_range_ok(lib, obj, 0x58u)) {
+    return;
+  }
+  /* Pre-shape empty tree; ctor will re-init the same bytes after we redirect its
+   * allocator to return this address. */
+  sen = tree + 4u;
+  mango_store_u32_guest(lib->guest_mem, tree + 0x8u, 0u);
+  mango_store_u32_guest(lib->guest_mem, tree + 0xcu, sen);
+  mango_store_u32_guest(lib->guest_mem, tree + 0x10u, sen);
+  mango_store_u32_guest(lib->guest_mem, tree + 0x14u, 0u);
+  mango_store_u32_guest(lib->guest_mem, obj + 4u, tree);
+
+  /* Ctor VA 0x87fa84 calls Unity alloc at 0x4c0c48 (often NULL under the shim).
+   * Replace mov r0,#0x18; mov r1,#6; mov r2,#0x10; bl alloc with
+   * movw/movt/add that set r0 = r4 + 0x168a14 (BSS tree relative to the same
+   * base the ctor already computed into r4). Method pointers still install. */
+  alloc_site = lib->load_bias + 0x4c1aa4u;
+  if (mango_guest_range_ok(lib, alloc_site, 16u) &&
+      mango_load_u32_guest(lib->guest_mem, alloc_site) == 0xe3a00018u &&
+      mango_load_u32_guest(lib->guest_mem, alloc_site + 4u) == 0xe3a01006u) {
+    mango_store_u32_guest(lib->guest_mem, alloc_site + 0u, 0xe3080a14u); /* movw r0, #0x8a14 */
+    mango_store_u32_guest(lib->guest_mem, alloc_site + 4u, 0xe3400016u); /* movt r0, #0x16 */
+    mango_store_u32_guest(lib->guest_mem, alloc_site + 8u, 0xe0840000u); /* add r0, r4, r0 */
+    mango_store_u32_guest(lib->guest_mem, alloc_site + 12u, 0xe1a00000u); /* nop */
+  }
+
+  /* Reset VA 0x87fb30 frees/clears obj+4 — disable it. */
+  dtor = lib->load_bias + 0x4c1b30u;
+  if (mango_guest_range_ok(lib, dtor, 4u) &&
+      mango_load_u32_guest(lib->guest_mem, dtor) == 0xe92d4830u) {
+    mango_store_u32_guest(lib->guest_mem, dtor, 0xe12fff1eu); /* bx lr */
   }
 }
 
@@ -1859,6 +1908,7 @@ static void* mango_load_library(const char* libpath, int flag) {
   mango_patch_ofdp_unity(lib);
   mango_run_constructors(lib);
   mango_seed_ofdp_memory_manager(lib);
+  mango_seed_ofdp_hash_tree(lib);
   return lib;
 }
 
