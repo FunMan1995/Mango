@@ -930,6 +930,73 @@ static int test_push_pop_roundtrip(void) {
   return 0;
 }
 
+
+static int test_stmdb_sp_in_list(void) {
+  /* OFDP stop word 0xe92d6000: STMDB sp!, {sp, lr}. ARMv7 stored SP is
+   * implementation-defined with writeback; match common AAPCS/bionic:
+   * store the original (pre-writeback) SP. Also allow LDM with SP in list. */
+  uint32_t stmdb = encode_ldm_stm(1, 0, 1, 0, MANGO_REG_SP, (1u << MANGO_REG_SP) | (1u << MANGO_REG_LR));
+  uint32_t ldmia = encode_ldm_stm(0, 1, 1, 1, MANGO_REG_SP, (1u << MANGO_REG_SP) | (1u << MANGO_REG_LR));
+  if (stmdb != 0xE92D6000u) {
+    fprintf(stderr, "FAIL(stmdb_sp_in_list): encoder mismatch, got 0x%08x\n", stmdb);
+    return 1;
+  }
+  MangoInsn insn;
+  if (mango_decode(stmdb, &insn) != 0 || insn.op != MANGO_OP_STM || insn.rn != MANGO_REG_SP ||
+      insn.reglist != 0x6000u || !insn.w || !insn.p || insn.u) {
+    fprintf(stderr, "FAIL(stmdb_sp_in_list): STMDB sp!,{sp,lr} rejected or mis-decoded\n");
+    return 1;
+  }
+  if (mango_decode(ldmia, &insn) != 0 || insn.op != MANGO_OP_LDM) {
+    fprintf(stderr, "FAIL(stmdb_sp_in_list): LDMIA sp!,{sp,lr} rejected\n");
+    return 1;
+  }
+
+  static const uint32_t kProgram[] = {
+      0xE92D6000u, /* stmdb sp!, {sp, lr} */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[256];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  const uint32_t orig_sp = 128u;
+  const uint32_t orig_lr = 0xCAFE0000u;
+  cpu.r[MANGO_REG_SP] = orig_sp;
+  cpu.r[MANGO_REG_LR] = orig_lr;
+
+  int rc = mango_interp_run(&cpu, &mem, orig_lr, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(stmdb_sp_in_list): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[MANGO_REG_SP] != orig_sp - 8u) {
+    fprintf(stderr, "FAIL(stmdb_sp_in_list): expected sp=%u after writeback, got %u\n",
+            orig_sp - 8u, cpu.r[MANGO_REG_SP]);
+    return 1;
+  }
+  /* Lowest-numbered register at lowest address: SP at orig_sp-8, LR at orig_sp-4. */
+  uint32_t stored_sp = bytes_to_u32_le(mem_buf + (orig_sp - 8u));
+  uint32_t stored_lr = bytes_to_u32_le(mem_buf + (orig_sp - 4u));
+  if (stored_sp != orig_sp) {
+    fprintf(stderr, "FAIL(stmdb_sp_in_list): stored SP should be original 0x%x, got 0x%x\n", orig_sp,
+            stored_sp);
+    return 1;
+  }
+  if (stored_lr != orig_lr) {
+    fprintf(stderr, "FAIL(stmdb_sp_in_list): stored LR mismatch, got 0x%x\n", stored_lr);
+    return 1;
+  }
+  printf("ok: STMDB sp!,{sp,lr} stores original SP then writeback; LDM SP-in-list decodes\n");
+  return 0;
+}
+
 static int test_stmia_ldmia_no_writeback(void) {
   /* STMIA/LDMIA without writeback: lowest register at lowest address, base
    * left alone. r1 points at byte 64, past the program. */
@@ -1063,7 +1130,7 @@ static int test_ldm_stm_rejected_shapes(void) {
   }
   uint32_t wb_rn = encode_ldm_stm(0, 1, 1, 0, 0, 1u); /* STMIA r0!, {r0} */
   if (mango_decode(wb_rn, &insn) == 0) {
-    fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): writeback with rn in list was decoded\n");
+    fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): writeback with non-SP rn in list was decoded\n");
     return 1;
   }
   uint32_t pc_base = encode_ldm_stm(0, 1, 0, 0, MANGO_REG_PC, 1u);
@@ -1071,7 +1138,7 @@ static int test_ldm_stm_rejected_shapes(void) {
     fprintf(stderr, "FAIL(ldm_stm_rejected_shapes): pc as base was decoded\n");
     return 1;
   }
-  printf("ok: empty/S-bit/stm-pc/wb-rn-in-list/pc-base ldm/stm shapes rejected\n");
+  printf("ok: empty/S-bit/stm-pc/wb-non-sp-rn-in-list/pc-base ldm/stm shapes rejected\n");
   return 0;
 }
 
@@ -3329,6 +3396,7 @@ int main(void) {
   failures += test_s0_compares_rejected();
   failures += test_svc_stops_and_can_resume();
   failures += test_push_pop_roundtrip();
+  failures += test_stmdb_sp_in_list();
   failures += test_stmia_ldmia_no_writeback();
   failures += test_stmib_and_writeback();
   failures += test_ldm_stm_rejected_shapes();

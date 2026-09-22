@@ -32,8 +32,11 @@ synthetic programs, not real app code yet.
   register always lands at the lowest address. `LDM` of PC is a real
   return (used by `POP {..., pc}`); `STM` of PC, an empty register list,
   the S-bit user-bank/SPSR form, PC as the base register, and writeback
-  with Rn in the list are all rejected rather than guessed at, because
-  each is UNPREDICTABLE or implementation-defined on real hardware.
+  with a non-SP Rn in the list are all rejected rather than guessed at.
+  Writeback with SP in the list is allowed (`STMDB sp!,{sp,...}` /
+  `LDMIA sp!,{...,sp,...}`): STM stores the original pre-writeback SP
+  (common AAPCS/bionic expectation; ARMv7 leaves that value
+  implementation-defined).
   Register operand2 can carry a shift: LSL/LSR/ASR/ROR by an immediate
   amount or by `Rs[7:0]`. Immediate `LSR #0`/`ASR #0`/`ROR #0` are the
   real hardware meanings (`LSR #32`/`ASR #32`/RRX), not "shift by zero".
@@ -169,7 +172,8 @@ synthetic programs, not real app code yet.
   negative tests that specifically try an out-of-bounds and a misaligned
   `LDR` and check they're rejected, not just that the happy path works,
   an out-of-bounds `STM`, rejected `LDM`/`STM` shapes (empty list, S-bit,
-  STM of PC, writeback with Rn in the list, PC as base), rejected
+  STM of PC, writeback with non-SP Rn in the list, PC as base),
+  `STMDB sp!,{sp,lr}` storing the original SP, rejected
   `LDRT` / writeback-into-PC / `LDR` writeback into the same dest /
   `LSL pc`, `LDRD`/`STRD`, a misaligned `LDRH`, and `S=0`
   `TST`/`TEQ`/`CMP`/`CMN` shapes. Earlier rounds of

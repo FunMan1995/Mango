@@ -1054,8 +1054,12 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     if (rn == MANGO_REG_PC) {
       return -1; /* PC as base is UNPREDICTABLE */
     }
-    if (w && (reglist & (1u << rn))) {
-      return -1; /* writeback with Rn in the list is UNPREDICTABLE */
+    if (w && (reglist & (1u << rn)) && rn != MANGO_REG_SP) {
+      /* Writeback with Rn in the list is UNPREDICTABLE for non-SP bases.
+       * STMDB/LDMIA sp!,{sp,...} appears in real AAPCS/bionic frames; allow
+       * SP. STM stores the original (pre-writeback) SP — interp applies
+       * writeback after the stores. */
+      return -1;
     }
     if (!l && (reglist & (1u << MANGO_REG_PC))) {
       /* STM of PC stores PC+8 or PC+12 depending on the core; refuse to
