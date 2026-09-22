@@ -13,6 +13,7 @@ add_library(mango_core STATIC
   src/elf32.c
 )
 target_include_directories(mango_core PUBLIC include)
+set_target_properties(mango_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 enable_testing()
 add_executable(mango_core_tests tests/test_interp.c)

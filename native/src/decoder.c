@@ -39,6 +39,44 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
+  /* BLX Rm: cond 0001 0010 1111 1111 1111 0011 Rm. JNI vtable calls. */
+  if (((word >> 20) & 0xFF) == 0x12 && ((word >> 4) & 0xFFFF) == 0xFFF3) {
+    uint32_t rm = word & 0xF;
+    if (rm == MANGO_REG_PC) {
+      return -1; /* BLX PC is UNPREDICTABLE */
+    }
+    out->op = MANGO_OP_BLX;
+    out->rm = rm;
+    out->is_imm = 0;
+    return 0;
+  }
+
+  /* MOVW: cond 0011 0000 imm4 Rd imm12. Overlaps S=0 TST, which we reject. */
+  if (((word >> 20) & 0xFF) == 0x30) {
+    uint32_t rd = (word >> 12) & 0xF;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->is_imm = 1;
+    out->imm = (((word >> 16) & 0xF) << 12) | (word & 0xFFF);
+    return 0;
+  }
+
+  /* MOVT: cond 0011 0100 imm4 Rd imm12. Overlaps S=0 CMP, which we reject. */
+  if (((word >> 20) & 0xFF) == 0x34) {
+    uint32_t rd = (word >> 12) & 0xF;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOVT;
+    out->rd = rd;
+    out->is_imm = 1;
+    out->imm = (((word >> 16) & 0xF) << 12) | (word & 0xFFF);
+    return 0;
+  }
+
   /* B/BL imm24: bits 27-25 = 101, bit 24 = L (0=B, 1=BL) */
   if (((word >> 25) & 0x7) == 0x5) {
     uint32_t l = (word >> 24) & 0x1;
@@ -479,11 +517,16 @@ int mango_decode_t16(uint16_t hw, MangoInsn* out) {
     uint32_t rm = (hw >> 3) & 0xFu;
     uint32_t rd = (hw & 7u) | (((hw >> 7) & 1u) << 3);
     if (opc == 3u) {
-      if ((hw & (1u << 7)) || (hw & 7u)) {
-        return -1; /* BLX, or BX with non-zero SBZ Rd */
+      if (hw & 7u) {
+        return -1; /* SBZ Rd bits must be 0 */
       }
-      out->op = MANGO_OP_BX;
       out->rm = rm;
+      if (hw & (1u << 7)) {
+        out->op = MANGO_OP_BLX; /* T16 BLX Rm, used for Thumb JNI vtable calls */
+        out->is_imm = 0;
+      } else {
+        out->op = MANGO_OP_BX;
+      }
       return 0;
     }
     out->rd = rd;
@@ -785,6 +828,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
         return -1; /* BLX imm H bit must be 0 */
       }
       out->op = MANGO_OP_BLX;
+      out->is_imm = 1;
       out->imm = mango_t32_branch_imm25(hw1, hw2);
       return 0;
     }
@@ -802,6 +846,57 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       out->cond = cond;
       out->imm = mango_t32_bcond_imm(hw1, hw2);
       return 0;
+    }
+  }
+
+  /* LDR/STR/LDRB/STRB/LDRH/STRH imm12: 11111 000 1 size L Rn / Rt imm12.
+   * Rn=15 + LDR is the literal form (U in bit 7). */
+  if ((hw1 & 0xFF80u) == 0xF880u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t kind = (hw1 >> 4) & 7u;
+    uint32_t imm12 = hw2 & 0xFFFu;
+    if (rt == MANGO_REG_PC) {
+      return -1;
+    }
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm12;
+    out->p = 1;
+    out->w = 0;
+    if (rn == MANGO_REG_PC) {
+      if (kind != 5u) {
+        return -1; /* only LDR literal in this subset */
+      }
+      out->op = MANGO_OP_LDR;
+      out->u = (int)((hw1 >> 7) & 1u);
+      return 0;
+    }
+    out->u = 1;
+    switch (kind) {
+      case 0:
+        out->op = MANGO_OP_STR;
+        out->b = 1;
+        return 0;
+      case 1:
+        out->op = MANGO_OP_LDR;
+        out->b = 1;
+        return 0;
+      case 2:
+        out->op = MANGO_OP_STRH;
+        return 0;
+      case 3:
+        out->op = MANGO_OP_LDRH;
+        return 0;
+      case 4:
+        out->op = MANGO_OP_STR;
+        return 0;
+      case 5:
+        out->op = MANGO_OP_LDR;
+        return 0;
+      default:
+        return -1;
     }
   }
 

@@ -1918,6 +1918,158 @@ static int test_swp_and_swpb(void) {
   return 0;
 }
 
+static int test_arm_movw_movt(void) {
+  /* JNI_VERSION_1_6 is the real Unity JNI_OnLoad return: movw/movt r0. */
+  static const uint32_t kProgram[] = {
+      0xE3000006u, /* movw r0, #6 */
+      0xE3400001u, /* movt r0, #1 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[0] = 0xFFFFFFFFu;
+  cpu.r[MANGO_REG_LR] = 0xCAFE0000u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xCAFE0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(arm_movw_movt): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 0x00010006u) {
+    fprintf(stderr, "FAIL(arm_movw_movt): expected r0==0x00010006, got 0x%08x\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: A32 MOVW/MOVT builds JNI_VERSION_1_6 (r0=0x%08x)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_arm_blx_reg(void) {
+  /* blx r1 to a callee at 8; return lands on bx r2 (the sentinel). */
+  static const uint32_t kProgram[] = {
+      0xE12FFF31u, /* blx r1 */
+      0xE12FFF12u, /* bx r2 */
+      0xE3A00007u, /* mov r0, #7 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 4);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[1] = 8u;
+  cpu.r[2] = 0xBEEF0000u;
+  cpu.r[MANGO_REG_LR] = 0xBAD0u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xBEEF0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(arm_blx_reg): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 7) {
+    fprintf(stderr, "FAIL(arm_blx_reg): expected r0==7 after blx r1, got %u\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: A32 BLX Rm calls through a register (r0=%u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_thumb_blx_reg(void) {
+  /* Thumb: blx r1 to ARM callee at 8; return lands on bx r2 (the sentinel). */
+  static const uint16_t kThumb[] = {
+      0x4788u, /* blx r1 */
+      0x4710u, /* bx r2 */
+  };
+  static const uint32_t kArm[] = {
+      0xE3A0002Au, /* mov r0, #42 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, 8, kThumb, 2);
+  mem_buf[8] = (uint8_t)(kArm[0] & 0xFFu);
+  mem_buf[9] = (uint8_t)((kArm[0] >> 8) & 0xFFu);
+  mem_buf[10] = (uint8_t)((kArm[0] >> 16) & 0xFFu);
+  mem_buf[11] = (uint8_t)((kArm[0] >> 24) & 0xFFu);
+  mem_buf[12] = (uint8_t)(kArm[1] & 0xFFu);
+  mem_buf[13] = (uint8_t)((kArm[1] >> 8) & 0xFFu);
+  mem_buf[14] = (uint8_t)((kArm[1] >> 16) & 0xFFu);
+  mem_buf[15] = (uint8_t)((kArm[1] >> 24) & 0xFFu);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[1] = 8u;
+  cpu.r[2] = 0xF00Du;
+  cpu.r[MANGO_REG_LR] = 0xBAD0u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xF00Du, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_blx_reg): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 42) {
+    fprintf(stderr, "FAIL(thumb_blx_reg): expected r0==42, got %u\n", cpu.r[0]);
+    return 1;
+  }
+  if ((cpu.cpsr & MANGO_CPSR_T) == 0) {
+    fprintf(stderr, "FAIL(thumb_blx_reg): return from ARM callee should restore Thumb\n");
+    return 1;
+  }
+  printf("ok: Thumb BLX Rm into ARM and back (r0=%u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_thumb32_ldr_str_imm(void) {
+  /* STR.W r2, [r1, #8]; LDR.W r0, [r1, #8]; bx lr */
+  static const uint16_t kProg[] = {
+      0xF8C1u, 0x2008u, /* str.w r2, [r1, #8] */
+      0xF8D1u, 0x0008u, /* ldr.w r0, [r1, #8] */
+      0x4770u,          /* bx lr */
+  };
+
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 5);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[1] = 16u;
+  cpu.r[2] = 0xAABBCCDDu;
+  cpu.r[MANGO_REG_LR] = 0xD00Du;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xD00Du, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb32_ldr_str_imm): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 0xAABBCCDDu) {
+    fprintf(stderr, "FAIL(thumb32_ldr_str_imm): expected r0==0xAABBCCDD, got 0x%08x\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: T32 STR.W/LDR.W imm12 roundtrip (r0=0x%08x)\n", cpu.r[0]);
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -1966,6 +2118,10 @@ int main(void) {
   failures += test_thumb_it_eq_taken();
   failures += test_thumb_it_eq_skipped();
   failures += test_thumb_b_w();
+  failures += test_arm_movw_movt();
+  failures += test_arm_blx_reg();
+  failures += test_thumb_blx_reg();
+  failures += test_thumb32_ldr_str_imm();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

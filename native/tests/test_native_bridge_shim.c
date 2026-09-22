@@ -4,6 +4,7 @@
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE /* glibc gates mkstemp's declaration behind this too */
 #endif
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,150 @@ int main(void) {
     return 1;
   }
   printf("ok: getTrampoline is NULL for a symbol the guest .so does not export\n");
+
+  NativeBridgeItf.unloadLibrary(handle);
+  unlink(path);
+
+  /* Put a real A32 JNI body at 0x100: add r0, r2, r3; bx lr. ART shorty
+   * III = returns int, two int args (JNIEnv* and jobject are implicit). */
+  uint8_t jni_elf[sizeof(kSynthElf)];
+  memcpy(jni_elf, kSynthElf, sizeof(jni_elf));
+  for (size_t i = 4; i + 4 < sizeof(jni_elf); i++) {
+    if (jni_elf[i] == 0x40 && jni_elf[i + 1] == 0 && jni_elf[i + 2] == 0 && jni_elf[i + 3] == 0 &&
+        jni_elf[i - 4] == 0x01 && jni_elf[i - 3] == 0 && jni_elf[i - 2] == 0 &&
+        jni_elf[i - 1] == 0) {
+      jni_elf[i] = 0x00;
+      jni_elf[i + 1] = 0x01;
+      break;
+    }
+  }
+  jni_elf[0x100] = 0x03;
+  jni_elf[0x101] = 0x00;
+  jni_elf[0x102] = 0x82;
+  jni_elf[0x103] = 0xE0; /* add r0, r2, r3 */
+  jni_elf[0x104] = 0x1E;
+  jni_elf[0x105] = 0xFF;
+  jni_elf[0x106] = 0x2F;
+  jni_elf[0x107] = 0xE1; /* bx lr */
+
+  if (snprintf(path, sizeof(path), "%s/mango_shim_test_XXXXXX", tmpdir) >= (int)sizeof(path)) {
+    fprintf(stderr, "FAIL: TMPDIR is too long for the JNI fixture\n");
+    return 1;
+  }
+  fd = mkstemp(path);
+  if (fd < 0 || write(fd, jni_elf, sizeof(jni_elf)) != (ssize_t)sizeof(jni_elf)) {
+    fprintf(stderr, "FAIL: couldn't write the JNI test fixture\n");
+    return 1;
+  }
+  close(fd);
+
+  handle = NativeBridgeItf.loadLibrary(path, 0);
+  if (!handle) {
+    fprintf(stderr, "FAIL: loadLibrary rejected the JNI add fixture\n");
+    unlink(path);
+    return 1;
+  }
+  void* add = NativeBridgeItf.getTrampoline(handle, "mango_add", "III", 3);
+  if (!add) {
+    fprintf(stderr, "FAIL: getTrampoline(mango_add, III) returned NULL\n");
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    return 1;
+  }
+  typedef jint (*mango_add_fn)(JNIEnv*, jobject, jint, jint);
+  jint sum = ((mango_add_fn)add)((JNIEnv*)(uintptr_t)1, (jobject)(uintptr_t)2, 20, 22);
+  if (sum != 42) {
+    fprintf(stderr, "FAIL: interpreter JNI trampoline returned %d, want 42\n", (int)sum);
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    return 1;
+  }
+  printf("ok: JNI trampoline runs guest add (20+22=42) through the interpreter\n");
+
+  NativeBridgeItf.unloadLibrary(handle);
+  unlink(path);
+
+  /* JNI_OnLoad shape from Unity's libmain.so: AttachCurrentThread via the
+   * JavaVM vtable, RegisterNatives, return JNI_VERSION_1_6 with MOVW/MOVT. */
+  uint8_t onload_elf[512];
+  memset(onload_elf, 0, sizeof(onload_elf));
+  memcpy(onload_elf, kSynthElf, sizeof(kSynthElf));
+  onload_elf[0x44] = 0x80;
+  onload_elf[0x45] = 0x01; /* p_filesz = 0x180 */
+  onload_elf[0x48] = 0x80;
+  onload_elf[0x49] = 0x01; /* p_memsz = 0x180 */
+  for (size_t i = 4; i + 4 < sizeof(kSynthElf); i++) {
+    if (onload_elf[i] == 0x40 && onload_elf[i + 1] == 0 && onload_elf[i + 2] == 0 &&
+        onload_elf[i + 3] == 0 && onload_elf[i - 4] == 0x01 && onload_elf[i - 3] == 0 &&
+        onload_elf[i - 2] == 0 && onload_elf[i - 1] == 0) {
+      onload_elf[i] = 0x00;
+      onload_elf[i + 1] = 0x01;
+      break;
+    }
+  }
+  static const uint32_t kOnLoad[] = {
+      0xE92D4000u, /* push {lr} */
+      0xE24DD008u, /* sub sp, sp, #8 */
+      0xE3A01000u, /* mov r1, #0 */
+      0xE58D1004u, /* str r1, [sp, #4] */
+      0xE5901000u, /* ldr r1, [r0] */
+      0xE5913010u, /* ldr r3, [r1, #0x10] AttachCurrentThread */
+      0xE28D1004u, /* add r1, sp, #4 */
+      0xE3A02000u, /* mov r2, #0 */
+      0xE12FFF33u, /* blx r3 */
+      0xE59D0004u, /* ldr r0, [sp, #4] */
+      0xE5901000u, /* ldr r1, [r0] */
+      0xE591435Cu, /* ldr r4, [r1, #0x35c] RegisterNatives */
+      0xE3A01000u, /* mov r1, #0 */
+      0xE3A02000u, /* mov r2, #0 */
+      0xE3A03000u, /* mov r3, #0 */
+      0xE12FFF34u, /* blx r4 */
+      0xE3000006u, /* movw r0, #6 */
+      0xE3400001u, /* movt r0, #1 */
+      0xE28DD008u, /* add sp, sp, #8 */
+      0xE8BD8000u, /* pop {pc} */
+  };
+  for (size_t i = 0; i < sizeof(kOnLoad) / sizeof(kOnLoad[0]); i++) {
+    uint32_t w = kOnLoad[i];
+    onload_elf[0x100 + i * 4 + 0] = (uint8_t)(w & 0xFFu);
+    onload_elf[0x100 + i * 4 + 1] = (uint8_t)((w >> 8) & 0xFFu);
+    onload_elf[0x100 + i * 4 + 2] = (uint8_t)((w >> 16) & 0xFFu);
+    onload_elf[0x100 + i * 4 + 3] = (uint8_t)((w >> 24) & 0xFFu);
+  }
+
+  if (snprintf(path, sizeof(path), "%s/mango_shim_test_XXXXXX", tmpdir) >= (int)sizeof(path)) {
+    fprintf(stderr, "FAIL: TMPDIR is too long for the JNI_OnLoad fixture\n");
+    return 1;
+  }
+  fd = mkstemp(path);
+  if (fd < 0 || write(fd, onload_elf, 0x180) != 0x180) {
+    fprintf(stderr, "FAIL: couldn't write the JNI_OnLoad fixture\n");
+    return 1;
+  }
+  close(fd);
+
+  handle = NativeBridgeItf.loadLibrary(path, 0);
+  if (!handle) {
+    fprintf(stderr, "FAIL: loadLibrary rejected the JNI_OnLoad fixture\n");
+    unlink(path);
+    return 1;
+  }
+  void* onload = NativeBridgeItf.getTrampoline(handle, "mango_add", "IL", 2);
+  if (!onload) {
+    fprintf(stderr, "FAIL: getTrampoline(JNI_OnLoad shorty IL) returned NULL\n");
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    return 1;
+  }
+  typedef jint (*mango_onload_fn)(void*, void*);
+  jint ver = ((mango_onload_fn)onload)((void*)(uintptr_t)1, NULL);
+  if (ver != 0x00010006) {
+    fprintf(stderr, "FAIL: JNI_OnLoad returned 0x%x, want 0x00010006\n", (int)ver);
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    return 1;
+  }
+  printf("ok: JNI_OnLoad runs AttachCurrentThread + RegisterNatives, returns 0x00010006\n");
 
   if (NativeBridgeItf.unloadLibrary(handle) != 0) {
     fprintf(stderr, "FAIL: unloadLibrary returned nonzero for a real handle\n");

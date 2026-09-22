@@ -67,8 +67,10 @@ synthetic programs, not real app code yet.
   the tests are left intact so a `BX LR` halt still matches). 32-bit
   Thumb covers `BL`/`BLX` (immediate), `B.W` / `B<cond>.W`, `MOVW`/`MOVT`,
   and `IT` (ITSTATE in CPSR, including ITE-style inverted conditions on
-  later slots). Other T32 groups (wide load/store, data-processing) are
-  still rejected.
+  later slots). T32 `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH` imm12 and
+  `LDR` literal are implemented; other T32 data-processing is still
+  rejected. A32 `MOVW`/`MOVT` and `BLX Rm` (and T16 `BLX Rm`) are
+  implemented so JNI vtable calls and `JNI_VERSION` returns work.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/
@@ -90,11 +92,13 @@ synthetic programs, not real app code yet.
   implements, adapted from the real header (see file for the source and
   license). `loadLibrary` really parses and loads a guest `.so`'s
   `PT_LOAD` segments into guest memory now (via `elf32.c` below);
-  `getTrampoline` really looks its requested symbol up in that guest
-  image, but still returns `NULL`: turning a found symbol into something
-  ART can actually call as a normal AArch64 function is a real, separate
-  piece of work (a generated trampoline or a libffi closure) that isn't
-  written yet. `isSupported`/`isCompatibleWith` work too, and
+  `getTrampoline` looks the symbol up and returns a callable host stub
+  that marshals JNI arguments into the guest AAPCS registers, runs the
+  interpreter until `BX LR`, and handles guest `SVC`s for a JNIEnv and
+  JavaVM function table (FindClass, RegisterNatives, GetEnv /
+  AttachCurrentThread, and the rest of the wired JNI subset) plus a
+  small guest libc (malloc/memcpy/strlen/...). `JNI_OnLoad` uses the
+  JavaVM calling convention. `isSupported`/`isCompatibleWith` work too, and
   `isCompatibleWith` is more load-bearing than its name suggests: AOSP's
   own `libnativebridge` calls it with `NAMESPACE_VERSION` (3)
   *unconditionally at load time* and discards the entire bridge if that's
@@ -123,9 +127,10 @@ synthetic programs, not real app code yet.
 - `src/native_bridge_shim.c`: the Android-specific glue exposing
   `NativeBridgeItf`. `isSupported()` really does check the ELF header
   (class + machine); `loadLibrary`/`getTrampoline`/`unloadLibrary`/the
-  namespace functions are real as far as `elf32.c` above goes, not
-  further (`getTrampoline` still can't hand back a real callable
-  function). `tests/test_native_bridge_shim.c` (built against
+  namespace functions are real as far as `elf32.c` above goes, and
+  `getTrampoline` hands back a callable interpreter stub. Relocs
+  (`R_ARM_RELATIVE`, `R_ARM_GLOB_DAT`, `R_ARM_JUMP_SLOT`) are applied at
+  load, with imports resolved to those libc thunks. `tests/test_native_bridge_shim.c` (built against
   `tests/fake_jni/jni.h`, a deliberately minimal stand-in, not the real
   NDK header, see that file) exercises this on the host without needing
   a device.
@@ -137,13 +142,13 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: forty-six test programs, hand-encoded by
+- `tests/test_interp.c`: fifty test programs, hand-encoded by
   working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why
   that second encoder exists; `encode_ldm_stm` / `encode_ldst` /
   `encode_mla` / `encode_extra_ldst` in the test file are the same
-  idea). All pass under
+  idea). Host interp tests pass under
   `-Wall -Wextra -Werror -fsanitize=address,undefined`, including two
   negative tests that specifically try an out-of-bounds and a misaligned
   `LDR` and check they're rejected, not just that the happy path works,
@@ -180,17 +185,10 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
 
 ## Where to look if you want to help
 
-- Remaining 32-bit Thumb (wide load/store, data-processing), then NEON.
+- Remaining 32-bit Thumb (more addressing modes, data-processing), then NEON.
   Each addition should come with a hand-derived test case the way the
   existing ones work, see `docs/CONTRIBUTING.md`'s testing section.
-- A real trampoline mechanism for `getTrampoline`: it can already find a
-  requested symbol in a loaded guest library (`elf32.c`), but the real
-  blocker is deeper than "generate a trampoline". A JNI native method's
-  guest code expects `JNIEnv*`/`jobject` in its own registers, both real
-  64-bit host pointers the 32-bit guest can't hold as-is; making guest
-  code able to call back into real JNI functions (`NewStringUTF` and
-  friends) at all needs some kind of 32-bit-handle-to-64-bit-pointer
-  proxy layer first. That's a substantially bigger, riskier piece of
-  work than anything in this file so far (closer to the roadmap's Phase
-  4 "thunking" in `docs/ARCHITECTURE.md` than Phase 2), and not
-  something to attempt without a real device to test against.
+- Guest `dlopen`/`dlsym` so Unity's `JNI_OnLoad` can pull in `libunity.so`,
+  GLES/libandroid thunks, and VFP. Integer JNI plus `JNI_OnLoad`'s
+  JavaVM/`RegisterNatives` path is in place; float/double returns and
+  `Call*Method` are not.

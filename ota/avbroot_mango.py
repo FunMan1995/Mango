@@ -31,8 +31,17 @@ PROP_FILES = (
     'system/system_ext/etc/build.prop',
 )
 
+PRODUCT_PROP_FILES = (
+    'etc/build.prop',
+    'build.prop',
+    'etc/prop.default',
+)
+
+# Do not set ro.dalvik.vm.native.bridge here. Magisk Zygisk already owns
+# that property (libzygisk.so). Overwriting it in build.prop makes zygote
+# load this translator instead of Zygisk and boot-loops a Magisk image.
+# LINEOS without Magisk can set the property in the ROM make files.
 PROPS = {
-    'ro.dalvik.vm.native.bridge': SO_NAME,
     'ro.enable.native.bridge.exec': '1',
 }
 
@@ -61,7 +70,7 @@ class MangoModule(Module):
     def requirements(self) -> ModuleRequirements:
         return ModuleRequirements(
             boot_images=set(),
-            ext_images={'system'},
+            ext_images={'system', 'product'},
             selinux_patching=False,
         )
 
@@ -83,7 +92,12 @@ class MangoModule(Module):
         for rel in PROP_FILES:
             self._patch_prop_file(system_fs, rel)
 
-        self._ensure_abilist(system_fs)
+        self._ensure_abilist(system_fs, PROP_FILES)
+        product_fs = ext_fs.get('product')
+        if product_fs is not None:
+            for rel in PRODUCT_PROP_FILES:
+                self._patch_prop_file(product_fs, rel)
+            self._ensure_abilist(product_fs, PRODUCT_PROP_FILES)
 
     def _patch_prop_file(self, system_fs: ExtFs, rel: str) -> None:
         path = PurePosixPath(rel)
@@ -113,9 +127,10 @@ class MangoModule(Module):
             f.write('\n'.join(out) + '\n')
         logger.info('Patched native-bridge props in %s', rel)
 
-    def _ensure_abilist(self, system_fs: ExtFs) -> None:
+    def _ensure_abilist(self, system_fs: ExtFs, files: tuple[str, ...]) -> None:
         """Advertise ARM32 ABIs so PackageManager will install 32-bit APKs."""
-        for rel in PROP_FILES:
+        extras = ('armeabi-v7a', 'armeabi')
+        for rel in files:
             path = PurePosixPath(rel)
             try:
                 with system_fs.open(path, 'r') as f:
@@ -126,27 +141,34 @@ class MangoModule(Module):
                 continue
             lines = text.splitlines()
             out: list[str] = []
+            seen: set[str] = set()
             for line in lines:
                 if line.startswith('ro.product.cpu.abilist=') or line.startswith(
                     'ro.system.product.cpu.abilist='
                 ):
                     key, _, val = line.partition('=')
                     parts = [p for p in val.split(',') if p]
-                    for extra in ('armeabi-v7a', 'armeabi'):
+                    for extra in extras:
                         if extra not in parts:
                             parts.append(extra)
                     out.append(f'{key}={",".join(parts)}')
+                    seen.add(key)
                 elif line.startswith('ro.product.cpu.abilist32=') or line.startswith(
                     'ro.system.product.cpu.abilist32='
                 ):
                     key, _, val = line.partition('=')
                     parts = [p for p in val.split(',') if p]
-                    for extra in ('armeabi-v7a', 'armeabi'):
+                    for extra in extras:
                         if extra not in parts:
                             parts.append(extra)
-                    out.append(f'{key}={",".join(parts) if parts else "armeabi-v7a,armeabi"}')
+                    out.append(f'{key}={",".join(parts) if parts else ",".join(extras)}')
+                    seen.add(key)
                 else:
                     out.append(line)
+            if 'ro.product.cpu.abilist' not in seen:
+                out.append('ro.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi')
+            if 'ro.product.cpu.abilist32' not in seen:
+                out.append('ro.product.cpu.abilist32=armeabi-v7a,armeabi')
             with system_fs.open(path, 'w') as f:
                 f.write('\n'.join(out) + '\n')
             logger.info('Patched cpu.abilist in %s', rel)

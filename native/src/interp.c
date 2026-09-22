@@ -528,9 +528,31 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
 
         case MANGO_OP_BLX:
-          cpu->r[MANGO_REG_LR] = (addr + 4u) | 1u;
-          cpu->cpsr &= ~MANGO_CPSR_T;
-          next_addr = ((addr + 4u) & ~3u) + insn.imm;
+          if (insn.is_imm) {
+            /* T32 BLX immediate: always switches to ARM. */
+            cpu->r[MANGO_REG_LR] = (addr + 4u) | 1u;
+            cpu->cpsr &= ~MANGO_CPSR_T;
+            next_addr = ((addr + 4u) & ~3u) + insn.imm;
+          } else {
+            /* A32 or T16 BLX Rm: write LR then interwork like BX. */
+            if (cpu->cpsr & MANGO_CPSR_T) {
+              cpu->r[MANGO_REG_LR] = (addr + 2u) | 1u;
+            } else {
+              cpu->r[MANGO_REG_LR] = addr + 4u;
+            }
+            {
+              uint32_t dest = cpu->r[insn.rm];
+              if (dest == stop_addr && (dest & 1u)) {
+                next_addr = dest;
+              } else if (dest & 1u) {
+                cpu->cpsr |= MANGO_CPSR_T;
+                next_addr = dest & ~1u;
+              } else {
+                cpu->cpsr &= ~MANGO_CPSR_T;
+                next_addr = dest;
+              }
+            }
+          }
           break;
 
         case MANGO_OP_MOVT:

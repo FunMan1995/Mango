@@ -6,12 +6,69 @@
 /* Implements native/include/mango/native_bridge.h, exported as "NativeBridgeItf". */
 #include <elf.h>
 #include <fcntl.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include "mango/cpu.h"
 #include "mango/elf32.h"
+#include "mango/interp.h"
 #include "mango/native_bridge.h"
+
+#define MANGO_STACK_SIZE 0x10000u
+#define MANGO_HEAP_SIZE 0x40000u
+#define MANGO_JNI_TABLE_LEN 256u
+#define MANGO_JVM_TABLE_LEN 8u
+#define MANGO_JNI_THUNK_SIZE 16u
+#define MANGO_JNI_SVC_BASE 0x1000u
+#define MANGO_JVM_SVC_BASE 0x1800u
+#define MANGO_LIBC_SVC_BASE 0x2000u
+#define MANGO_JNI_STOP 0xFFFFFFF0u
+#define MANGO_JNI_SLOTS 32
+#define MANGO_HANDLE_MAX 4096
+
+#define MANGO_JNI_GET_VERSION 4
+#define MANGO_JNI_FIND_CLASS 6
+#define MANGO_JNI_EXCEPTION_OCCURRED 15
+#define MANGO_JNI_EXCEPTION_CLEAR 17
+#define MANGO_JNI_NEW_GLOBAL_REF 21
+#define MANGO_JNI_DELETE_LOCAL_REF 23
+#define MANGO_JNI_IS_SAME_OBJECT 24
+#define MANGO_JNI_GET_OBJECT_CLASS 31
+#define MANGO_JNI_GET_METHOD_ID 33
+#define MANGO_JNI_GET_STATIC_METHOD_ID 113
+#define MANGO_JNI_NEW_STRING_UTF 167
+#define MANGO_JNI_GET_STRING_UTF_CHARS 169
+#define MANGO_JNI_RELEASE_STRING_UTF_CHARS 170
+#define MANGO_JNI_REGISTER_NATIVES 215
+#define MANGO_JNI_GET_JAVA_VM 219
+#define MANGO_JNI_EXCEPTION_CHECK 228
+
+#define MANGO_JVM_DESTROY 3
+#define MANGO_JVM_ATTACH 4
+#define MANGO_JVM_DETACH 5
+#define MANGO_JVM_GET_ENV 6
+#define MANGO_JVM_ATTACH_DAEMON 7
+
+#define MANGO_LIBC_MALLOC 0
+#define MANGO_LIBC_FREE 1
+#define MANGO_LIBC_MEMCPY 2
+#define MANGO_LIBC_MEMMOVE 3
+#define MANGO_LIBC_MEMSET 4
+#define MANGO_LIBC_MEMCMP 5
+#define MANGO_LIBC_MEMCHR 6
+#define MANGO_LIBC_STRLEN 7
+#define MANGO_LIBC_STRCMP 8
+#define MANGO_LIBC_STRNCMP 9
+#define MANGO_LIBC_STRCPY 10
+#define MANGO_LIBC_ABORT 11
+#define MANGO_LIBC_MEMMEM 12
+#define MANGO_LIBC_AEABI_MEMCPY 13
+#define MANGO_LIBC_ERRNO 14
+#define MANGO_LIBC_STRTOL 15
+#define MANGO_LIBC_COUNT 16
 
 static bool mango_is_arm32_elf(const char* libpath) {
   int fd = open(libpath, O_RDONLY);
@@ -42,8 +99,672 @@ static bool mango_is_arm32_elf(const char* libpath) {
 typedef struct MangoLoadedLibrary {
   uint8_t* file_data;
   uint8_t* guest_mem;
+  uint32_t guest_mem_size;
+  uint32_t jni_env_addr;
+  uint32_t jni_vm_addr;
+  uint32_t libc_thunk_base;
+  uint32_t stack_top;
+  uint32_t heap_base;
+  uint32_t heap_used;
+  uint32_t guest_errno_addr;
+  void* host_vm;
   MangoElf32Image image;
 } MangoLoadedLibrary;
+
+typedef struct MangoJniSlot {
+  MangoLoadedLibrary* lib;
+  uint32_t guest_pc;
+  char shorty[32];
+  char name[64];
+} MangoJniSlot;
+
+static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
+    "malloc", "free",    "memcpy", "memmove", "memset", "memcmp",         "memchr",  "strlen",
+    "strcmp", "strncmp", "strcpy", "abort",   "memmem", "__aeabi_memcpy", "__errno", "strtol",
+};
+
+static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
+static int g_nslots;
+static void* g_handles[MANGO_HANDLE_MAX];
+static uint32_t g_nhandles = 1; /* 0 is JNI NULL */
+
+static uint32_t mango_handle_intern(void* p) {
+  if (p == NULL) {
+    return 0;
+  }
+  for (uint32_t i = 1; i < g_nhandles; i++) {
+    if (g_handles[i] == p) {
+      return i;
+    }
+  }
+  if (g_nhandles >= MANGO_HANDLE_MAX) {
+    return 0;
+  }
+  uint32_t id = g_nhandles++;
+  g_handles[id] = p;
+  return id;
+}
+
+static void* mango_handle_lookup(uint32_t id) {
+  if (id == 0 || id >= g_nhandles) {
+    return NULL;
+  }
+  return g_handles[id];
+}
+
+static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v) {
+  mem[addr] = (uint8_t)(v & 0xFFu);
+  mem[addr + 1] = (uint8_t)((v >> 8) & 0xFFu);
+  mem[addr + 2] = (uint8_t)((v >> 16) & 0xFFu);
+  mem[addr + 3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+/* A32 thunk: ldr r7, [pc, #4]; svc 0; bx lr; .word imm */
+static void mango_write_jni_thunk(uint8_t* mem, uint32_t addr, uint32_t imm) {
+  mango_store_u32_guest(mem, addr, 0xE59F7004u);
+  mango_store_u32_guest(mem, addr + 4u, 0xEF000000u);
+  mango_store_u32_guest(mem, addr + 8u, 0xE12FFF1Eu);
+  mango_store_u32_guest(mem, addr + 12u, imm);
+}
+
+static int mango_setup_guest_jni(MangoLoadedLibrary* lib, uint32_t elf_end) {
+  uint32_t base = (elf_end + 15u) & ~15u;
+  uint32_t vm_table = base + 4u;
+  uint32_t vm_thunks = vm_table + MANGO_JVM_TABLE_LEN * 4u;
+  uint32_t env_ptr = vm_thunks + MANGO_JVM_TABLE_LEN * MANGO_JNI_THUNK_SIZE;
+  uint32_t table = env_ptr + 4u;
+  uint32_t thunks = table + MANGO_JNI_TABLE_LEN * 4u;
+  uint32_t libc_thunks = thunks + MANGO_JNI_TABLE_LEN * MANGO_JNI_THUNK_SIZE;
+  uint32_t heap = libc_thunks + MANGO_LIBC_COUNT * MANGO_JNI_THUNK_SIZE;
+  uint32_t need = heap + MANGO_HEAP_SIZE + MANGO_STACK_SIZE;
+  if ((uint64_t)need > UINT32_MAX) {
+    return -1;
+  }
+  uint8_t* grown = realloc(lib->guest_mem, need);
+  if (!grown) {
+    return -1;
+  }
+  memset(grown + lib->guest_mem_size, 0, need - lib->guest_mem_size);
+  lib->guest_mem = grown;
+  lib->guest_mem_size = need;
+  lib->jni_vm_addr = base;
+  lib->jni_env_addr = env_ptr;
+  lib->libc_thunk_base = libc_thunks;
+  lib->heap_base = heap;
+  lib->heap_used = 4u; /* first word is guest errno */
+  lib->guest_errno_addr = heap;
+  lib->stack_top = need - 16u;
+  lib->host_vm = NULL;
+  mango_store_u32_guest(grown, base, vm_table);
+  for (uint32_t i = 0; i < MANGO_JVM_TABLE_LEN; i++) {
+    uint32_t thunk = vm_thunks + i * MANGO_JNI_THUNK_SIZE;
+    mango_write_jni_thunk(grown, thunk, MANGO_JVM_SVC_BASE + i);
+    mango_store_u32_guest(grown, vm_table + i * 4u, thunk);
+  }
+  mango_store_u32_guest(grown, env_ptr, table);
+  for (uint32_t i = 0; i < MANGO_JNI_TABLE_LEN; i++) {
+    uint32_t thunk = thunks + i * MANGO_JNI_THUNK_SIZE;
+    mango_write_jni_thunk(grown, thunk, MANGO_JNI_SVC_BASE + i);
+    mango_store_u32_guest(grown, table + i * 4u, thunk);
+  }
+  for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
+    mango_write_jni_thunk(grown, libc_thunks + i * MANGO_JNI_THUNK_SIZE, MANGO_LIBC_SVC_BASE + i);
+  }
+  return 0;
+}
+
+static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_value,
+                                     uint32_t st_shndx) {
+  MangoLoadedLibrary* lib = ctx;
+  (void)st_value;
+  (void)st_shndx;
+  if (name == NULL || name[0] == '\0') {
+    return 0;
+  }
+  for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
+    if (strcmp(name, kLibcNames[i]) == 0) {
+      return lib->libc_thunk_base + i * MANGO_JNI_THUNK_SIZE;
+    }
+  }
+  return 0;
+}
+
+static const char* mango_guest_cstr(MangoLoadedLibrary* lib, uint32_t addr) {
+  if (addr == 0 || addr >= lib->guest_mem_size) {
+    return NULL;
+  }
+  uint32_t i = addr;
+  while (i < lib->guest_mem_size) {
+    if (lib->guest_mem[i] == 0) {
+      return (const char*)(lib->guest_mem + addr);
+    }
+    i++;
+  }
+  return NULL;
+}
+
+static uint32_t mango_load_u32_guest(const uint8_t* mem, uint32_t addr) {
+  return (uint32_t)mem[addr] | ((uint32_t)mem[addr + 1u] << 8) | ((uint32_t)mem[addr + 2u] << 16) |
+         ((uint32_t)mem[addr + 3u] << 24);
+}
+
+static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n) {
+  return n == 0 || ((uint64_t)addr + n <= lib->guest_mem_size);
+}
+
+static uint32_t mango_guest_strdup(MangoLoadedLibrary* lib, const char* s) {
+  if (s == NULL) {
+    return 0;
+  }
+  size_t n = strlen(s) + 1;
+  if (lib->heap_used + n > MANGO_HEAP_SIZE) {
+    return 0;
+  }
+  uint32_t addr = lib->heap_base + lib->heap_used;
+  memcpy(lib->guest_mem + addr, s, n);
+  lib->heap_used += (uint32_t)((n + 3u) & ~3u);
+  return addr;
+}
+
+static void mango_jvm_write_env(MangoLoadedLibrary* lib, uint32_t p_env) {
+  if (p_env != 0 && mango_guest_range_ok(lib, p_env, 4u)) {
+    mango_store_u32_guest(lib->guest_mem, p_env, lib->jni_env_addr);
+  }
+}
+
+static void mango_jvm_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
+  (void)lib->host_vm; /* stashed by JNI_OnLoad for a later real Attach */
+  switch (fn) {
+    case MANGO_JVM_ATTACH:
+    case MANGO_JVM_GET_ENV:
+    case MANGO_JVM_ATTACH_DAEMON:
+      mango_jvm_write_env(lib, cpu->r[1]);
+      cpu->r[0] = 0; /* JNI_OK */
+      break;
+    case MANGO_JVM_DESTROY:
+    case MANGO_JVM_DETACH:
+      cpu->r[0] = 0;
+      break;
+    default:
+      cpu->r[0] = (uint32_t)-1;
+      break;
+  }
+}
+
+static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
+  uint32_t r0 = cpu->r[0];
+  uint32_t r1 = cpu->r[1];
+  uint32_t r2 = cpu->r[2];
+  switch (fn) {
+    case MANGO_LIBC_MALLOC: {
+      uint32_t n = (r0 + 7u) & ~7u;
+      if (n == 0) {
+        n = 8u;
+      }
+      if (lib->heap_used + n > MANGO_HEAP_SIZE) {
+        cpu->r[0] = 0;
+      } else {
+        cpu->r[0] = lib->heap_base + lib->heap_used;
+        lib->heap_used += n;
+      }
+      break;
+    }
+    case MANGO_LIBC_FREE:
+      break;
+    case MANGO_LIBC_MEMCPY:
+    case MANGO_LIBC_AEABI_MEMCPY:
+    case MANGO_LIBC_MEMMOVE:
+      if (!mango_guest_range_ok(lib, r0, r2) || !mango_guest_range_ok(lib, r1, r2)) {
+        cpu->r[0] = 0;
+      } else {
+        memmove(lib->guest_mem + r0, lib->guest_mem + r1, r2);
+        cpu->r[0] = r0;
+      }
+      break;
+    case MANGO_LIBC_MEMSET:
+      if (!mango_guest_range_ok(lib, r0, r2)) {
+        cpu->r[0] = 0;
+      } else {
+        memset(lib->guest_mem + r0, (int)(r1 & 0xFFu), r2);
+        cpu->r[0] = r0;
+      }
+      break;
+    case MANGO_LIBC_MEMCMP:
+      if (!mango_guest_range_ok(lib, r0, r2) || !mango_guest_range_ok(lib, r1, r2)) {
+        cpu->r[0] = (uint32_t)-1;
+      } else {
+        cpu->r[0] = (uint32_t)memcmp(lib->guest_mem + r0, lib->guest_mem + r1, r2);
+      }
+      break;
+    case MANGO_LIBC_MEMCHR:
+      if (!mango_guest_range_ok(lib, r0, r2)) {
+        cpu->r[0] = 0;
+      } else {
+        const void* p = memchr(lib->guest_mem + r0, (int)(r1 & 0xFFu), r2);
+        cpu->r[0] = p ? (uint32_t)((const uint8_t*)p - lib->guest_mem) : 0;
+      }
+      break;
+    case MANGO_LIBC_STRLEN: {
+      const char* s = mango_guest_cstr(lib, r0);
+      cpu->r[0] = s ? (uint32_t)strlen(s) : 0;
+      break;
+    }
+    case MANGO_LIBC_STRCMP: {
+      const char* a = mango_guest_cstr(lib, r0);
+      const char* b = mango_guest_cstr(lib, r1);
+      cpu->r[0] = (a && b) ? (uint32_t)strcmp(a, b) : (uint32_t)-1;
+      break;
+    }
+    case MANGO_LIBC_STRNCMP: {
+      const char* a = mango_guest_cstr(lib, r0);
+      const char* b = mango_guest_cstr(lib, r1);
+      cpu->r[0] = (a && b) ? (uint32_t)strncmp(a, b, r2) : (uint32_t)-1;
+      break;
+    }
+    case MANGO_LIBC_STRCPY: {
+      const char* src = mango_guest_cstr(lib, r1);
+      size_t n = src ? strlen(src) + 1u : 0;
+      if (!src || !mango_guest_range_ok(lib, r0, (uint32_t)n)) {
+        cpu->r[0] = 0;
+      } else {
+        memcpy(lib->guest_mem + r0, src, n);
+        cpu->r[0] = r0;
+      }
+      break;
+    }
+    case MANGO_LIBC_MEMMEM: {
+      if (!mango_guest_range_ok(lib, r0, r1) || !mango_guest_range_ok(lib, r2, cpu->r[3])) {
+        cpu->r[0] = 0;
+        break;
+      }
+      /* naive search; memmem is GNU and not in C11 */
+      cpu->r[0] = 0;
+      if (cpu->r[3] == 0) {
+        cpu->r[0] = r0;
+      } else if (r1 >= cpu->r[3]) {
+        for (uint32_t i = 0; i + cpu->r[3] <= r1; i++) {
+          if (memcmp(lib->guest_mem + r0 + i, lib->guest_mem + r2, cpu->r[3]) == 0) {
+            cpu->r[0] = r0 + i;
+            break;
+          }
+        }
+      }
+      break;
+    }
+    case MANGO_LIBC_ERRNO:
+      cpu->r[0] = lib->guest_errno_addr;
+      break;
+    case MANGO_LIBC_STRTOL: {
+      const char* s = mango_guest_cstr(lib, r0);
+      cpu->r[0] = s ? (uint32_t)strtol(s, NULL, (int)r2) : 0;
+      break;
+    }
+    case MANGO_LIBC_ABORT:
+    default:
+      cpu->r[0] = (uint32_t)-1;
+      break;
+  }
+}
+
+static int mango_host_jni_ok(JNIEnv* env) {
+  if (env == NULL || (uintptr_t)env < 4096u) {
+    return 0; /* tests pass a dummy; never dereference it */
+  }
+#if defined(__cplusplus)
+  return 1;
+#else
+  return *(const void* const*)env != NULL;
+#endif
+}
+
+static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, uint32_t fn) {
+  switch (fn) {
+    case MANGO_JNI_GET_VERSION:
+      cpu->r[0] = mango_host_jni_ok(env) ? (uint32_t)(*env)->GetVersion(env) : 0x00010006u;
+      break;
+    case MANGO_JNI_FIND_CLASS: {
+      const char* name = mango_guest_cstr(lib, cpu->r[1]);
+      jobject c = NULL;
+      if (name && mango_host_jni_ok(env)) {
+        c = (*env)->FindClass(env, name);
+      }
+      cpu->r[0] = mango_handle_intern(c);
+      break;
+    }
+    case MANGO_JNI_EXCEPTION_OCCURRED:
+      cpu->r[0] = mango_host_jni_ok(env) ? mango_handle_intern((*env)->ExceptionOccurred(env)) : 0;
+      break;
+    case MANGO_JNI_EXCEPTION_CLEAR:
+      if (mango_host_jni_ok(env)) {
+        (*env)->ExceptionClear(env);
+      }
+      break;
+    case MANGO_JNI_NEW_GLOBAL_REF:
+      cpu->r[0] =
+          mango_host_jni_ok(env)
+              ? mango_handle_intern((*env)->NewGlobalRef(env, mango_handle_lookup(cpu->r[1])))
+              : cpu->r[1];
+      break;
+    case MANGO_JNI_DELETE_LOCAL_REF:
+      if (mango_host_jni_ok(env)) {
+        (*env)->DeleteLocalRef(env, mango_handle_lookup(cpu->r[1]));
+      }
+      break;
+    case MANGO_JNI_IS_SAME_OBJECT:
+      if (mango_host_jni_ok(env)) {
+        cpu->r[0] = (*env)->IsSameObject(env, mango_handle_lookup(cpu->r[1]),
+                                         mango_handle_lookup(cpu->r[2]));
+      } else {
+        cpu->r[0] = cpu->r[1] == cpu->r[2];
+      }
+      break;
+    case MANGO_JNI_GET_OBJECT_CLASS:
+      cpu->r[0] =
+          mango_host_jni_ok(env)
+              ? mango_handle_intern((*env)->GetObjectClass(env, mango_handle_lookup(cpu->r[1])))
+              : 0;
+      break;
+    case MANGO_JNI_GET_METHOD_ID:
+    case MANGO_JNI_GET_STATIC_METHOD_ID: {
+      const char* name = mango_guest_cstr(lib, cpu->r[2]);
+      jmethodID mid = NULL;
+#if defined(__ANDROID__) && !defined(MANGO_FAKE_JNI)
+      const char* sig = mango_guest_cstr(lib, cpu->r[3]);
+      if (name && sig && mango_host_jni_ok(env)) {
+        jclass clazz = mango_handle_lookup(cpu->r[1]);
+        mid = fn == MANGO_JNI_GET_STATIC_METHOD_ID
+                  ? (*env)->GetStaticMethodID(env, clazz, name, sig)
+                  : (*env)->GetMethodID(env, clazz, name, sig);
+      }
+#else
+      (void)fn;
+      if (name) {
+        mid = (jmethodID)(uintptr_t)mango_handle_intern((void*)(uintptr_t)(cpu->r[2] | 1u));
+      }
+#endif
+      cpu->r[0] = mango_handle_intern(mid);
+      break;
+    }
+    case MANGO_JNI_NEW_STRING_UTF: {
+      const char* s = mango_guest_cstr(lib, cpu->r[1]);
+      jobject js = NULL;
+      if (s && mango_host_jni_ok(env)) {
+        js = (*env)->NewStringUTF(env, s);
+      }
+      cpu->r[0] = mango_handle_intern(js);
+      break;
+    }
+    case MANGO_JNI_GET_STRING_UTF_CHARS: {
+      jstring js = mango_handle_lookup(cpu->r[1]);
+      const char* s = NULL;
+      if (js && mango_host_jni_ok(env)) {
+        s = (*env)->GetStringUTFChars(env, js, NULL);
+      }
+      cpu->r[0] = mango_guest_strdup(lib, s ? s : "");
+      if (s && mango_host_jni_ok(env)) {
+        (*env)->ReleaseStringUTFChars(env, js, s);
+      }
+      break;
+    }
+    case MANGO_JNI_RELEASE_STRING_UTF_CHARS:
+      break;
+    case MANGO_JNI_REGISTER_NATIVES: {
+      uint32_t n = cpu->r[3];
+      uint32_t methods = cpu->r[2];
+      if (n > 64u || !mango_guest_range_ok(lib, methods, n * 12u)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      /* Each guest JNINativeMethod is 3x uint32 (name, signature, fnPtr).
+       * Bind each fnPtr as a trampoline slot so ART can call it later. */
+      for (uint32_t i = 0; i < n; i++) {
+        uint32_t name_a = mango_load_u32_guest(lib->guest_mem, methods + i * 12u);
+        uint32_t sig_a = mango_load_u32_guest(lib->guest_mem, methods + i * 12u + 4u);
+        uint32_t fn_a = mango_load_u32_guest(lib->guest_mem, methods + i * 12u + 8u);
+        const char* nm = mango_guest_cstr(lib, name_a);
+        const char* sg = mango_guest_cstr(lib, sig_a);
+        if (g_nslots < MANGO_JNI_SLOTS && fn_a != 0) {
+          int si = g_nslots++;
+          g_slots[si].lib = lib;
+          g_slots[si].guest_pc = fn_a;
+          memset(g_slots[si].shorty, 0, sizeof(g_slots[si].shorty));
+          memset(g_slots[si].name, 0, sizeof(g_slots[si].name));
+          if (nm) {
+            strncpy(g_slots[si].name, nm, sizeof(g_slots[si].name) - 1u);
+          }
+          if (sg) {
+            strncpy(g_slots[si].shorty, sg, sizeof(g_slots[si].shorty) - 1u);
+          }
+        }
+      }
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_JNI_GET_JAVA_VM:
+      if (mango_guest_range_ok(lib, cpu->r[1], 4u)) {
+        mango_store_u32_guest(lib->guest_mem, cpu->r[1], lib->jni_vm_addr);
+      }
+      cpu->r[0] = 0;
+      break;
+    case MANGO_JNI_EXCEPTION_CHECK:
+      cpu->r[0] = mango_host_jni_ok(env) ? (uint32_t)(*env)->ExceptionCheck(env) : 0;
+      break;
+    default:
+      cpu->r[0] = 0;
+      break;
+  }
+}
+
+static int mango_parse_shorty(const char* shorty, char* ret, char* args, uint32_t args_max) {
+  uint32_t n = 0;
+  if (shorty == NULL || shorty[0] == '\0') {
+    return -1;
+  }
+  if (shorty[0] == '(') {
+    const char* p = shorty + 1;
+    while (*p && *p != ')') {
+      if (n + 1 >= args_max) {
+        return -1;
+      }
+      args[n++] = *p++;
+    }
+    if (*p != ')' || p[1] == '\0') {
+      return -1;
+    }
+    *ret = p[1];
+  } else {
+    *ret = shorty[0];
+    const char* p = shorty + 1;
+    while (*p) {
+      if (n + 1 >= args_max) {
+        return -1;
+      }
+      args[n++] = *p++;
+    }
+  }
+  args[n] = 0;
+  return (int)n;
+}
+
+static int mango_is_jni_onload(const MangoJniSlot* slot) {
+  if (strcmp(slot->name, "JNI_OnLoad") == 0 || strcmp(slot->name, "JNI_OnUnload") == 0) {
+    return 1;
+  }
+  return slot->shorty[0] == 'I' && slot->shorty[1] == 'L' && slot->shorty[2] == '\0';
+}
+
+static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
+  MangoLoadedLibrary* lib = slot->lib;
+  char ret = 'V';
+  char args[24];
+  int nargs = mango_parse_shorty(slot->shorty, &ret, args, sizeof(args));
+  if (nargs < 0) {
+    return 0;
+  }
+
+  uint32_t regs[4];
+  uint32_t stack[16];
+  uint32_t nstack = 0;
+  uint32_t nreg = 2; /* r0 env/vm, r1 thiz/reserved */
+  int onload = mango_is_jni_onload(slot);
+  if (onload) {
+    lib->host_vm = env; /* ART calls JNI_OnLoad(JavaVM*, void*) */
+    regs[0] = lib->jni_vm_addr;
+    (void)va_arg(ap, void*); /* reserved, typically NULL */
+    regs[1] = 0;
+    nargs = 0; /* JavaVM* / reserved are not JNIEnv method args */
+  } else {
+    jobject thiz = va_arg(ap, jobject);
+    regs[0] = lib->jni_env_addr;
+    regs[1] = mango_handle_intern(thiz);
+  }
+
+  for (int i = 0; i < nargs; i++) {
+    char t = args[i];
+    uint32_t lo, hi = 0;
+    int wide = 0;
+    if (t == 'J' || t == 'D') {
+      jlong v = va_arg(ap, jlong);
+      lo = (uint32_t)v;
+      hi = (uint32_t)(v >> 32);
+      wide = 1;
+    } else if (t == 'F') {
+      double d = va_arg(ap, double); /* float promotes */
+      union {
+        float f;
+        uint32_t u;
+      } u;
+      u.f = (float)d;
+      lo = u.u;
+    } else if (t == 'L' || t == '[') {
+      lo = mango_handle_intern(va_arg(ap, jobject));
+    } else {
+      lo = (uint32_t)va_arg(ap, int);
+    }
+    if (wide && (nreg & 1u)) {
+      nreg++; /* AAPCS 8-byte align */
+    }
+    if (nreg < 4u) {
+      regs[nreg++] = lo;
+      if (wide) {
+        if (nreg < 4u) {
+          regs[nreg++] = hi;
+        } else if (nstack + 1u < 16u) {
+          stack[nstack++] = hi;
+        }
+      }
+    } else if (nstack < 16u) {
+      stack[nstack++] = lo;
+      if (wide && nstack < 16u) {
+        stack[nstack++] = hi;
+      }
+    }
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[0] = regs[0];
+  cpu.r[1] = regs[1];
+  cpu.r[2] = nreg > 2 ? regs[2] : 0;
+  cpu.r[3] = nreg > 3 ? regs[3] : 0;
+  cpu.r[MANGO_REG_SP] = lib->stack_top - nstack * 4u;
+  cpu.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  uint32_t pc = slot->guest_pc;
+  if (pc & 1u) {
+    cpu.cpsr = MANGO_CPSR_T;
+    pc &= ~1u;
+  }
+  cpu.r[MANGO_REG_PC] = pc;
+  for (uint32_t i = 0; i < nstack; i++) {
+    mango_store_u32_guest(lib->guest_mem, cpu.r[MANGO_REG_SP] + i * 4u, stack[i]);
+  }
+
+  MangoMemory mem = {lib->guest_mem, lib->guest_mem_size};
+  for (;;) {
+    int rc = mango_interp_run(&cpu, &mem, MANGO_JNI_STOP, 1000000u);
+    if (rc == 0) {
+      break;
+    }
+    if (rc != 1) {
+      return 0;
+    }
+    uint32_t nr = cpu.r[7];
+    if (nr >= MANGO_JNI_SVC_BASE && nr < MANGO_JNI_SVC_BASE + MANGO_JNI_TABLE_LEN) {
+      mango_jni_svc(lib, &cpu, env, nr - MANGO_JNI_SVC_BASE);
+    } else if (nr >= MANGO_JVM_SVC_BASE && nr < MANGO_JVM_SVC_BASE + MANGO_JVM_TABLE_LEN) {
+      mango_jvm_svc(lib, &cpu, nr - MANGO_JVM_SVC_BASE);
+    } else if (nr >= MANGO_LIBC_SVC_BASE && nr < MANGO_LIBC_SVC_BASE + MANGO_LIBC_COUNT) {
+      mango_libc_svc(lib, &cpu, nr - MANGO_LIBC_SVC_BASE);
+    } else {
+      cpu.r[0] = (uint32_t)-1;
+    }
+    cpu.r[MANGO_REG_PC] += (cpu.cpsr & MANGO_CPSR_T) ? 2u : 4u;
+  }
+
+  if (ret == 'J' || ret == 'D') {
+    return (intptr_t)(((uint64_t)cpu.r[1] << 32) | cpu.r[0]);
+  }
+  if (ret == 'L' || ret == '[') {
+    return (intptr_t)mango_handle_lookup(cpu.r[0]);
+  }
+  return (intptr_t)(int32_t)cpu.r[0];
+}
+
+#define MANGO_SLOT_FN(n)                                 \
+  static intptr_t mango_jni_slot_##n(JNIEnv* env, ...) { \
+    va_list ap;                                          \
+    va_start(ap, env);                                   \
+    intptr_t r = mango_jni_invoke(&g_slots[n], env, ap); \
+    va_end(ap);                                          \
+    return r;                                            \
+  }
+
+MANGO_SLOT_FN(0)
+MANGO_SLOT_FN(1)
+MANGO_SLOT_FN(2)
+MANGO_SLOT_FN(3)
+MANGO_SLOT_FN(4)
+MANGO_SLOT_FN(5)
+MANGO_SLOT_FN(6)
+MANGO_SLOT_FN(7)
+MANGO_SLOT_FN(8)
+MANGO_SLOT_FN(9)
+MANGO_SLOT_FN(10)
+MANGO_SLOT_FN(11)
+MANGO_SLOT_FN(12)
+MANGO_SLOT_FN(13)
+MANGO_SLOT_FN(14)
+MANGO_SLOT_FN(15)
+MANGO_SLOT_FN(16)
+MANGO_SLOT_FN(17)
+MANGO_SLOT_FN(18)
+MANGO_SLOT_FN(19)
+MANGO_SLOT_FN(20)
+MANGO_SLOT_FN(21)
+MANGO_SLOT_FN(22)
+MANGO_SLOT_FN(23)
+MANGO_SLOT_FN(24)
+MANGO_SLOT_FN(25)
+MANGO_SLOT_FN(26)
+MANGO_SLOT_FN(27)
+MANGO_SLOT_FN(28)
+MANGO_SLOT_FN(29)
+MANGO_SLOT_FN(30)
+MANGO_SLOT_FN(31)
+
+static void* const g_slot_fns[MANGO_JNI_SLOTS] = {
+    (void*)mango_jni_slot_0,  (void*)mango_jni_slot_1,  (void*)mango_jni_slot_2,
+    (void*)mango_jni_slot_3,  (void*)mango_jni_slot_4,  (void*)mango_jni_slot_5,
+    (void*)mango_jni_slot_6,  (void*)mango_jni_slot_7,  (void*)mango_jni_slot_8,
+    (void*)mango_jni_slot_9,  (void*)mango_jni_slot_10, (void*)mango_jni_slot_11,
+    (void*)mango_jni_slot_12, (void*)mango_jni_slot_13, (void*)mango_jni_slot_14,
+    (void*)mango_jni_slot_15, (void*)mango_jni_slot_16, (void*)mango_jni_slot_17,
+    (void*)mango_jni_slot_18, (void*)mango_jni_slot_19, (void*)mango_jni_slot_20,
+    (void*)mango_jni_slot_21, (void*)mango_jni_slot_22, (void*)mango_jni_slot_23,
+    (void*)mango_jni_slot_24, (void*)mango_jni_slot_25, (void*)mango_jni_slot_26,
+    (void*)mango_jni_slot_27, (void*)mango_jni_slot_28, (void*)mango_jni_slot_29,
+    (void*)mango_jni_slot_30, (void*)mango_jni_slot_31,
+};
 
 static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_cbs,
                              const char* private_dir, const char* instruction_set) {
@@ -118,37 +839,50 @@ static void* mango_load_library(const char* libpath, int flag) {
   }
   lib->file_data = file_data;
   lib->guest_mem = guest_mem;
+  lib->guest_mem_size = (uint32_t)guest_mem_size;
   lib->image = image;
+  if (mango_setup_guest_jni(lib, (uint32_t)guest_mem_size) != 0) {
+    free(lib->file_data);
+    free(lib->guest_mem);
+    free(lib);
+    return NULL;
+  }
+  if (mango_elf32_apply_relocs(&lib->image, lib->guest_mem, lib->guest_mem_size, 0,
+                               mango_resolve_import, lib) != 0) {
+    free(lib->file_data);
+    free(lib->guest_mem);
+    free(lib);
+    return NULL;
+  }
   return lib;
 }
 
-static void* mango_generic_jni_stub(JNIEnv* env, jobject thiz, ...);
-
 static void* mango_get_trampoline(void* handle, const char* name, const char* shorty,
                                   uint32_t len) {
-  (void)shorty;
   (void)len;
   MangoLoadedLibrary* lib = handle;
+  if (!lib || name == NULL) {
+    return NULL;
+  }
   uint32_t addr = mango_elf32_find_symbol(&lib->image, name);
   if (addr == 0) {
-    return NULL; /* not exported by this library at all */
+    return NULL;
   }
-  /* Guest PC is real (offset into lib->guest_mem). ART needs an AArch64
-   * function pointer it can call as a JNI native method. A per-shorty
-   * generated stub that drives mango_interp_run is still TODO; until then
-   * every resolved symbol shares one inert stub so ART can bind natives
-   * without treating the bridge as missing. */
-  (void)addr;
-  (void)lib;
-  return (void*)(uintptr_t)mango_generic_jni_stub;
-}
-
-/* JNI native methods are called as (JNIEnv*, jobject, ...). Extra args are
- * ignored; return 0 / NULL. Guest execution is not wired through here yet. */
-static void* mango_generic_jni_stub(JNIEnv* env, jobject thiz, ...) {
-  (void)env;
-  (void)thiz;
-  return NULL;
+  if (g_nslots >= MANGO_JNI_SLOTS) {
+    return NULL;
+  }
+  int i = g_nslots++;
+  g_slots[i].lib = lib;
+  g_slots[i].guest_pc = addr;
+  memset(g_slots[i].shorty, 0, sizeof(g_slots[i].shorty));
+  memset(g_slots[i].name, 0, sizeof(g_slots[i].name));
+  strncpy(g_slots[i].name, name, sizeof(g_slots[i].name) - 1u);
+  if (shorty) {
+    strncpy(g_slots[i].shorty, shorty, sizeof(g_slots[i].shorty) - 1u);
+  } else {
+    g_slots[i].shorty[0] = 'V';
+  }
+  return g_slot_fns[i];
 }
 
 static bool mango_is_supported(const char* libpath) { return mango_is_arm32_elf(libpath); }
