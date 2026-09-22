@@ -80,7 +80,7 @@ synthetic programs, not real app code yet.
   `BFC`/`BFI`/`UBFX`/`SBFX`, `RBIT`/`REV`/`REV16`/`REVSH`,
   `UXTB`/`UXTH`/`SXTB`/`SXTH` (and `*TA*` accumulate), `PKHBT`/`PKHTB`,
   `VMOV` between an S register and a GPR, VFP single `VADD`/`VSUB`/`VMUL`/
-  `VDIV`/`VCMP`, `VCVT.F32.F64`, dummy JNI `Call*Method`/`Get*Field`
+  `VDIV`/`VCMP`, `VCVT.F32.F64`/`VCVT.S32.F64`/`VCVT.S32.F32`, dummy JNI `Call*Method`/`Get*Field`
   returning interned objects, and EGL init/create/query thunks. Guest JNI
   slots are cleared on `unloadLibrary`.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,

@@ -872,6 +872,12 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             uint32_t u;
             memcpy(&u, &f, 4);
             cpu->s[insn.rd & 31u] = u;
+          } else if (insn.imm == 6 || insn.imm == 7) {
+            double d = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
+            cpu->s[insn.rd & 31u] = insn.imm == 6 ? (uint32_t)(int32_t)d : (uint32_t)d;
+          } else if (insn.imm == 8) {
+            uint32_t u = cpu->s[insn.rn & 31u];
+            mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64((double)u));
           } else {
             int32_t si = (int32_t)cpu->s[insn.rn & 31u];
             mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64((double)si));

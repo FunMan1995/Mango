@@ -282,12 +282,29 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       out->imm = esize;
       return 0;
     }
-    if (dbl && ((word >> 16) & 0xFFu) == 0xF8u && ((word >> 4) & 0xDu) == 0xCu) {
+    if (dbl && ((word >> 16) & 0xBFu) == 0xB8u && ((word >> 4) & 0xDu) == 0xCu) {
       out->op = MANGO_OP_VCVT; /* vcvt.f64.s32 Dd, Sm */
       out->rd = (dbit << 4) | vd;
       out->rn = (vm << 1) | mbit;
       out->imm = 0;
       return 0;
+    }
+    if (dbl && ((word >> 16) & 0xBFu) == 0xB8u && ((word >> 4) & 0xDu) == 0x4u) {
+      out->op = MANGO_OP_VCVT; /* vcvt.f64.u32 Dd, Sm */
+      out->rd = (dbit << 4) | vd;
+      out->rn = (vm << 1) | mbit;
+      out->imm = 8;
+      return 0;
+    }
+    if (dbl && ((word >> 4) & 0xDu) == 0xCu) {
+      uint32_t opc8 = (word >> 16) & 0xBFu;
+      if (opc8 == 0xBDu || opc8 == 0xBCu) {
+        out->op = MANGO_OP_VCVT; /* s32/u32.f64 Sd, Dm */
+        out->rd = (vd << 1) | dbit;
+        out->rm = (mbit << 4) | vm;
+        out->imm = opc8 == 0xBDu ? 6u : 7u;
+        return 0;
+      }
     }
     if (!dbl && ((word >> 4) & 0xDu) == 0xCu) {
       uint32_t opc8 = (word >> 16) & 0xBFu;

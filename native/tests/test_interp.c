@@ -2587,6 +2587,31 @@ static int test_vcvt_s32_f32(void) {
   return 0;
 }
 
+static int test_vcvt_s32_f64(void) {
+  static const uint32_t kProgram[] = {
+      0xEEBD0BC0u, /* vcvt.s32.f64 s0, d0 */
+      0xEEBD1BE0u, /* vcvt.s32.f64 s2, d16 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[0] = 0;
+  cpu.s[1] = 0x40000000u; /* d0 = 2.0 */
+  cpu.s[32] = 0;
+  cpu.s[33] = 0x40080000u; /* d16 = 3.0 */
+  cpu.r[MANGO_REG_LR] = 0xFFFFu;
+  int rc = mango_interp_run(&cpu, &mem, 0xFFFFu, 100);
+  if (rc != 0 || cpu.s[0] != 2u || cpu.s[2] != 3u) {
+    fprintf(stderr, "FAIL(vcvt_s32_f64): rc=%d s0=%u s2=%u\n", rc, cpu.s[0], cpu.s[2]);
+    return 1;
+  }
+  printf("ok: VCVT.S32.F64 s0,d0 and s2,d16\n");
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2656,6 +2681,7 @@ int main(void) {
   failures += test_vcmpe_f32_zero();
   failures += test_vadd_f32();
   failures += test_vcvt_s32_f32();
+  failures += test_vcvt_s32_f64();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);
