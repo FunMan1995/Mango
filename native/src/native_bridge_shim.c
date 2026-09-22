@@ -1665,6 +1665,14 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  * 0x4000000. Seed an empty tree at obj+0x40, redirect ctor VA 0x87fa84's Unity
  * alloc onto that BSS tree (so method pointers still install), and disable
  * reset VA 0x87fb30 which would free/clear obj+4.
+ *
+ * nativeRender label lookup at VA 0x104ce8 can legitimately return NULL (two
+ * sibling call sites null-check; the site at VA 0x103f54 does not). A NULL
+ * result then does ldr r1,[r0] / ldr r2,[r1,#0x1c] / blx r2, so guest[0]
+ * (0xffffff from earlier NULL stores) is treated as a vtable and slot +0x1c
+ * (0x82ec07ee, a VFP word mid-image) becomes the branch target — PC far above
+ * the 40 MiB guest AS. Redirect that site through a trampoline that skips the
+ * virtual call when the lookup returns NULL (same as the sibling sites).
  */
 static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
   const char* base;
@@ -1758,6 +1766,41 @@ static void mango_seed_ofdp_hash_tree(MangoLoadedLibrary* lib) {
       mango_load_u32_guest(lib->guest_mem, dtor) == 0xe92d4830u) {
     mango_store_u32_guest(lib->guest_mem, dtor, 0xe12fff1eu); /* bx lr */
   }
+}
+
+static uint32_t mango_arm_b(uint32_t from, uint32_t to, uint32_t cond) {
+  int32_t imm24 = (int32_t)(to - from - 8u) / 4;
+  return (cond << 28) | 0x0a000000u | ((uint32_t)imm24 & 0x00ffffffu);
+}
+
+static void mango_patch_ofdp_label_lookup_null(MangoLoadedLibrary* lib) {
+  uint32_t site, cont, tramp;
+  if (!mango_is_ofdp_unity(lib)) {
+    return;
+  }
+  /* VA 0x103f54: ldr r1,[r0]; ldr r2,[r1,#0x1c]; mov r1,r5; blx r2 */
+  site = lib->load_bias + 0x103f54u;
+  cont = lib->load_bias + 0x103f70u; /* mov r0, r8 — after cmp/movlo */
+  /* Unused BSS just past the Hash128 tree carve (obj 0x12d7fa0 + 0x58). */
+  tramp = lib->load_bias + 0x12d8020u;
+  if (!mango_guest_range_ok(lib, site, 16u) || !mango_guest_range_ok(lib, tramp, 40u)) {
+    return;
+  }
+  if (mango_load_u32_guest(lib->guest_mem, site) != 0xe5901000u ||
+      mango_load_u32_guest(lib->guest_mem, site + 4u) != 0xe591201cu) {
+    return;
+  }
+  /* trampoline: null-check r0 then same vtable call + min into r4; else leave r4 */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x00u, 0xe3500000u); /* cmp r0, #0 */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x04u, mango_arm_b(tramp + 0x04u, cont, 0x0u)); /* beq cont */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x08u, 0xe5901000u); /* ldr r1, [r0] */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x0cu, 0xe591201cu); /* ldr r2, [r1, #0x1c] */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x10u, 0xe1a01005u); /* mov r1, r5 */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x14u, 0xe12fff32u); /* blx r2 */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x18u, 0xe1500004u); /* cmp r0, r4 */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x1cu, 0x31a04000u); /* movlo r4, r0 */
+  mango_store_u32_guest(lib->guest_mem, tramp + 0x20u, mango_arm_b(tramp + 0x20u, cont, 0xeu)); /* b cont */
+  mango_store_u32_guest(lib->guest_mem, site, mango_arm_b(site, tramp, 0xeu)); /* b tramp */
 }
 
 static int mango_run_ctor(MangoLoadedLibrary* lib, uint32_t pc) {
@@ -1909,6 +1952,7 @@ static void* mango_load_library(const char* libpath, int flag) {
   mango_run_constructors(lib);
   mango_seed_ofdp_memory_manager(lib);
   mango_seed_ofdp_hash_tree(lib);
+  mango_patch_ofdp_label_lookup_null(lib);
   return lib;
 }
 
