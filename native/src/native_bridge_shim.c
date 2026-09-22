@@ -1064,7 +1064,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     case MANGO_LIBC_AEABI_MEMSET:
       /* dest, n, c — not the C memset order */
-      if (!mango_guest_range_ok(lib, r0, r1)) {
+      if (r0 == 0 || !mango_guest_range_ok(lib, r0, r1)) {
         cpu->r[0] = 0;
       } else {
         memset(lib->guest_mem + r0, (int)(r2 & 0xFFu), r1);
@@ -1653,16 +1653,25 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  *
  * Also the keyword/shader tree header at BSS 0x12d3d80 needs an empty-tree
  * sentinel so nativeRender's first insert does not pass a NULL node pointer.
+ *
+ * After constructors, MemoryManager at BSS 0x12c1630 has list1 empty but list2
+ * head/sentinel at +0x30/+0x34 left 0. Contains() then walks address 0 as a
+ * node; [0+4] holds a label pointer into "ALLOC_TEMP_THREAD", whose +4 word
+ * is ASCII "C_TE" and OOB-loads as a next pointer.
  */
-static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
+static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
   const char* base;
-  uint32_t alloc_fn, hdr, sen;
   if (lib == NULL || lib->path[0] == '\0') {
-    return;
+    return 0;
   }
   base = strrchr(lib->path, '/');
   base = base ? base + 1 : lib->path;
-  if (strcmp(base, "libunity.so") != 0) {
+  return strcmp(base, "libunity.so") == 0;
+}
+
+static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
+  uint32_t alloc_fn, hdr, sen;
+  if (!mango_is_ofdp_unity(lib)) {
     return;
   }
   alloc_fn = lib->load_bias + 0x102b78u;
@@ -1682,6 +1691,24 @@ static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
   mango_store_u32_guest(lib->guest_mem, hdr + 0x20u, sen);
   mango_store_u32_guest(lib->guest_mem, sen + 0x8u, 0u);
   mango_store_u32_guest(lib->guest_mem, sen + 0xcu, sen + 0x4u);
+}
+
+static void mango_seed_ofdp_memory_manager(MangoLoadedLibrary* lib) {
+  uint32_t mm, sen;
+  if (!mango_is_ofdp_unity(lib)) {
+    return;
+  }
+  mm = lib->load_bias + 0x12c1630u;
+  if (!mango_guest_range_ok(lib, mm, 0x50u)) {
+    return;
+  }
+  /* Match list1 empty shape (head == sentinel == &embedded). Ctors leave list2
+   * at +0x30/+0x34 as 0, which Contains() treats as a node at address 0. */
+  if (mango_load_u32_guest(lib->guest_mem, mm + 0x34u) == 0u) {
+    sen = mm + 0x30u;
+    mango_store_u32_guest(lib->guest_mem, mm + 0x30u, sen);
+    mango_store_u32_guest(lib->guest_mem, mm + 0x34u, sen);
+  }
 }
 
 static int mango_run_ctor(MangoLoadedLibrary* lib, uint32_t pc) {
@@ -1831,6 +1858,7 @@ static void* mango_load_library(const char* libpath, int flag) {
   }
   mango_patch_ofdp_unity(lib);
   mango_run_constructors(lib);
+  mango_seed_ofdp_memory_manager(lib);
   return lib;
 }
 

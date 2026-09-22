@@ -217,6 +217,7 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   `libmono.so`. Dummy `FindClass` lets Unity `RegisterNatives` bind
   `nativeRender` / `nativePause` / `initJni` and the rest. OFDP
   `libunity.so` routes the internal MemoryManager allocator (VA
-  `0x102b78`) to guest `malloc` and seeds the keyword-tree sentinel so
-  `nativeRender` does not memcpy into address 0 / OOB on ASCII `NAL_`.
-  Host `Call*Method` and real GLES are still open.
+  `0x102b78`) to guest `malloc`, seeds the keyword-tree sentinel, and
+  after constructors seeds MemoryManager list2 (BSS `0x12c1630`) so
+  `nativeRender` does not OOB on ASCII `NAL_` / `C_TE` from a NULL list
+  walk. Host `Call*Method` and real GLES are still open.
