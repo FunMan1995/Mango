@@ -1150,6 +1150,13 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
         }
 
+        case MANGO_OP_SMMUL: {
+          int64_t a = (int32_t)mango_read_reg(cpu, addr, insn.rn);
+          int64_t b = (int32_t)mango_read_reg(cpu, addr, insn.rm);
+          cpu->r[insn.rd] = (uint32_t)((a * b) >> 32);
+          break;
+        }
+
         case MANGO_OP_PKH: {
           uint32_t n = mango_read_reg(cpu, addr, insn.rn);
           uint32_t m = mango_read_reg(cpu, addr, insn.rm);

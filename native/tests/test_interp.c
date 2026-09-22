@@ -2612,6 +2612,68 @@ static int test_vcvt_s32_f64(void) {
   return 0;
 }
 
+static int test_vmov_f32_imm_and_smmul(void) {
+  static const uint32_t kVmov[] = {
+      0xF2C70F50u, /* vmov.f32 q8, #1.0 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[64];
+  load_words(mem_buf, sizeof(mem_buf), kVmov, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0 || cpu.s[32] != 0x3F800000u || cpu.s[33] != 0x3F800000u) {
+    fprintf(stderr, "FAIL(vmov_f32_imm): rc=%d s32=0x%x\n", rc, cpu.s[32]);
+    return 1;
+  }
+
+  static const uint32_t kSmmul[] = {
+      0xE3A01801u, /* mov r1, #0x10000 */
+      0xE1A02001u, /* mov r2, r1 */
+      0xE750F112u, /* smmul r0, r2, r1 */
+      0xE12FFF1Eu,
+  };
+  load_words(mem_buf, sizeof(mem_buf), kSmmul, 4);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0 || cpu.r[0] != 1u) {
+    fprintf(stderr, "FAIL(smmul): rc=%d r0=%u\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: VMOV.F32 q8,#1.0 and SMMUL\n");
+  return 0;
+}
+
+static int test_strexd(void) {
+  static const uint32_t kProg[] = {
+      0xE3A00040u, /* mov r0, #64 */
+      0xE3A02011u, /* mov r2, #17 */
+      0xE3A03022u, /* mov r3, #34 */
+      0xE1A01F92u, /* strexd r1, r2, r3, [r0] */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProg, 5);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0xDEADu;
+  int rc = mango_interp_run(&cpu, &mem, 0xDEADu, 100);
+  uint32_t lo = (uint32_t)mem_buf[64] | ((uint32_t)mem_buf[65] << 8) | ((uint32_t)mem_buf[66] << 16) |
+                ((uint32_t)mem_buf[67] << 24);
+  uint32_t hi = (uint32_t)mem_buf[68] | ((uint32_t)mem_buf[69] << 8) | ((uint32_t)mem_buf[70] << 16) |
+                ((uint32_t)mem_buf[71] << 24);
+  if (rc != 0 || cpu.r[1] != 0 || lo != 17u || hi != 34u) {
+    fprintf(stderr, "FAIL(strexd): rc=%d r1=%u lo=%u hi=%u\n", rc, cpu.r[1], lo, hi);
+    return 1;
+  }
+  printf("ok: STREXD r1, r2, r3, [r0]\n");
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2682,6 +2744,8 @@ int main(void) {
   failures += test_vadd_f32();
   failures += test_vcvt_s32_f32();
   failures += test_vcvt_s32_f64();
+  failures += test_vmov_f32_imm_and_smmul();
+  failures += test_strexd();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

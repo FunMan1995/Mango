@@ -7,9 +7,12 @@
 #define MANGO_PF_X 1u
 #define MANGO_SHT_DYNSYM 11u
 #define MANGO_DT_PLTRELSZ 2u
+#define MANGO_DT_INIT 12u
 #define MANGO_DT_REL 17u
 #define MANGO_DT_RELSZ 18u
 #define MANGO_DT_JMPREL 23u
+#define MANGO_DT_INIT_ARRAY 25u
+#define MANGO_DT_INIT_ARRAYSZ 27u
 
 static int read_u16(const uint8_t* data, uint32_t size, uint32_t off, uint16_t* out) {
   if (off + 2 > size) {
@@ -98,6 +101,12 @@ int mango_elf32_parse(const uint8_t* data, uint32_t size, uint16_t expected_mach
           out->jmprel_vaddr = val;
         } else if (tag == MANGO_DT_PLTRELSZ) {
           out->jmprel_size = val;
+        } else if (tag == MANGO_DT_INIT) {
+          out->init_fn = val;
+        } else if (tag == MANGO_DT_INIT_ARRAY) {
+          out->init_array_vaddr = val;
+        } else if (tag == MANGO_DT_INIT_ARRAYSZ) {
+          out->init_array_size = val;
         }
       }
       continue;

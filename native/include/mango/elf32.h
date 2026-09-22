@@ -34,6 +34,9 @@ typedef struct MangoElf32Image {
   uint32_t rel_size;
   uint32_t jmprel_vaddr; /* DT_JMPREL */
   uint32_t jmprel_size;
+  uint32_t init_fn; /* DT_INIT vaddr, 0 if none */
+  uint32_t init_array_vaddr;
+  uint32_t init_array_size;
 } MangoElf32Image;
 
 /* Resolve an imported (UND) symbol to a guest address. Defined symbols

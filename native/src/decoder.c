@@ -16,17 +16,24 @@ static void mango_insn_clear(MangoInsn* out) {
   out->op = MANGO_OP_UNKNOWN;
 }
 
-/* NEON VMOV.I* imm8 → 64-bit D-lane pattern (repeated across Q). */
+/* NEON VMOV.I* / VMOV.F32 imm8 → 64-bit D-lane pattern (repeated across Q). */
 static int mango_neon_expand_imm(uint32_t cmode, uint32_t op, uint32_t imm8, uint64_t* out) {
-  if (op != 0) {
-    return -1;
-  }
-  if (cmode <= 0x3u) {
-    uint32_t w = imm8 << ((cmode & 3u) * 8u);
+  if (op == 0 && (cmode & 1u) == 0 && cmode <= 0x6u) {
+    uint32_t w = imm8 << ((cmode >> 1) * 8u);
     *out = (uint64_t)w | ((uint64_t)w << 32);
     return 0;
   }
-  if (cmode == 0x8u) {
+  if (op == 0 && cmode == 0x8u) {
+    uint32_t w = imm8 | (imm8 << 16);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+    return 0;
+  }
+  if (op == 0 && cmode == 0xAu) {
+    uint32_t w = (imm8 << 8) | (imm8 << 24);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+    return 0;
+  }
+  if (op == 0 && cmode == 0xEu) {
     uint64_t p = 0;
     for (uint32_t i = 0; i < 8u; i++) {
       p |= (uint64_t)imm8 << (8u * i);
@@ -34,7 +41,14 @@ static int mango_neon_expand_imm(uint32_t cmode, uint32_t op, uint32_t imm8, uin
     *out = p;
     return 0;
   }
-  if (cmode == 0xEu) {
+  if (op == 0 && cmode == 0xFu) {
+    uint32_t b = (imm8 >> 6) & 1u;
+    uint32_t w = ((imm8 & 0x80u) << 24) | ((1u - b) << 30) | (b ? 0x3E000000u : 0) |
+                 ((imm8 & 0x3Fu) << 19);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+    return 0;
+  }
+  if (op == 1 && cmode == 0xEu) {
     uint64_t p = 0;
     for (uint32_t i = 0; i < 8u; i++) {
       if (imm8 & (1u << i)) {
@@ -416,8 +430,11 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     if (rn == MANGO_REG_PC || rd == MANGO_REG_PC || (!load && rt == MANGO_REG_PC)) {
       return -1;
     }
-    if (size == 1u && (rd & 1u)) {
-      return -1; /* LDREXD/STREXD pair must be even */
+    {
+      uint32_t pair = load ? rd : rt;
+      if (size == 1u && (pair & 1u)) {
+        return -1; /* LDREXD/STREXD data pair must be even */
+      }
     }
     out->op = load ? MANGO_OP_LDREX : MANGO_OP_STREX;
     out->rn = rn;
@@ -460,6 +477,21 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     uint32_t msb = (word >> 16) & 0x1Fu;
     uint32_t rn = word & 0xF;
     uint32_t op2 = (word >> 4) & 7u;
+    /* SMMUL Rd, Rn, Rm: 0111 0101 Rd 1111 Rm 0001 00 Rn. Ra(15:12)=1111. */
+    if (((word >> 20) & 0xF) == 0x5 && ((word >> 12) & 0xF) == 0xF &&
+        ((word >> 4) & 0x9) == 0x1) {
+      uint32_t d = (word >> 16) & 0xF;
+      uint32_t n = word & 0xF;
+      uint32_t m = (word >> 8) & 0xF;
+      if (d == MANGO_REG_PC || n == MANGO_REG_PC || m == MANGO_REG_PC) {
+        return -1;
+      }
+      out->op = MANGO_OP_SMMUL;
+      out->rd = d;
+      out->rn = n;
+      out->rm = m;
+      return 0;
+    }
     if (rd == MANGO_REG_PC) {
       return -1;
     }

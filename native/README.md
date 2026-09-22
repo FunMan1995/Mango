@@ -81,8 +81,10 @@ synthetic programs, not real app code yet.
   `UXTB`/`UXTH`/`SXTB`/`SXTH` (and `*TA*` accumulate), `PKHBT`/`PKHTB`,
   `VMOV` between an S register and a GPR, VFP single `VADD`/`VSUB`/`VMUL`/
   `VDIV`/`VCMP`, `VCVT.F32.F64`/`VCVT.S32.F64`/`VCVT.S32.F32`, dummy JNI `Call*Method`/`Get*Field`
-  returning interned objects, and EGL init/create/query thunks. Guest JNI
-  slots are cleared on `unloadLibrary`.
+  returning interned objects, EGL init/create/query thunks, and
+  `pthread_key_create`/`getspecific`/`setspecific` TLS. `loadLibrary`
+  runs `DT_INIT` / `DT_INIT_ARRAY` after relocs so C++ globals construct.
+  Guest JNI slots are cleared on `unloadLibrary`.
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/

@@ -140,7 +140,12 @@
 #define MANGO_LIBC_EGL_CONTEXT 60
 #define MANGO_LIBC_EGL_QUERY 61
 #define MANGO_LIBC_ANW_FROM 62
-#define MANGO_LIBC_COUNT 63
+#define MANGO_LIBC_PTHREAD_KEY_CREATE 63
+#define MANGO_LIBC_PTHREAD_GETSPECIFIC 64
+#define MANGO_LIBC_PTHREAD_SETSPECIFIC 65
+#define MANGO_LIBC_PTHREAD_KEY_DELETE 66
+#define MANGO_LIBC_COUNT 67
+#define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x2800000u
 #define MANGO_LIB_CAP 0x2000000u
@@ -261,6 +266,10 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "eglCreateContext",
     "eglQueryString",
     "ANativeWindow_fromSurface",
+    "pthread_key_create",
+    "pthread_getspecific",
+    "pthread_setspecific",
+    "pthread_key_delete",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -274,6 +283,9 @@ static uint32_t g_as_size;
 static uint32_t g_as_next;
 static uint32_t g_as_jni_ready;
 static char g_dlerror[128];
+static uint32_t g_tsd[MANGO_TSD_KEYS];
+static uint32_t g_nkeys = 1; /* key 0 is invalid, matching glibc */
+static uint32_t g_nested_sp;
 static const char kCpuInfo[] =
     "Processor\t: ARMv7 Processor rev 1 (v7l)\n"
     "Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt\n"
@@ -721,7 +733,10 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         snprintf(path, sizeof(path), "%s", nm);
       }
       {
+        uint32_t saved_sp = g_nested_sp;
+        g_nested_sp = cpu->r[MANGO_REG_SP];
         void* h = mango_load_library(path, (int)r1);
+        g_nested_sp = saved_sp;
         uint32_t id = 0;
         if (h) {
           for (int i = 0; i < g_nlibs; i++) {
@@ -883,6 +898,33 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       }
       break;
     case MANGO_LIBC_CLOSE:
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_PTHREAD_KEY_CREATE:
+      if (!mango_guest_range_ok(lib, r0, 4u) || g_nkeys >= MANGO_TSD_KEYS) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      mango_store_u32_guest(lib->guest_mem, r0, g_nkeys);
+      g_tsd[g_nkeys] = 0;
+      g_nkeys++;
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_PTHREAD_GETSPECIFIC:
+      cpu->r[0] = (r0 > 0 && r0 < g_nkeys) ? g_tsd[r0] : 0;
+      break;
+    case MANGO_LIBC_PTHREAD_SETSPECIFIC:
+      if (r0 == 0 || r0 >= g_nkeys) {
+        cpu->r[0] = (uint32_t)-1;
+      } else {
+        g_tsd[r0] = r1;
+        cpu->r[0] = 0;
+      }
+      break;
+    case MANGO_LIBC_PTHREAD_KEY_DELETE:
+      if (r0 > 0 && r0 < g_nkeys) {
+        g_tsd[r0] = 0;
+      }
       cpu->r[0] = 0;
       break;
     case MANGO_LIBC_PTHREAD_ONCE: {
@@ -1598,6 +1640,52 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
   return true; /* TODO: stash runtime_cbs for getTrampoline's JNI lookups */
 }
 
+static int mango_run_ctor(MangoLoadedLibrary* lib, uint32_t pc) {
+  MangoCpu cpu;
+  uint32_t sp;
+  if (pc == 0 || pc == 0xFFFFFFFFu) {
+    return 0;
+  }
+  memset(&cpu, 0, sizeof(cpu));
+  sp = g_nested_sp ? g_nested_sp - 0x4000u : lib->stack_top;
+  cpu.r[MANGO_REG_SP] = sp;
+  cpu.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  if (pc & 1u) {
+    cpu.cpsr = MANGO_CPSR_T;
+    pc &= ~1u;
+  }
+  cpu.r[MANGO_REG_PC] = pc;
+  return mango_run_guest(lib, &cpu, NULL);
+}
+
+static void mango_run_constructors(MangoLoadedLibrary* lib) {
+  uint32_t n = 0, ok = 0;
+  if (lib->image.init_fn) {
+    n++;
+    if (mango_run_ctor(lib, lib->image.init_fn + lib->load_bias) == 0) {
+      ok++;
+    }
+  }
+  if (lib->image.init_array_vaddr && lib->image.init_array_size) {
+    uint32_t addr = lib->image.init_array_vaddr + lib->load_bias;
+    uint32_t count = lib->image.init_array_size / 4u;
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t fn;
+      n++;
+      if (!mango_guest_range_ok(lib, addr + i * 4u, 4u)) {
+        continue;
+      }
+      fn = mango_load_u32_guest(lib->guest_mem, addr + i * 4u);
+      if (mango_run_ctor(lib, fn) == 0) {
+        ok++;
+      }
+    }
+  }
+  if (n > 0) {
+    fprintf(stderr, "mango: constructors %s %u/%u\n", lib->path, ok, n);
+  }
+}
+
 static void* mango_load_library(const char* libpath, int flag) {
   (void)flag;
   if (!libpath || !mango_is_arm32_elf(libpath)) {
@@ -1697,6 +1785,7 @@ static void* mango_load_library(const char* libpath, int flag) {
     free(lib);
     return NULL;
   }
+  mango_run_constructors(lib);
   return lib;
 }
 
@@ -1792,6 +1881,8 @@ static int mango_unload_library(void* handle) {
         g_as_next = 0;
         g_as_jni_ready = 0;
         g_nslots = 0;
+        g_nkeys = 1;
+        memset(g_tsd, 0, sizeof(g_tsd));
       }
       return 0;
     }
