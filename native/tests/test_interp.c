@@ -2102,6 +2102,79 @@ static int test_thumb32_addw(void) {
   return 0;
 }
 
+static int test_thumb_bx_pc_veneer(void) {
+  /* Thumb BX PC into ARM PLT-style veneer: dest is addr+4, not r15. */
+  uint8_t mem_buf[32];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = 0x78; /* bx pc */
+  mem_buf[1] = 0x47;
+  mem_buf[2] = 0xC0; /* mov r8, r8 */
+  mem_buf[3] = 0x46;
+  mem_buf[4] = 0x07; /* mov r0, #7 */
+  mem_buf[5] = 0x00;
+  mem_buf[6] = 0xA0;
+  mem_buf[7] = 0xE3;
+  mem_buf[8] = 0x1E; /* bx lr */
+  mem_buf[9] = 0xFF;
+  mem_buf[10] = 0x2F;
+  mem_buf[11] = 0xE1;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_LR] = 0xF00Du;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xF00Du, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_bx_pc_veneer): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 7) {
+    fprintf(stderr, "FAIL(thumb_bx_pc_veneer): expected r0==7, got %u\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: Thumb BX PC veneer into ARM (r0=%u)\n", cpu.r[0]);
+  return 0;
+}
+
+static int test_arm_add_pc(void) {
+  /* add pc, r0, pc — ARM PLT tail. At the add, PC as operand is addr+8. */
+  static const uint32_t kProgram[] = {
+      0xE3A00004u, /* mov r0, #4 */
+      0xE080F00Fu, /* add pc, r0, pc  -> 4 + (4+8) = 16 */
+      0xE3A00063u, /* mov r0, #99 (skipped) */
+      0xE3A00063u, /* mov r0, #99 (skipped) */
+      0xE3A0002Au, /* mov r0, #42 */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 6);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = 0;
+  cpu.r[MANGO_REG_LR] = 0xB0B0u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xB0B0u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(arm_add_pc): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 42) {
+    fprintf(stderr, "FAIL(arm_add_pc): expected r0==42, got %u\n", cpu.r[0]);
+    return 1;
+  }
+  printf("ok: ARM ADD PC (PLT) (r0=%u)\n", cpu.r[0]);
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2155,6 +2228,8 @@ int main(void) {
   failures += test_thumb_blx_reg();
   failures += test_thumb32_ldr_str_imm();
   failures += test_thumb32_addw();
+  failures += test_thumb_bx_pc_veneer();
+  failures += test_arm_add_pc();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

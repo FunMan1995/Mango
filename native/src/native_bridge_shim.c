@@ -812,6 +812,13 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
       break;
     }
     if (rc != 1) {
+      uint32_t pc = cpu.r[MANGO_REG_PC];
+      uint32_t w = 0;
+      if (pc + 4u <= mem.size) {
+        w = mango_load_u32_guest(mem.bytes, pc);
+      }
+      fprintf(stderr, "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d\n", pc, cpu.cpsr, w,
+              rc);
       return 0;
     }
     uint32_t nr = cpu.r[7];

@@ -71,6 +71,8 @@ synthetic programs, not real app code yet.
   `LDR` literal are implemented; other T32 data-processing is still
   rejected. A32 `MOVW`/`MOVT` and `BLX Rm` (and T16 `BLX Rm`) are
   implemented so JNI vtable calls and `JNI_VERSION` returns work.
+  `BX PC`, ALU to PC, and `LDR PC` are real branches (Thumb-to-ARM PLT
+  veneers).
 - The interpreter has an actual memory model (`MangoMemory`): a flat,
   byte-addressable buffer that code and data share, same as real memory.
   Every fetch and every `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/
@@ -142,7 +144,7 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: fifty-one test programs, hand-encoded by
+- `tests/test_interp.c`: fifty-three test programs, hand-encoded by
   working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why

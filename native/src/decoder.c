@@ -341,8 +341,8 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     if (!p && w) {
       return -1; /* LDRT/STRT unprivileged form */
     }
-    if (rt == MANGO_REG_PC) {
-      return -1; /* LDR/STR PC is an indirect branch, not in this subset */
+    if (rt == MANGO_REG_PC && !l) {
+      return -1; /* STR PC; LDR PC is a branch, executed in interp */
     }
     if (writeback && rn == MANGO_REG_PC) {
       return -1; /* writeback into PC is UNPREDICTABLE */
