@@ -145,7 +145,8 @@
 #define MANGO_LIBC_PTHREAD_SETSPECIFIC 65
 #define MANGO_LIBC_PTHREAD_KEY_DELETE 66
 #define MANGO_LIBC_REALLOC 67
-#define MANGO_LIBC_COUNT 68
+#define MANGO_LIBC_WRITE 68
+#define MANGO_LIBC_COUNT 69
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x2800000u
@@ -272,6 +273,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "pthread_setspecific",
     "pthread_key_delete",
     "realloc",
+    "write",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -928,6 +930,15 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     case MANGO_LIBC_CLOSE:
       cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_WRITE:
+      /* Discard sink: report full count so write-all loops advance. Unresolved
+       * write used to hit the mov-r0-#0 stub and spin forever (libmono). */
+      if (r2 != 0 && !mango_guest_range_ok(lib, r1, r2)) {
+        cpu->r[0] = (uint32_t)-1;
+      } else {
+        cpu->r[0] = r2;
+      }
       break;
     case MANGO_LIBC_PTHREAD_KEY_CREATE:
       if (!mango_guest_range_ok(lib, r0, 4u) || g_nkeys >= MANGO_TSD_KEYS) {
