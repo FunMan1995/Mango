@@ -401,6 +401,29 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       out->op = MANGO_OP_VMOV;
       return 0;
     }
+    /* VMOV.F32 Sd,#imm / VMOV.F64 Dd,#imm (A8.8.343): bits23=1,21-20=11, bits3-0=0. */
+    /* Mask clears D (bit22) and imm/Vd fields; cp already 0xA/0xB in this block. */
+    if ((word & 0x0FB00E0Fu) == 0x0EB00A00u) {
+      uint32_t imm8 = (((word >> 16) & 0xFu) << 4) | ((word >> 4) & 0xFu);
+      uint64_t pat;
+      if (dbl) {
+        /* F64 modified immediate: sign:~expbit:expbit*8:imm6:zeros(48). */
+        uint32_t sign = (imm8 >> 7) & 1u;
+        uint32_t expb = (imm8 >> 6) & 1u;
+        uint32_t hi = (sign << 31) | ((1u - expb) << 30) | ((expb ? 0xFFu : 0u) << 22) |
+                      ((imm8 & 0x3Fu) << 16);
+        pat = (uint64_t)hi << 32;
+      } else if (mango_neon_expand_imm(0xFu, 0u, imm8, &pat) != 0) {
+        return -1;
+      }
+      out->op = MANGO_OP_VMOV;
+      out->u = 5;
+      out->rd = dbl ? ((dbit << 4) | vd) : ((vd << 1) | dbit);
+      out->b = dbl;
+      out->imm = (uint32_t)pat;
+      out->rs = (uint32_t)(pat >> 32);
+      return 0;
+    }
     (void)opc;
     return -1;
   }

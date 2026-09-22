@@ -2647,6 +2647,28 @@ static int test_vmov_f32_imm_and_smmul(void) {
   return 0;
 }
 
+
+static int test_vmov_f32_scalar_imm(void) {
+  /* OFDP nativeRender stop: VMOV.F32 s0, #0.5 (imm8=0x60 → 0x3f000000). */
+  static const uint32_t kProg[] = {
+      0xEEB60A00u, /* vmov.f32 s0, #0.5 */
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x1234u;
+  int rc = mango_interp_run(&cpu, &mem, 0x1234u, 100);
+  if (rc != 0 || cpu.s[0] != 0x3F000000u) {
+    fprintf(stderr, "FAIL(vmov_f32_scalar_imm): rc=%d s0=0x%x\n", rc, cpu.s[0]);
+    return 1;
+  }
+  printf("ok: VMOV.F32 s0, #0.5 (0xeeb60a00)\n");
+  return 0;
+}
+
 static int test_strexd(void) {
   static const uint32_t kProg[] = {
       0xE3A00040u, /* mov r0, #64 */
@@ -2745,6 +2767,7 @@ int main(void) {
   failures += test_vcvt_s32_f32();
   failures += test_vcvt_s32_f64();
   failures += test_vmov_f32_imm_and_smmul();
+  failures += test_vmov_f32_scalar_imm();
   failures += test_strexd();
 
   if (failures != 0) {

@@ -998,6 +998,17 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             } else {
               cpu->s[insn.rd] = cpu->r[insn.rn];
             }
+          } else if (insn.u == 5) {
+            /* VFP VMOV Sd/Dd, #imm */
+            if (insn.b) {
+              uint64_t v = (uint64_t)insn.imm | ((uint64_t)insn.rs << 32);
+              mango_vfp_set_d(cpu, insn.rd, v);
+            } else {
+              if (insn.rd >= 32u) {
+                return -1;
+              }
+              cpu->s[insn.rd] = insn.imm;
+            }
           } else {
             mango_vfp_set_d(cpu, insn.rd, mango_vfp_get_d(cpu, insn.rm));
           }
