@@ -6,6 +6,7 @@
 /* Implements native/include/mango/native_bridge.h, exported as "NativeBridgeItf". */
 #include <elf.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -92,7 +93,25 @@
 #define MANGO_LIBC_PTHREAD_LOCK 26
 #define MANGO_LIBC_PTHREAD_UNLOCK 27
 #define MANGO_LIBC_CLOCK_GETTIME 28
-#define MANGO_LIBC_COUNT 29
+#define MANGO_LIBC_SIN 29
+#define MANGO_LIBC_COS 30
+#define MANGO_LIBC_TAN 31
+#define MANGO_LIBC_SQRT 32
+#define MANGO_LIBC_POW 33
+#define MANGO_LIBC_EXP 34
+#define MANGO_LIBC_LOG 35
+#define MANGO_LIBC_FLOOR 36
+#define MANGO_LIBC_FABS 37
+#define MANGO_LIBC_ATAN2 38
+#define MANGO_LIBC_SINF 39
+#define MANGO_LIBC_COSF 40
+#define MANGO_LIBC_SQRTF 41
+#define MANGO_LIBC_POWF 42
+#define MANGO_LIBC_FLOORF 43
+#define MANGO_LIBC_FABSF 44
+#define MANGO_LIBC_PTHREAD_SELF 45
+#define MANGO_LIBC_PTHREAD_CREATE 46
+#define MANGO_LIBC_COUNT 47
 
 #define MANGO_AS_SIZE 0x2800000u
 #define MANGO_LIB_CAP 0x2000000u
@@ -179,6 +198,24 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "pthread_mutex_lock",
     "pthread_mutex_unlock",
     "clock_gettime",
+    "sin",
+    "cos",
+    "tan",
+    "sqrt",
+    "pow",
+    "exp",
+    "log",
+    "floor",
+    "fabs",
+    "atan2",
+    "sinf",
+    "cosf",
+    "sqrtf",
+    "powf",
+    "floorf",
+    "fabsf",
+    "pthread_self",
+    "pthread_create",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -384,6 +421,40 @@ static void mango_jvm_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   }
 }
 
+static double mango_arg_d(const MangoCpu* cpu) {
+  uint64_t u = (uint64_t)cpu->r[0] | ((uint64_t)cpu->r[1] << 32);
+  double d;
+  memcpy(&d, &u, 8);
+  return d;
+}
+
+static double mango_arg_d2(const MangoCpu* cpu) {
+  uint64_t u = (uint64_t)cpu->r[2] | ((uint64_t)cpu->r[3] << 32);
+  double d;
+  memcpy(&d, &u, 8);
+  return d;
+}
+
+static void mango_ret_d(MangoCpu* cpu, double d) {
+  uint64_t u;
+  memcpy(&u, &d, 8);
+  cpu->r[0] = (uint32_t)u;
+  cpu->r[1] = (uint32_t)(u >> 32);
+}
+
+static float mango_arg_f(const MangoCpu* cpu) {
+  float f;
+  uint32_t u = cpu->r[0];
+  memcpy(&f, &u, 4);
+  return f;
+}
+
+static void mango_ret_f(MangoCpu* cpu, float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  cpu->r[0] = u;
+}
+
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
@@ -574,6 +645,65 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       }
       break;
     }
+    case MANGO_LIBC_SIN:
+      mango_ret_d(cpu, sin(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_COS:
+      mango_ret_d(cpu, cos(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_TAN:
+      mango_ret_d(cpu, tan(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_SQRT:
+      mango_ret_d(cpu, sqrt(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_POW:
+      mango_ret_d(cpu, pow(mango_arg_d(cpu), mango_arg_d2(cpu)));
+      break;
+    case MANGO_LIBC_EXP:
+      mango_ret_d(cpu, exp(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_LOG:
+      mango_ret_d(cpu, log(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_FLOOR:
+      mango_ret_d(cpu, floor(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_FABS:
+      mango_ret_d(cpu, fabs(mango_arg_d(cpu)));
+      break;
+    case MANGO_LIBC_ATAN2:
+      mango_ret_d(cpu, atan2(mango_arg_d(cpu), mango_arg_d2(cpu)));
+      break;
+    case MANGO_LIBC_SINF:
+      mango_ret_f(cpu, sinf(mango_arg_f(cpu)));
+      break;
+    case MANGO_LIBC_COSF:
+      mango_ret_f(cpu, cosf(mango_arg_f(cpu)));
+      break;
+    case MANGO_LIBC_SQRTF:
+      mango_ret_f(cpu, sqrtf(mango_arg_f(cpu)));
+      break;
+    case MANGO_LIBC_POWF: {
+      float a, b;
+      uint32_t ua = cpu->r[0], ub = cpu->r[1];
+      memcpy(&a, &ua, 4);
+      memcpy(&b, &ub, 4);
+      mango_ret_f(cpu, powf(a, b));
+      break;
+    }
+    case MANGO_LIBC_FLOORF:
+      mango_ret_f(cpu, floorf(mango_arg_f(cpu)));
+      break;
+    case MANGO_LIBC_FABSF:
+      mango_ret_f(cpu, fabsf(mango_arg_f(cpu)));
+      break;
+    case MANGO_LIBC_PTHREAD_SELF:
+      cpu->r[0] = 1;
+      break;
+    case MANGO_LIBC_PTHREAD_CREATE:
+      cpu->r[0] = 11; /* EAGAIN: do not start a guest thread */
+      break;
     case MANGO_LIBC_CLOCK_GETTIME:
       if (!mango_guest_range_ok(lib, r1, 8u)) {
         cpu->r[0] = (uint32_t)-1;

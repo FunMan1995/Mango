@@ -33,7 +33,7 @@ add_executable(mango_native_bridge_shim_tests
   tests/test_native_bridge_shim.c
 )
 target_include_directories(mango_native_bridge_shim_tests PRIVATE tests/fake_jni)
-target_link_libraries(mango_native_bridge_shim_tests PRIVATE mango_core)
+target_link_libraries(mango_native_bridge_shim_tests PRIVATE mango_core m)
 add_test(NAME native_bridge_shim_smoke_test COMMAND mango_native_bridge_shim_tests)
 
 # The actual native bridge .so. Only buildable with the NDK toolchain file,
@@ -42,6 +42,6 @@ if(ANDROID)
   add_library(mango_translator SHARED
     src/native_bridge_shim.c
   )
-  target_link_libraries(mango_translator PRIVATE mango_core)
+  target_link_libraries(mango_translator PRIVATE mango_core m log)
   target_include_directories(mango_translator PRIVATE include)
 endif()

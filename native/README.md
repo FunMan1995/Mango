@@ -194,5 +194,6 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   40 MiB address space (32 MiB of libraries). Unity `libunity.so` loads
   and its `JNI_OnLoad` returns `JNI_VERSION_1_6` using a VFP subset
   (`VLDR`/`VSTR`, `VCVT.F64.S32`, `VADD`/`VMUL.F64`, `VCMP`, `VMRS`,
-  `VMOV`). `Call*Method` and field get/set are still no-op stubs; GLES
-  and NEON are still open.
+  `VMOV`). `libmono.so` maps (no `JNI_OnLoad`). libm (`sin`/`cos`/`sqrt`/…)
+  and a few pthread stubs are thunked. `Call*Method` and GLES are still
+  open.
