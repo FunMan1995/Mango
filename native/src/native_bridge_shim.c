@@ -295,12 +295,14 @@ static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v) {
   mem[addr + 3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
-/* A32 thunk: ldr r7, [pc, #4]; svc 0; bx lr; .word imm */
+/* A32 thunk preserves r4-r11 (AAPCS). SVC number lives in the word after
+ * `bx lr` so we do not need to load it into r7.
+ *   svc 0; bx lr; .word imm; nop */
 static void mango_write_jni_thunk(uint8_t* mem, uint32_t addr, uint32_t imm) {
-  mango_store_u32_guest(mem, addr, 0xE59F7004u);
-  mango_store_u32_guest(mem, addr + 4u, 0xEF000000u);
-  mango_store_u32_guest(mem, addr + 8u, 0xE12FFF1Eu);
-  mango_store_u32_guest(mem, addr + 12u, imm);
+  mango_store_u32_guest(mem, addr, 0xEF000000u);
+  mango_store_u32_guest(mem, addr + 4u, 0xE12FFF1Eu);
+  mango_store_u32_guest(mem, addr + 8u, imm);
+  mango_store_u32_guest(mem, addr + 12u, 0xE1A00000u);
 }
 
 static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
@@ -1150,14 +1152,23 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
       if (pc + 4u <= mem.size) {
         w = mango_load_u32_guest(mem.bytes, pc);
       }
-      fprintf(stderr,
-              "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d r0=%x r1=%x r6=%x r7=%x "
-              "sp=%x\n",
-              pc, cpu->cpsr, w, rc, cpu->r[0], cpu->r[1], cpu->r[6], cpu->r[7],
-              cpu->r[MANGO_REG_SP]);
+      fprintf(stderr, "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d\n", pc, cpu->cpsr, w,
+              rc);
       return -1;
     }
     uint32_t nr = cpu->r[7];
+    {
+      uint32_t pc = cpu->r[MANGO_REG_PC];
+      if ((cpu->cpsr & MANGO_CPSR_T) == 0 && pc + 12u <= mem.size &&
+          mango_load_u32_guest(mem.bytes, pc + 4u) == 0xE12FFF1Eu) {
+        uint32_t imm = mango_load_u32_guest(mem.bytes, pc + 8u);
+        if ((imm >= MANGO_JNI_SVC_BASE && imm < MANGO_JNI_SVC_BASE + MANGO_JNI_TABLE_LEN) ||
+            (imm >= MANGO_JVM_SVC_BASE && imm < MANGO_JVM_SVC_BASE + MANGO_JVM_TABLE_LEN) ||
+            (imm >= MANGO_LIBC_SVC_BASE && imm < MANGO_LIBC_SVC_BASE + MANGO_LIBC_COUNT)) {
+          nr = imm;
+        }
+      }
+    }
     if (nr >= MANGO_JNI_SVC_BASE && nr < MANGO_JNI_SVC_BASE + MANGO_JNI_TABLE_LEN) {
       mango_jni_svc(lib, cpu, env, nr - MANGO_JNI_SVC_BASE);
     } else if (nr >= MANGO_JVM_SVC_BASE && nr < MANGO_JVM_SVC_BASE + MANGO_JVM_TABLE_LEN) {

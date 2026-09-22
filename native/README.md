@@ -198,5 +198,7 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   and a few pthread stubs are thunked. GLES/EGL/`ANativeWindow` calls
   return success/dummy sizes. `getTrampoline` finds `RegisterNatives`
   names (`NativeLoader.load`). `pthread_once` runs the init function.
-  Fake `/proc/cpuinfo` and auxv advertise NEON/VFP. `Call*Method` host
-  JNI and a working Unity `load()` PIC tail are still open.
+  Fake `/proc/cpuinfo` and auxv advertise NEON/VFP. JNI thunks preserve
+  r4–r11 (SVC number is the word after `bx lr`). Unity
+  `NativeLoader.load` returns true and `dlopen`s `libunity.so` and
+  `libmono.so`. Host `Call*Method` and real GLES are still open.
