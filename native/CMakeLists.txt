@@ -45,3 +45,12 @@ if(ANDROID)
   target_link_libraries(mango_translator PRIVATE mango_core m log)
   target_include_directories(mango_translator PRIVATE include)
 endif()
+
+# Host-only Unity/OFDP drive helper for Test Lab (not a ctest). Loads real
+# ARM32 libmain.so siblings through the same shim as mango_native_bridge_shim_tests.
+add_executable(mango_host_unity_drive
+  src/native_bridge_shim.c
+  tests/host_unity_drive.c
+)
+target_include_directories(mango_host_unity_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_unity_drive PRIVATE mango_core m)

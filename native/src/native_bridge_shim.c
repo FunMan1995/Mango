@@ -748,6 +748,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         }
         if (id == 0) {
           snprintf(g_dlerror, sizeof(g_dlerror), "dlopen failed: %s", path);
+          fprintf(stderr, "mango: dlopen FAIL %s\n", path);
+        } else {
+          fprintf(stderr, "mango: dlopen OK %s -> id=%u\n", path, id);
         }
         cpu->r[0] = id;
       }

@@ -338,6 +338,18 @@ int mango_decode(uint32_t word, MangoInsn* out) {
         return 0;
       }
     }
+    if (!dbl && ((word >> 4) & 0xDu) == 0x4u) {
+      uint32_t opc8 = (word >> 16) & 0xBFu;
+      uint32_t sd = (vd << 1) | dbit;
+      uint32_t sm = (vm << 1) | mbit;
+      if (opc8 == 0xB8u) {
+        out->op = MANGO_OP_VCVT; /* vcvt.f32.u32 Sd, Sm */
+        out->rd = sd;
+        out->rn = sm;
+        out->imm = 9; /* f32.u32 */
+        return 0;
+      }
+    }
     /* VCVT.F32.F64 Sd, Dm (cp B) / VCVT.F64.F32 Dd, Sm (cp A). */
     if (((word >> 16) & 0xFFu) == 0xB7u && ((word >> 4) & 9u) == 8u) {
       out->op = MANGO_OP_VCVT;

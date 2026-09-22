@@ -2566,6 +2566,29 @@ static int test_vadd_f32(void) {
   return 0;
 }
 
+
+static int test_vcvt_f32_u32(void) {
+  /* OFDP nativeRender stop 0xeeb81a41: vcvt.f32.u32 s2, s2 */
+  static const uint32_t kProgram[] = {
+      0xEEB81A41u,
+      0xE12FFF1Eu,
+  };
+  uint8_t mem_buf[32];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 2);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.s[2] = 42u;
+  cpu.r[MANGO_REG_LR] = 0xEEEEu;
+  int rc = mango_interp_run(&cpu, &mem, 0xEEEEu, 100);
+  if (rc != 0 || cpu.s[2] != 0x42280000u) {
+    fprintf(stderr, "FAIL(vcvt_f32_u32): rc=%d s2=0x%x\n", rc, cpu.s[2]);
+    return 1;
+  }
+  printf("ok: VCVT.F32.U32 s2, s2 (42 -> 42.0f)\n");
+  return 0;
+}
+
 static int test_vcvt_s32_f32(void) {
   static const uint32_t kProgram[] = {
       0xEEBD0AC0u, /* vcvt.s32.f32 s0, s0 */
@@ -2764,6 +2787,7 @@ int main(void) {
   failures += test_vcvt_f32_f64();
   failures += test_vcmpe_f32_zero();
   failures += test_vadd_f32();
+  failures += test_vcvt_f32_u32();
   failures += test_vcvt_s32_f32();
   failures += test_vcvt_s32_f64();
   failures += test_vmov_f32_imm_and_smmul();
