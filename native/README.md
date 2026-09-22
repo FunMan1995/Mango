@@ -215,5 +215,8 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   r4–r11 (SVC number is the word after `bx lr`). Unity
   `NativeLoader.load` returns true and `dlopen`s `libunity.so` and
   `libmono.so`. Dummy `FindClass` lets Unity `RegisterNatives` bind
-  `nativeRender` / `nativePause` / `initJni` and the rest. Host
-  `Call*Method` and real GLES are still open.
+  `nativeRender` / `nativePause` / `initJni` and the rest. OFDP
+  `libunity.so` routes the internal MemoryManager allocator (VA
+  `0x102b78`) to guest `malloc` and seeds the keyword-tree sentinel so
+  `nativeRender` does not memcpy into address 0 / OOB on ASCII `NAL_`.
+  Host `Call*Method` and real GLES are still open.

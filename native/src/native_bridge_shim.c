@@ -632,7 +632,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_AEABI_MEMCPY:
     case MANGO_LIBC_MEMMOVE:
     case MANGO_LIBC_AEABI_MEMMOVE:
-      if (!mango_guest_range_ok(lib, r0, r2) || !mango_guest_range_ok(lib, r1, r2)) {
+      /* Unity's MemoryManager can return NULL before it is constructed; refuse to
+       * smash guest address 0 (seen as ASCII "DIRECTIONAL_COOKIE" / NAL_ OOB). */
+      if (r0 == 0 || !mango_guest_range_ok(lib, r0, r2) || !mango_guest_range_ok(lib, r1, r2)) {
         cpu->r[0] = 0;
       } else {
         memmove(lib->guest_mem + r0, lib->guest_mem + r1, r2);
@@ -640,7 +642,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       }
       break;
     case MANGO_LIBC_MEMSET:
-      if (!mango_guest_range_ok(lib, r0, r2)) {
+      if (r0 == 0 || !mango_guest_range_ok(lib, r0, r2)) {
         cpu->r[0] = 0;
       } else {
         memset(lib->guest_mem + r0, (int)(r1 & 0xFFu), r2);
@@ -682,7 +684,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_STRCPY: {
       const char* src = mango_guest_cstr(lib, r1);
       size_t n = src ? strlen(src) + 1u : 0;
-      if (!src || !mango_guest_range_ok(lib, r0, (uint32_t)n)) {
+      if (r0 == 0 || !src || !mango_guest_range_ok(lib, r0, (uint32_t)n)) {
         cpu->r[0] = 0;
       } else {
         memcpy(lib->guest_mem + r0, src, n);
@@ -1643,6 +1645,45 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
   return true; /* TODO: stash runtime_cbs for getTrampoline's JNI lookups */
 }
 
+/*
+ * OFDP libunity: MemoryManager is not constructed under the shim, so the
+ * internal allocator at VA 0x102b78 returns NULL and callers memcpy into
+ * address 0 (clobbering the ELF header with strings like DIRECTIONAL_COOKIE).
+ * That makes NULL object field loads at [0+8] yield ASCII "NAL_" and OOB.
+ *
+ * Also the keyword/shader tree header at BSS 0x12d3d80 needs an empty-tree
+ * sentinel so nativeRender's first insert does not pass a NULL node pointer.
+ */
+static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
+  const char* base;
+  uint32_t alloc_fn, hdr, sen;
+  if (lib == NULL || lib->path[0] == '\0') {
+    return;
+  }
+  base = strrchr(lib->path, '/');
+  base = base ? base + 1 : lib->path;
+  if (strcmp(base, "libunity.so") != 0) {
+    return;
+  }
+  alloc_fn = lib->load_bias + 0x102b78u;
+  if (!mango_guest_range_ok(lib, alloc_fn, MANGO_JNI_THUNK_SIZE) ||
+      mango_load_u32_guest(lib->guest_mem, alloc_fn) != 0xe92d4bf0u) {
+    return;
+  }
+  /* r0 is the byte size at every call site we inspected; route to guest malloc. */
+  mango_write_jni_thunk(lib->guest_mem, alloc_fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_MALLOC);
+
+  hdr = lib->load_bias + 0x12d3d80u;
+  if (!mango_guest_range_ok(lib, hdr, 0x40u)) {
+    return;
+  }
+  /* Empty intrusive tree: head -> embedded sentinel; sentinel+0xc == sentinel+4. */
+  sen = hdr + 0x2cu;
+  mango_store_u32_guest(lib->guest_mem, hdr + 0x20u, sen);
+  mango_store_u32_guest(lib->guest_mem, sen + 0x8u, 0u);
+  mango_store_u32_guest(lib->guest_mem, sen + 0xcu, sen + 0x4u);
+}
+
 static int mango_run_ctor(MangoLoadedLibrary* lib, uint32_t pc) {
   MangoCpu cpu;
   uint32_t sp;
@@ -1788,6 +1829,7 @@ static void* mango_load_library(const char* libpath, int flag) {
     free(lib);
     return NULL;
   }
+  mango_patch_ofdp_unity(lib);
   mango_run_constructors(lib);
   return lib;
 }
