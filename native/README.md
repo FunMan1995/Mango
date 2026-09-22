@@ -144,7 +144,7 @@ synthetic programs, not real app code yet.
   thunking syscalls to something real is a per-context decision (a
   standalone process versus a JNI-loaded library want different things),
   see `linux/loader_core.c` for where that's actually implemented.
-- `tests/test_interp.c`: fifty-three test programs, hand-encoded by
+- `tests/test_interp.c`: fifty-four test programs, hand-encoded by
   working out the A32 bit patterns by hand and cross-checked against an
   independently written encoder before trusting them (this caught a real
   mistake in a hand-derived test word during development, exactly why
@@ -191,6 +191,8 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   Each addition should come with a hand-derived test case the way the
   existing ones work, see `docs/CONTRIBUTING.md`'s testing section.
 - Guest `dlopen`/`dlsym`/`dlclose` map extra ARM32 `.so`s into a shared
-  32 MiB address space (Unity `libunity.so` / `libmono.so`). `Call*Method`
-  and field get/set are no-op stubs until host JNI is wired; float/double
-  returns, GLES, and VFP/NEON are still open.
+  40 MiB address space (32 MiB of libraries). Unity `libunity.so` loads
+  and its `JNI_OnLoad` returns `JNI_VERSION_1_6` using a VFP subset
+  (`VLDR`/`VSTR`, `VCVT.F64.S32`, `VADD`/`VMUL.F64`, `VCMP`, `VMRS`,
+  `VMOV`). `Call*Method` and field get/set are still no-op stubs; GLES
+  and NEON are still open.

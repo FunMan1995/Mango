@@ -2175,6 +2175,38 @@ static int test_arm_add_pc(void) {
   return 0;
 }
 
+static int test_vldr_s_from_stack(void) {
+  static const uint32_t kProgram[] = {
+      0xE3A0D040u, /* mov sp, #64 */
+      0xED9D0A00u, /* vldr s0, [sp] */
+      0xE12FFF1Eu, /* bx lr */
+  };
+
+  uint8_t mem_buf[128];
+  load_words(mem_buf, sizeof(mem_buf), kProgram, 3);
+  mem_buf[64] = 0x00;
+  mem_buf[65] = 0x00;
+  mem_buf[66] = 0x80;
+  mem_buf[67] = 0x3F; /* 1.0f */
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x1111u;
+
+  int rc = mango_interp_run(&cpu, &mem, 0x1111u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(vldr_s_from_stack): mango_interp_run returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.s[0] != 0x3F800000u) {
+    fprintf(stderr, "FAIL(vldr_s_from_stack): s0=0x%08x want 0x3f800000\n", cpu.s[0]);
+    return 1;
+  }
+  printf("ok: VLDR s0, [sp] (s0=0x%08x)\n", cpu.s[0]);
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -2230,6 +2262,7 @@ int main(void) {
   failures += test_thumb32_addw();
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
+  failures += test_vldr_s_from_stack();
 
   if (failures != 0) {
     fprintf(stderr, "%d test(s) failed\n", failures);

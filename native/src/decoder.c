@@ -32,6 +32,94 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     return 0;
   }
 
+  /* VFP VLDR/VSTR: coproc 1010 (single) or 1011 (double), bits 27-25=110. */
+  if (((word >> 25) & 0x7) == 0x6 && (((word >> 8) & 0xF) == 0xA || ((word >> 8) & 0xF) == 0xB)) {
+    uint32_t p = (word >> 24) & 1u;
+    uint32_t u = (word >> 23) & 1u;
+    uint32_t dbit = (word >> 22) & 1u;
+    uint32_t w = (word >> 21) & 1u;
+    uint32_t l = (word >> 20) & 1u;
+    uint32_t rn = (word >> 16) & 0xF;
+    uint32_t vd = (word >> 12) & 0xF;
+    uint32_t cp = (word >> 8) & 0xF;
+    uint32_t imm8 = word & 0xFFu;
+    int dbl = cp == 0xB;
+    if (!p && !w && dbl) {
+      /* VMOV between a double and two GPRs (Rt, Rt2). */
+      out->op = MANGO_OP_VMOV;
+      out->rd = vd;
+      out->rn = rn;
+      out->rm = (dbit << 4) | (word & 0xFu);
+      if ((word >> 5) & 1u) {
+        out->rm |= 16u;
+      }
+      out->b = 1;
+      out->u = l ? 1 : 2;
+      return 0;
+    }
+    if (!p || w) {
+      return -1; /* unindexed / writeback forms */
+    }
+    out->op = l ? MANGO_OP_VLDR : MANGO_OP_VSTR;
+    out->rn = rn;
+    out->rd = dbl ? ((dbit << 4) | vd) : ((vd << 1) | dbit);
+    out->b = dbl;
+    out->is_imm = 1;
+    out->imm = imm8 << 2;
+    out->u = (int)u;
+    out->p = 1;
+    return 0;
+  }
+
+  /* VFP data-processing, coproc 1010/1011, bits 27-24=1110. */
+  if (((word >> 24) & 0xF) == 0xE && (((word >> 8) & 0xF) == 0xA || ((word >> 8) & 0xF) == 0xB)) {
+    uint32_t opc = (word >> 20) & 0xF;
+    uint32_t dbit = (word >> 22) & 1u;
+    uint32_t nbit = (word >> 7) & 1u;
+    uint32_t mbit = (word >> 5) & 1u;
+    uint32_t vd = (word >> 12) & 0xF;
+    uint32_t vn = (word >> 16) & 0xF;
+    uint32_t vm = word & 0xF;
+    uint32_t cp = (word >> 8) & 0xF;
+    int dbl = cp == 0xB;
+    uint32_t fd = dbl ? ((dbit << 4) | vd) : ((vd << 1) | dbit);
+    uint32_t fn = dbl ? ((nbit << 4) | vn) : ((vn << 1) | nbit);
+    uint32_t fm = dbl ? ((mbit << 4) | vm) : ((vm << 1) | mbit);
+    out->b = dbl;
+    out->rd = fd;
+    out->rn = fn;
+    out->rm = fm;
+    if (dbl && ((word >> 16) & 0xFFu) == 0xF8u && ((word >> 4) & 0xDu) == 0xCu) {
+      out->op = MANGO_OP_VCVT; /* vcvt.f64.s32 Dd, Sm */
+      out->rd = (dbit << 4) | vd;
+      out->rn = (vm << 1) | mbit;
+      return 0;
+    }
+    if (dbl && (word & 0x0EB00B00u) == 0x0E300B00u) {
+      out->op = MANGO_OP_VADD;
+      return 0;
+    }
+    if (dbl && (word & 0x0EB00B00u) == 0x0E200B00u) {
+      out->op = MANGO_OP_VMUL;
+      return 0;
+    }
+    if (dbl && ((word >> 16) & 0xFFu) == 0xF5u && ((word >> 4) & 0xFu) == 0xCu) {
+      out->op = MANGO_OP_VCMP;
+      out->imm = (word & 0xFu) == 0 ? 1u : 0u; /* 1 = compare with #0.0 */
+      return 0;
+    }
+    if ((word & 0x0FFFFFFF) == 0x0EF1FA10u) {
+      out->op = MANGO_OP_VMRS;
+      return 0;
+    }
+    if (dbl && ((word >> 16) & 0xFFu) == 0xF0u && ((word >> 4) & 0xFu) == 0x6u) {
+      out->op = MANGO_OP_VMOV;
+      return 0;
+    }
+    (void)opc;
+    return -1;
+  }
+
   /* BX Rm: cond 0001 0010 1111 1111 1111 0001 Rm */
   if (((word >> 20) & 0xFF) == 0x12 && ((word >> 4) & 0xFFFF) == 0xFFF1) {
     out->op = MANGO_OP_BX;

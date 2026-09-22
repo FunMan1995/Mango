@@ -43,6 +43,14 @@ typedef enum MangoOp {
   MANGO_OP_SWP,
   MANGO_OP_LDM,
   MANGO_OP_STM,
+  MANGO_OP_VLDR,
+  MANGO_OP_VSTR,
+  MANGO_OP_VMOV,
+  MANGO_OP_VCVT,
+  MANGO_OP_VADD,
+  MANGO_OP_VMUL,
+  MANGO_OP_VCMP,
+  MANGO_OP_VMRS,
 } MangoOp;
 
 typedef struct MangoInsn {
