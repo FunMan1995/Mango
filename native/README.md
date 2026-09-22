@@ -201,4 +201,6 @@ and NDK/bionic headers) does need the NDK toolchain; see `docs/BUILDING.md`.
   Fake `/proc/cpuinfo` and auxv advertise NEON/VFP. JNI thunks preserve
   r4–r11 (SVC number is the word after `bx lr`). Unity
   `NativeLoader.load` returns true and `dlopen`s `libunity.so` and
-  `libmono.so`. Host `Call*Method` and real GLES are still open.
+  `libmono.so`. Dummy `FindClass` lets Unity `RegisterNatives` bind
+  `nativeRender` / `nativePause` / `initJni` and the rest. Host
+  `Call*Method` and real GLES are still open.

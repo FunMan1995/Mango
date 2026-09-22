@@ -28,13 +28,16 @@
 #define MANGO_JVM_SVC_BASE 0x1800u
 #define MANGO_LIBC_SVC_BASE 0x2000u
 #define MANGO_JNI_STOP 0xFFFFFFF0u
-#define MANGO_JNI_SLOTS 32
+#define MANGO_JNI_SLOTS 64
 #define MANGO_HANDLE_MAX 4096
 
 #define MANGO_JNI_GET_VERSION 4
 #define MANGO_JNI_FIND_CLASS 6
+#define MANGO_JNI_THROW 13
+#define MANGO_JNI_THROW_NEW 14
 #define MANGO_JNI_EXCEPTION_OCCURRED 15
 #define MANGO_JNI_EXCEPTION_CLEAR 17
+#define MANGO_JNI_FATAL_ERROR 18
 #define MANGO_JNI_NEW_GLOBAL_REF 21
 #define MANGO_JNI_DELETE_LOCAL_REF 23
 #define MANGO_JNI_IS_SAME_OBJECT 24
@@ -904,10 +907,17 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       jobject c = NULL;
       if (name && mango_host_jni_ok(env)) {
         c = (*env)->FindClass(env, name);
+      } else if (name) {
+        c = (jobject)(uintptr_t)(cpu->r[1] | 1u);
       }
       cpu->r[0] = mango_handle_intern(c);
       break;
     }
+    case MANGO_JNI_THROW:
+    case MANGO_JNI_THROW_NEW:
+    case MANGO_JNI_FATAL_ERROR:
+      cpu->r[0] = 0;
+      break;
     case MANGO_JNI_EXCEPTION_OCCURRED:
       cpu->r[0] = mango_host_jni_ok(env) ? mango_handle_intern((*env)->ExceptionOccurred(env)) : 0;
       break;
@@ -939,7 +949,7 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       cpu->r[0] =
           mango_host_jni_ok(env)
               ? mango_handle_intern((*env)->GetObjectClass(env, mango_handle_lookup(cpu->r[1])))
-              : 0;
+              : (cpu->r[1] ? cpu->r[1] : mango_handle_intern((void*)(uintptr_t)1));
       break;
     case MANGO_JNI_GET_METHOD_ID:
     case MANGO_JNI_GET_STATIC_METHOD_ID: {
@@ -985,6 +995,8 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       jobject js = NULL;
       if (s && mango_host_jni_ok(env)) {
         js = (*env)->NewStringUTF(env, s);
+      } else if (s) {
+        js = (jobject)(uintptr_t)mango_guest_strdup(lib, s);
       }
       cpu->r[0] = mango_handle_intern(js);
       break;
@@ -1322,6 +1334,38 @@ MANGO_SLOT_FN(28)
 MANGO_SLOT_FN(29)
 MANGO_SLOT_FN(30)
 MANGO_SLOT_FN(31)
+MANGO_SLOT_FN(32)
+MANGO_SLOT_FN(33)
+MANGO_SLOT_FN(34)
+MANGO_SLOT_FN(35)
+MANGO_SLOT_FN(36)
+MANGO_SLOT_FN(37)
+MANGO_SLOT_FN(38)
+MANGO_SLOT_FN(39)
+MANGO_SLOT_FN(40)
+MANGO_SLOT_FN(41)
+MANGO_SLOT_FN(42)
+MANGO_SLOT_FN(43)
+MANGO_SLOT_FN(44)
+MANGO_SLOT_FN(45)
+MANGO_SLOT_FN(46)
+MANGO_SLOT_FN(47)
+MANGO_SLOT_FN(48)
+MANGO_SLOT_FN(49)
+MANGO_SLOT_FN(50)
+MANGO_SLOT_FN(51)
+MANGO_SLOT_FN(52)
+MANGO_SLOT_FN(53)
+MANGO_SLOT_FN(54)
+MANGO_SLOT_FN(55)
+MANGO_SLOT_FN(56)
+MANGO_SLOT_FN(57)
+MANGO_SLOT_FN(58)
+MANGO_SLOT_FN(59)
+MANGO_SLOT_FN(60)
+MANGO_SLOT_FN(61)
+MANGO_SLOT_FN(62)
+MANGO_SLOT_FN(63)
 
 static void* const g_slot_fns[MANGO_JNI_SLOTS] = {
     (void*)mango_jni_slot_0,  (void*)mango_jni_slot_1,  (void*)mango_jni_slot_2,
@@ -1334,7 +1378,18 @@ static void* const g_slot_fns[MANGO_JNI_SLOTS] = {
     (void*)mango_jni_slot_21, (void*)mango_jni_slot_22, (void*)mango_jni_slot_23,
     (void*)mango_jni_slot_24, (void*)mango_jni_slot_25, (void*)mango_jni_slot_26,
     (void*)mango_jni_slot_27, (void*)mango_jni_slot_28, (void*)mango_jni_slot_29,
-    (void*)mango_jni_slot_30, (void*)mango_jni_slot_31,
+    (void*)mango_jni_slot_30, (void*)mango_jni_slot_31, (void*)mango_jni_slot_32,
+    (void*)mango_jni_slot_33, (void*)mango_jni_slot_34, (void*)mango_jni_slot_35,
+    (void*)mango_jni_slot_36, (void*)mango_jni_slot_37, (void*)mango_jni_slot_38,
+    (void*)mango_jni_slot_39, (void*)mango_jni_slot_40, (void*)mango_jni_slot_41,
+    (void*)mango_jni_slot_42, (void*)mango_jni_slot_43, (void*)mango_jni_slot_44,
+    (void*)mango_jni_slot_45, (void*)mango_jni_slot_46, (void*)mango_jni_slot_47,
+    (void*)mango_jni_slot_48, (void*)mango_jni_slot_49, (void*)mango_jni_slot_50,
+    (void*)mango_jni_slot_51, (void*)mango_jni_slot_52, (void*)mango_jni_slot_53,
+    (void*)mango_jni_slot_54, (void*)mango_jni_slot_55, (void*)mango_jni_slot_56,
+    (void*)mango_jni_slot_57, (void*)mango_jni_slot_58, (void*)mango_jni_slot_59,
+    (void*)mango_jni_slot_60, (void*)mango_jni_slot_61, (void*)mango_jni_slot_62,
+    (void*)mango_jni_slot_63,
 };
 
 static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_cbs,
@@ -1456,6 +1511,11 @@ static void* mango_get_trampoline(void* handle, const char* name, const char* sh
   }
   for (int i = 0; i < g_nslots; i++) {
     if (g_slots[i].lib == lib && strcmp(g_slots[i].name, name) == 0) {
+      return g_slot_fns[i];
+    }
+  }
+  for (int i = 0; i < g_nslots; i++) {
+    if (strcmp(g_slots[i].name, name) == 0) {
       return g_slot_fns[i];
     }
   }
