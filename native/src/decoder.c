@@ -2032,14 +2032,21 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0g-str: T32 STR.W Rt,[Rn,#-imm8] T4 exact guest — P=1 U=0 W=0.
-   * Guest f849 6c3c = str.w r6,[r9,#-0x3c] (NOT +0x3c; that is imm12 f8c9 603c).
-   * Mask (hw2 & 0x0F00)==0x0C00 → bit11=1, P=1, U=0, W=0. Reject Rt/Rn=PC.
-   * Do not open full P/U/W matrix / footnote f85d 4b04 this bite. */
-  if ((hw1 & 0xFFF0u) == 0xF840u && (hw2 & 0x0F00u) == 0x0C00u) {
+  /* Q-OTTD-0s / widen 0g-str: T32 STR.W Rt,[Rn,#±imm8]!? T4 — bit11=1 P/U/W.
+   * Guest f840 1f0c = str.w r1,[r0,#12]! (P=1 U=1 W=1). Also covers tip 0g
+   * f849 6c3c / f840 1c0c (P=1 U=0 W=0), post 1b0c, neg WB 1d0c.
+   * Distinct from 0i reg form (bit11=0). Reject STRT (P=0 W=0) and Rt/Rn=PC.
+   * Do not open LDR.W-reg / LDRH.W WB / STRH this bite. */
+  if ((hw1 & 0xFFF0u) == 0xF840u && (hw2 & 0x0800u) != 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
     uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw2 >> 10) & 1u);
+    int u = (int)((hw2 >> 9) & 1u);
+    int w = (int)((hw2 >> 8) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* STRT */
+    }
     if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
       return -1;
     }
@@ -2048,9 +2055,9 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rn = rn;
     out->is_imm = 1;
     out->imm = imm8; /* byte offset, not shifted */
-    out->p = 1;
-    out->u = 0;
-    out->w = 0;
+    out->p = p;
+    out->u = u;
+    out->w = w;
     out->b = 0;
     return 0;
   }
