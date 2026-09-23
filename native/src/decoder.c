@@ -1912,6 +1912,32 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0i: T32 STR.W Rt,[Rn,Rm,LSL#2] T2 exact guest — size=10 L=0,
+   * hw2 bits[11:6]=0 (register form), imm2=2 only. Guest f840 4025 =
+   * str.w r4,[r0,r5,lsl#2]. Distinct from 0g-str (bit11=1 imm8). Reject PC.
+   * Do not open STRB/STRH-reg or all imm2 this bite. */
+  if ((hw1 & 0xFFF0u) == 0xF840u && (hw2 & 0x0FC0u) == 0 &&
+      ((hw2 >> 4) & 3u) == 2u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_STR;
+    out->rd = rt;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_amount = 2;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    out->b = 0;
+    return 0;
+  }
+
   /* LDR/STR/LDRB/STRB/LDRH/STRH imm12: 11111 000 1 size L Rn / Rt imm12.
    * Rn=15 + LDR is the literal form (U in bit 7). */
   if ((hw1 & 0xFF80u) == 0xF880u) {
@@ -2007,10 +2033,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   }
 
   /* Q-OTTD-0c: T32 LDMIA / POP.W SP! — hw1 E8BD form, Rn=SP, W=1, P(hw2)=0.
-   * Reuse MANGO_OP_LDM (p=0 u=1 w=1). Not full T32 LDM / PC-in-list. */
+   * Reuse MANGO_OP_LDM (p=0 u=1 w=1). PC-in-list is Q-OTTD-0i-pop sibling. */
   if ((hw1 & 0xFFD0u) == 0xE890u && (hw1 & 0x0020u) != 0 && (hw1 & 0xFu) == MANGO_REG_SP &&
       (hw2 & 0x8000u) == 0) {
-    uint32_t reglist = hw2 & 0x7FFFu; /* M<<14 | R[12:0]; PC forbidden */
+    uint32_t reglist = hw2 & 0x7FFFu; /* M<<14 | R[12:0]; PC forbidden here */
+    if (reglist == 0) {
+      return -1; /* empty list UNPRED */
+    }
+    out->op = MANGO_OP_LDM;
+    out->rn = MANGO_REG_SP;
+    out->reglist = reglist;
+    out->p = 0;
+    out->u = 1;
+    out->w = 1;
+    return 0;
+  }
+
+  /* Q-OTTD-0i-pop: T32 LDMIA / POP.W SP! with PC in list (P=1, M=0).
+   * Guest e8bd 81f0 = pop.w {r4-r8,pc}. Keep bit15 in reglist for LoadWritePC
+   * (execute already sets/clears CPSR.T from loaded word bit0). Reject LR+PC. */
+  if ((hw1 & 0xFFD0u) == 0xE890u && (hw1 & 0x0020u) != 0 && (hw1 & 0xFu) == MANGO_REG_SP &&
+      (hw2 & 0x8000u) != 0 && (hw2 & 0x4000u) == 0) {
+    uint32_t reglist = hw2 & 0xFFFFu; /* MUST keep bit15 */
     if (reglist == 0) {
       return -1; /* empty list UNPRED */
     }
