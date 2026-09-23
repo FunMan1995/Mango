@@ -2927,8 +2927,9 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   /* Gameplay draw path: tile walk + DrawCircle sqrt dominate after mapgen. */
   {
+    /* DrawLevel left live: one tile-walk frame is cheap with host UpperBlit
+     * no-op; proves a real gameplay draw path. Keep circle/entity/arc stubs. */
     static const uint32_t kBx[] = {
-        0x18578u, /* DrawLevel */
         0x11db4u, /* DrawEntities */
         0x16a88u, /* DrawPlayer */
         0x18a90u, /* DrawCircle */
@@ -2960,27 +2961,25 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   /* DungeonPlay left intact — title head branches to New Game at 0x1cf86. */
 
-  /* Generate() room target literal 3000 @ VA 0x1e61c → 64. Full 3000-room
-   * mapgen is minutes under the interpreter even with host lrand48/idivmod.
-   * Dist gate cmp #0x31 (s_dist>49) @ 0x1e5c2 → cmp #0x5 (s_dist>5).
-   * InitEnemies loops c_room=1..2999 via r4+=0x34 vs limit 2999*0x34 @
-   * VA 0x135c0; with a short map those BSS rooms have w=h=0 and the
-   * placement loop spins forever — clamp limit to (N-1)*sizeof(Room). */
+  /* Generate() → 1000 rooms (boss index 999 exists). InitEnemies for all
+   * 999 non-start rooms is the wall under interp (enemy place loops); keep
+   * map topology large but only spawn into the first 256 rooms. Dist gate
+   * >20 (vanilla >49) so 1k-room maps pass without ResetLevel storms. */
   addr = lib->load_bias + 0x1e61cu;
   if (mango_guest_range_ok(lib, addr, 4u)) {
-    mango_store_u32_guest(lib->guest_mem, addr, 64u);
-    fprintf(stderr, "mango: Meritous Generate room target 3000->64\n");
+    mango_store_u32_guest(lib->guest_mem, addr, 1000u);
+    fprintf(stderr, "mango: Meritous Generate room target 3000->1000\n");
   }
   addr = lib->load_bias + 0x1e5c2u;
   if (mango_guest_range_ok(lib, addr, 2u)) {
-    lib->guest_mem[addr + 0u] = 0x05u;
-    lib->guest_mem[addr + 1u] = 0x29u; /* cmp r1, #5 */
-    fprintf(stderr, "mango: Meritous Generate dist gate >49 -> >5\n");
+    lib->guest_mem[addr + 0u] = 0x14u;
+    lib->guest_mem[addr + 1u] = 0x29u; /* cmp r1, #0x14 */
+    fprintf(stderr, "mango: Meritous Generate dist gate >49 -> >20\n");
   }
   addr = lib->load_bias + 0x135c0u;
   if (mango_guest_range_ok(lib, addr, 4u)) {
-    mango_store_u32_guest(lib->guest_mem, addr, 63u * 0x34u);
-    fprintf(stderr, "mango: Meritous InitEnemies room loop ->63\n");
+    mango_store_u32_guest(lib->guest_mem, addr, 256u * 0x34u);
+    fprintf(stderr, "mango: Meritous InitEnemies room loop ->256 (of 1000)\n");
   }
 
   g_meritous_progress_armed = 1;
