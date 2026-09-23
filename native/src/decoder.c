@@ -2166,14 +2166,22 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   }
 
 
-  /* Q-OTTD-0e-strd: T32 STRD imm T1 exact guest shape — P=1 U=1 W=0 L=0.
-   * e9c1 8902 = strd r8,r9,[r1,#8] (Rn unchanged). Reuse MANGO_OP_STRD /
-   * A32 pair execute (rd even, rd+1). Not W=1 (e9e1) or post-index. */
-  if ((hw1 & 0xFFF0u) == 0xE9C0u) {
+  /* Q-OTTD-0t / widen 0e-strd: T32 STRD imm T1 L=0 — general P/U/W from hw1.
+   * Guest e946 4502 = strd r4,r5,[r6,#-8] (P=1 U=0 W=0). Also tip 0e e9c1/e9c6
+   * (P=1 U=1 W=0), optional e966 (neg WB) / e866 (post). Mask (hw1&0xFE50)==0xE840
+   * → 1110100 P U 1 W 0 Rn (bit6=1 L=0; excludes LDRD E9D0/E950 and STM bit6=0).
+   * Reject undefined P==0&&W==0; even-pair Rt; Rt/Rn/Rt2!=PC. Reuse MANGO_OP_STRD. */
+  if ((hw1 & 0xFE50u) == 0xE840u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
     uint32_t rt2 = (hw2 >> 8) & 0xFu;
     uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw1 >> 8) & 1u);
+    int u = (int)((hw1 >> 7) & 1u);
+    int w = (int)((hw1 >> 5) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* undefined STRD form */
+    }
     if ((rt & 1u) != 0 || rt2 != rt + 1u) {
       return -1; /* even pair only — matches A32 STRD execute */
     }
@@ -2185,9 +2193,9 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rd = rt;
     out->is_imm = 1;
     out->imm = imm8 << 2;
-    out->p = 1;
-    out->u = 1;
-    out->w = 0;
+    out->p = p;
+    out->u = u;
+    out->w = w;
     return 0;
   }
 
