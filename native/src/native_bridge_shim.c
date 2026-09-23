@@ -3509,6 +3509,29 @@ static void mango_meritous_soft_circle(MangoLoadedLibrary* lib, uint32_t pix, ui
   }
 }
 
+/* Crude degree-step arc on 8bpp fb (proof paint; not guest Arc). */
+static void mango_meritous_soft_arc(MangoLoadedLibrary* lib, uint32_t pix, uint32_t pitch,
+                                    uint32_t w, uint32_t h, int cx, int cy, int radius,
+                                    int deg0, int deg1, uint8_t ink) {
+  if (!lib || radius <= 0 || deg1 <= deg0) {
+    return;
+  }
+  for (int d = deg0; d <= deg1; d++) {
+    double rad = (double)d * 3.14159265358979323846 / 180.0;
+    int px = cx + (int)(radius * cos(rad) + 0.5);
+    int py = cy + (int)(radius * sin(rad) + 0.5);
+    if (px >= 0 && py >= 0 && (uint32_t)px < w && (uint32_t)py < h) {
+      lib->guest_mem[pix + (uint32_t)py * pitch + (uint32_t)px] = ink;
+    }
+    if (px + 1 >= 0 && (uint32_t)(px + 1) < w && py >= 0 && (uint32_t)py < h) {
+      lib->guest_mem[pix + (uint32_t)py * pitch + (uint32_t)(px + 1)] = ink;
+    }
+    if (py + 1 >= 0 && (uint32_t)(py + 1) < h && px >= 0 && (uint32_t)px < w) {
+      lib->guest_mem[pix + (uint32_t)(py + 1) * pitch + (uint32_t)px] = ink;
+    }
+  }
+}
+
 static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf) {
   uint32_t fmt, pix, w, h, pitch;
   uint8_t bpp;
@@ -3550,16 +3573,23 @@ static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf) {
   if (!out_path || !out_path[0]) {
     out_path = "/workspace/mango/fixtures/meritous/frame-dungeon.pgm";
   }
-  /* One-dungeon New Game leaves meter FX idle; force rings for stop-4k proof.
-   * Dump itself is one-shot (g_frame_dumped); no sticky flag (BSS neighbor got trashed). */
+  /* One-dungeon New Game leaves meter FX idle; force rings/arcs for stop-4k/4l proof.
+   * Dump itself is one-shot (g_frame_dumped). */
   if (g_meritous_progress_armed) {
     int cx = (int)(w / 2u);
     int cy = (int)(h / 2u);
+    /* 4k: Circle/Shield-style rings */
     mango_meritous_soft_circle(lib, pix, pitch, w, h, cx, cy, 48, 220);
     mango_meritous_soft_circle(lib, pix, pitch, w, h, cx, cy, 64, 180);
     mango_meritous_soft_circle(lib, pix, pitch, w, h, cx, cy, 72, 160);
+    /* 4l: CircleEx-style thick ring + Arc-style quarter sweeps (distinct inks) */
+    mango_meritous_soft_circle(lib, pix, pitch, w, h, cx, cy, 88, 240);
+    mango_meritous_soft_circle(lib, pix, pitch, w, h, cx, cy, 90, 240);
+    mango_meritous_soft_circle(lib, pix, pitch, w, h, cx, cy, 92, 240);
+    mango_meritous_soft_arc(lib, pix, pitch, w, h, cx, cy, 110, 10, 80, 130);
+    mango_meritous_soft_arc(lib, pix, pitch, w, h, cx, cy, 120, 100, 170, 110);
     fprintf(stderr,
-            "mango: Meritous forced one-shot circle/shield rings (meter idle in drive)\n");
+            "mango: Meritous forced one-shot CircleEx/Arc paint (meter idle in drive)\n");
     /* Recount nonzero after paint. */
     nonzero = 0;
     for (i = 0; i < nbytes; i++) {
@@ -3711,16 +3741,14 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     fprintf(stderr, "mango: Meritous DrawLevel clear preserves HUD y<32\n");
   }
 
-  /* Gameplay draw path: Circle/Shield/Circuit live (host sqrt/aeabi); Arc+Artifacts stubbed.
-   * One-dungeon drive meters idle → forced host rings at frame dump for stop-4k proof. */
+  /* Gameplay draw path: Circle/CircleEx/Shield/Circuit/Arc live; Artifacts+SetTonedPalette stubbed.
+   * Meters idle on one-dungeon drive → forced host CircleEx/Arc paint at frame dump (stop 4l). */
   {
-    /* DrawLevel + DrawPlayer + DrawEntities + DrawCircle/Shield/Circuit live;
-     * draw_text host-thunked. Keep CircleEx/Artifacts/SetTonedPalette/Arc stubbed. */
+    /* DrawLevel + DrawPlayer + DrawEntities + Circle/CircleEx/Shield/Circuit/Arc live;
+     * draw_text host-thunked. Keep Artifacts + SetTonedPalette stubbed (palette churn). */
     static const uint32_t kBx[] = {
-        0x18ba4u, /* DrawCircleEx */
         0x1a540u, /* DrawArtifacts */
         0x16c70u, /* SetTonedPalette */
-        0x1a710u, /* Arc */
     };
     for (unsigned i = 0; i < sizeof(kBx) / sizeof(kBx[0]); i++) {
       addr = lib->load_bias + kBx[i];
@@ -3729,7 +3757,8 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
         lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
       }
     }
-    fprintf(stderr, "mango: Meritous live DrawCircle/Shield/Circuit; host draw_text; stub Arc\n");
+    fprintf(stderr,
+            "mango: Meritous live Circle/CircleEx/Shield/Circuit/Arc; host draw_text; stub Artifacts/Toned\n");
   }
 
   /* Title loop HEAD: first visit -> New Game; after one DungeonPlay the progress
