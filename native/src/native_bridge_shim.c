@@ -474,8 +474,8 @@ static uint32_t g_pc_hist[MANGO_PC_HIST_BUCKETS];
 static int g_meritous_progress_armed;
 static uint32_t g_meritous_bias;
 static MangoLoadedLibrary* g_meritous_lib;
-static uint32_t g_meritous_seen_mask; /* bit0 DungeonPlay, bit1 Generate, bit2 RandomGenerateMap */
-static uint8_t g_meritous_font[8192];
+static uint32_t g_meritous_seen_mask; /* bit0 DungeonPlay, bit1 Generate, bit2 RandomGenerateMap, bit3 DestroyDungeon/mapIO, bit4 title→exit rewritten, bit5 title→exit armed */
+static uint8_t g_meritous_font[16384]; /* 256 glyphs × 64B rearrange; was 8192 and clobbered progress statics */
 static int g_meritous_font_ready;
 static uint32_t g_meritous_draw_text_calls;
 
@@ -531,7 +531,12 @@ static void mango_meritous_progress(uint32_t pc) {
   if (!g_meritous_progress_armed) return;
   if (pc < g_meritous_bias) return;
   uint32_t va = (pc & ~1u) - g_meritous_bias;
-  /* Ranges from nm -D on libapplication.so (Thumb). */
+  /* Ranges from nm -D on libapplication.so (Thumb).
+   * Title→exit must NOT depend solely on flaky DungeonPlay PC/LR samples
+   * (research/41). Track mapgen (Generate / RandomGenerateMap); arm bit32 on
+   * DestroyDungeon after any progress, title-head re-entry, or frame dump
+   * (see mango_dump_framebuffer). Do not rewrite at first mapgen sample —
+   * that races the still-running New Game and exits prematurely. */
   if (!(g_meritous_seen_mask & 1u) && va >= 0x1af28u && va < 0x1c8f0u) {
     g_meritous_seen_mask |= 1u;
     fprintf(stderr, "mango: Meritous in DungeonPlay (va=0x%x)\n", va);
@@ -546,13 +551,18 @@ static void mango_meritous_progress(uint32_t pc) {
       g_meritous_seen_mask |= 8u;
       fprintf(stderr, "mango: Meritous in DestroyDungeon/map IO (va=0x%x)\n", va);
     }
-    /* DestroyDungeon after DungeonPlay ⇒ run finished; arm title→exit. */
-    if ((g_meritous_seen_mask & 1u) && !(g_meritous_seen_mask & 32u)) {
+    /* DestroyDungeon after any dungeon/mapgen progress ⇒ arm title→exit.
+     * Previously required bit0 DungeonPlay only — that sample is flaky. */
+    if ((g_meritous_seen_mask & 7u) && !(g_meritous_seen_mask & 32u)) {
       g_meritous_seen_mask |= 32u;
       fprintf(stderr, "mango: Meritous post-dungeon DestroyDungeon\n");
     }
   }
-  /* After a completed DungeonPlay then DestroyDungeon, rewrite title head. */
+  /* Re-enter title menu after first dungeon/mapgen progress → arm exit. */
+  if (va == 0x1ccd8u && (g_meritous_seen_mask & 7u) && !(g_meritous_seen_mask & 32u)) {
+    g_meritous_seen_mask |= 32u;
+  }
+  /* Once armed, rewrite title head to exit (first visit already forced New Game). */
   if ((g_meritous_seen_mask & 32u) && !(g_meritous_seen_mask & 16u)) {
     uint32_t th = g_meritous_bias + 0x1ccd8u;
     /* Find exit libc thunk; fall back to title Quit path: movs r0,#0; bl exit
@@ -569,17 +579,18 @@ static void mango_meritous_progress(uint32_t pc) {
         if (g_nlibs > 0) {
           thunk = g_libs[0]->libc_thunk_base + i * MANGO_JNI_THUNK_SIZE;
         }
-        if (thunk && mango_guest_range_ok(g_libs[0], th, 12u)) {
+        MangoLoadedLibrary* tlib = g_meritous_lib ? g_meritous_lib : g_libs[0];
+        if (thunk && tlib && mango_guest_range_ok(tlib, th, 12u)) {
           /* movs r0,#0; ldr r1,[pc,#4]; bx r1; nop; .word thunk */
-          g_libs[0]->guest_mem[th + 0u] = 0x00u;
-          g_libs[0]->guest_mem[th + 1u] = 0x20u; /* movs r0,#0 */
-          g_libs[0]->guest_mem[th + 2u] = 0x01u;
-          g_libs[0]->guest_mem[th + 3u] = 0x49u; /* ldr r1,[pc,#4] */
-          g_libs[0]->guest_mem[th + 4u] = 0x08u;
-          g_libs[0]->guest_mem[th + 5u] = 0x47u; /* bx r1 */
-          g_libs[0]->guest_mem[th + 6u] = 0x00u;
-          g_libs[0]->guest_mem[th + 7u] = 0xbfu; /* nop */
-          mango_store_u32_guest(g_libs[0]->guest_mem, th + 8u, thunk);
+          tlib->guest_mem[th + 0u] = 0x00u;
+          tlib->guest_mem[th + 1u] = 0x20u; /* movs r0,#0 */
+          tlib->guest_mem[th + 2u] = 0x01u;
+          tlib->guest_mem[th + 3u] = 0x49u; /* ldr r1,[pc,#4] */
+          tlib->guest_mem[th + 4u] = 0x08u;
+          tlib->guest_mem[th + 5u] = 0x47u; /* bx r1 */
+          tlib->guest_mem[th + 6u] = 0x00u;
+          tlib->guest_mem[th + 7u] = 0xbfu; /* nop */
+          mango_store_u32_guest(tlib->guest_mem, th + 8u, thunk);
           g_meritous_seen_mask |= 16u;
           fprintf(stderr, "mango: Meritous title head -> exit after one dungeon\n");
         }
@@ -3618,6 +3629,16 @@ static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf) {
           (unsigned long long)g_blit_count, (unsigned long long)g_fill_count,
           (unsigned long long)g_blit_bytes, (unsigned long long)g_ckey_blit_count,
           (unsigned long long)g_ckey_pixels_skipped);
+  /* One-dungeon drive: after first framebuffer dump, arm title→exit so return
+   * to title does not start a second NewLevel (bump-heap OOM / NULL fill). */
+  if (g_meritous_progress_armed && (g_meritous_seen_mask & 7u) &&
+      !(g_meritous_seen_mask & 32u)) {
+    g_meritous_seen_mask |= 32u;
+  }
+  if (g_meritous_progress_armed && (g_meritous_seen_mask & 32u) &&
+      !(g_meritous_seen_mask & 16u)) {
+    mango_meritous_progress(g_meritous_bias + 0x1ccd8u);
+  }
 }
 
 static int mango_is_meritous_sdl_image(const MangoLoadedLibrary* lib) {
@@ -3768,8 +3789,8 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
             "mango: Meritous live Circle/CircleEx/Shield/Circuit/Arc; host draw_text; stub Artifacts/Toned\n");
   }
 
-  /* Title loop HEAD: first visit -> New Game; after one DungeonPlay the progress
-   * hook rewrites this site to `bl exit` so SDL_main returns cleanly. */
+  /* Title loop HEAD: first visit -> New Game; after mapgen/dungeon progress the
+   * progress hook rewrites this site to exit so SDL_main returns cleanly. */
   addr = lib->load_bias + 0x1ccd8u;
   if (mango_guest_range_ok(lib, addr, 2u)) {
     lib->guest_mem[addr + 0u] = 0x55u;
