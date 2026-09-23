@@ -3638,7 +3638,14 @@ static int mango_is_meritous_app(const MangoLoadedLibrary* lib) {
   }
   base = strrchr(lib->path, '/');
   base = base ? base + 1 : lib->path;
-  return strcmp(base, "libapplication.so") == 0;
+  /* Basename alone is insufficient: OpenTTD (pelya/F-Droid) also ships
+   * libapplication.so. Require a Meritous-only export so Meritous patches
+   * stay basename+symbol gated and OpenTTD stays ungated for those hooks. */
+  if (strcmp(base, "libapplication.so") != 0) {
+    return 0;
+  }
+  return mango_elf32_find_symbol(&lib->image, "InitEnemies") != 0 ||
+         mango_elf32_find_symbol(&lib->image, "DrawCircuit") != 0;
 }
 
 /* Title "plasma" fill at VA 0x69ad6 runs ~307k host-sqrt iterations under the

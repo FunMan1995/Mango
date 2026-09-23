@@ -75,3 +75,15 @@ target_link_libraries(mango_host_meritous_drive PRIVATE mango_core m)
 if(PNG_FOUND)
   target_link_libraries(mango_host_meritous_drive PRIVATE PNG::PNG)
 endif()
+
+# Host-only OpenTTD/SDL drive helper for Test Lab (not a ctest). Loads
+# armeabi-v7a libsdl-1.2.so + libapplication.so (pelya org.openttd.sdl 1.6.0.56).
+add_executable(mango_host_openttd_drive
+  src/native_bridge_shim.c
+  tests/host_openttd_drive.c
+)
+target_include_directories(mango_host_openttd_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_openttd_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_openttd_drive PRIVATE PNG::PNG)
+endif()
