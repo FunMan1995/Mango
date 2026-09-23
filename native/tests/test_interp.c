@@ -2598,6 +2598,77 @@ static int test_thumb_blx_reg(void) {
   return 0;
 }
 
+
+static int test_t32_beq_w_guest_f000_8134(void) {
+  /* Q-OTTD-0w: guest IcuStringIterator::SetString beq.w f000 8134 must be
+   * +0x268 (to SetString+0x280), NOT +0xc0268 (T4-style J1/J2 inversion).
+   * Wrong imm landed mid A32 u_strToJavaModifiedUTF8_52 with T=1. */
+  MangoInsn di;
+  if (mango_decode_t32(0xF000u, 0x8134u, &di) != 0 || di.op != MANGO_OP_B || di.cond != 0 ||
+      di.imm != 0x268u) {
+    fprintf(stderr, "FAIL(t32_beq_w_guest): decode op=%d cond=%u imm=0x%x want B EQ imm=0x268\n",
+            di.op, di.cond, di.imm);
+    return 1;
+  }
+
+  /* Layout @0: movs r3,#0; cmp r3,#0; beq.w +0x268; movs r0,#1; b done;
+   * beq @4 → taken @4+4+0x268=0x270; fall uses b.n to done @0x274. */
+  uint8_t mem_buf[0x280];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = 0x00;
+  mem_buf[1] = 0x23; /* movs r3,#0 */
+  mem_buf[2] = 0x00;
+  mem_buf[3] = 0x2b; /* cmp r3,#0 */
+  mem_buf[4] = 0x00;
+  mem_buf[5] = 0xf0;
+  mem_buf[6] = 0x34;
+  mem_buf[7] = 0x81; /* beq.w +0x268 */
+  mem_buf[8] = 0x01;
+  mem_buf[9] = 0x20; /* movs r0,#1 (fall) */
+  /* b.n done@0x272 from @0xa: off = 0x272-(0xa+4)=0x264 → imm11=0x132 */
+  {
+    uint16_t b_enc = (uint16_t)(0xE000u | 0x132u);
+    mem_buf[10] = (uint8_t)(b_enc & 0xFF);
+    mem_buf[11] = (uint8_t)(b_enc >> 8);
+  }
+  mem_buf[0x270] = 0x02;
+  mem_buf[0x271] = 0x20; /* movs r0,#2 (taken) */
+  mem_buf[0x272] = 0x70;
+  mem_buf[0x273] = 0x47; /* bx lr (done) */
+
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_LR] = 0xD00Du;
+
+  int rc = mango_interp_run(&cpu, &mem, 0xD00Du, 200);
+  if (rc != 0 || cpu.r[0] != 2u) {
+    fprintf(stderr, "FAIL(t32_beq_w_guest taken): rc=%d r0=%u pc=0x%x want r0=2\n", rc, cpu.r[0],
+            cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+
+  /* Fall: r3!=0 so beq not taken. Start at cmp (@2). */
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[3] = 1u;
+  cpu.r[MANGO_REG_LR] = 0xD00Du;
+  cpu.r[MANGO_REG_PC] = 2u;
+  rc = mango_interp_run(&cpu, &mem, 0xD00Du, 200);
+  if (rc != 0 || cpu.r[0] != 1u) {
+    fprintf(stderr, "FAIL(t32_beq_w_guest fall): rc=%d r0=%u want r0=1\n", rc, cpu.r[0]);
+    return 1;
+  }
+
+  printf("ok: T32 BEQ.W f000 8134 imm=0x268 taken/fall (Q-OTTD-0w)\n");
+  return 0;
+}
+
 static int test_thumb32_ldr_str_imm(void) {
   /* STR.W r2, [r1, #8]; LDR.W r0, [r1, #8]; bx lr */
   static const uint16_t kProg[] = {
@@ -7332,6 +7403,7 @@ int main(void) {
   failures += test_arm_movw_movt();
   failures += test_arm_blx_reg();
   failures += test_thumb_blx_reg();
+  failures += test_t32_beq_w_guest_f000_8134();
   failures += test_thumb32_ldr_str_imm();
   failures += test_thumb32_addw();
   failures += test_t32_push_w_stmdb_sp();

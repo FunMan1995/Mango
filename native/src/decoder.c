@@ -1627,14 +1627,17 @@ static uint32_t mango_t32_branch_imm25(uint16_t hw1, uint16_t hw2) {
 }
 
 static uint32_t mango_t32_bcond_imm(uint16_t hw1, uint16_t hw2) {
+  /* T32 B<c>.W (T3): imm32 = SignExtend(S:J1:J2:imm6:imm11:0).
+   * Unlike unconditional B.W/BL (T4), J1/J2 are NOT inverted via NOT(J EOR S).
+   * Q-OTTD-0w: tip previously reused the T4 inversion, so guest f000 8134
+   * (beq.w +0x268 in IcuStringIterator::SetString) became +0xc0268 and landed
+   * mid A32 ICU body with T=1 (stop word eaffffb2). */
   uint32_t s = (hw1 >> 10) & 1u;
   uint32_t j1 = (hw2 >> 13) & 1u;
   uint32_t j2 = (hw2 >> 11) & 1u;
-  uint32_t i1 = (j1 ^ s) ^ 1u;
-  uint32_t i2 = (j2 ^ s) ^ 1u;
   uint32_t imm6 = hw1 & 0x3Fu;
   uint32_t imm11 = hw2 & 0x7FFu;
-  uint32_t imm = (s << 20) | (i1 << 19) | (i2 << 18) | (imm6 << 12) | (imm11 << 1);
+  uint32_t imm = (s << 20) | (j1 << 19) | (j2 << 18) | (imm6 << 12) | (imm11 << 1);
   if (s) {
     imm |= 0xFFE00000u;
   }
