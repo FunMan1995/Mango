@@ -787,8 +787,10 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         case MANGO_OP_STRH:
         case MANGO_OP_LDRSB:
         case MANGO_OP_LDRSH: {
-          /* Extra load/store: Rm is never shifted, unlike regular LDR/STR. */
-          uint32_t offset = insn.is_imm ? insn.imm : mango_read_reg(cpu, addr, insn.rm);
+          /* Imm offset, or Rm LSL#shift_amount (T32 STRH.W/LDRH.W reg; A32/T16
+           * leave shift_amount=0 so this matches prior unshifted Rm). */
+          uint32_t offset =
+              insn.is_imm ? insn.imm : mango_eval_operand2(cpu, addr, &insn).value;
           uint32_t base = mango_read_reg(cpu, addr, insn.rn);
           uint32_t wbaddr = insn.u ? base + offset : base - offset;
           uint32_t eaddr = insn.p ? wbaddr : base;

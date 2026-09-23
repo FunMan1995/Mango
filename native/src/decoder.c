@@ -2088,6 +2088,33 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0v: T32 STRH.W Rt,[Rn,Rm,LSL#imm2] T2 — size=01 L=0, register form.
+   * Guest f822 600c = strh.w r6,[r2,ip] imm2=0; footnote f820 6012 LSL#1.
+   * Open any imm2 0..3 (mirror 0u STR.W / 0m LDRB.W). Execute must honor
+   * shift_amount. Distinct from F8A0 STRH imm12 (bit7=1) and F840 STR.W (0u).
+   * Reject Rt/Rn/Rm=PC. Do not open LDRH.W-reg / LDR.W-reg this bite. */
+  if ((hw1 & 0xFFF0u) == 0xF820u && (hw2 & 0x0FC0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm2 = (hw2 >> 4) & 3u;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_STRH;
+    out->rd = rt;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_amount = imm2;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    out->b = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0m: T32 LDRB.W Rt,[Rn,Rm,LSL#imm2] T2 — size=00 L=1, register form.
    * Guest f81b 0032 = ldrb.w r0,[r11,r2,lsl#3]; sib f81b 8003 imm2=0.
    * Open any imm2 0..3 (execute honors shift_amount). Reject Rt/Rn/Rm=PC.
