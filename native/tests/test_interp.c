@@ -2657,6 +2657,111 @@ static int test_thumb32_addw(void) {
   return 0;
 }
 
+
+static int test_t32_push_w_stmdb_sp(void) {
+  /* Q-OTTD-0a: push.w {r3-r11,lr} = e92d 4ff8. Stop at PC=4 after the T32. */
+  static const uint16_t kProg[] = {
+      0xE92Du, 0x4FF8u, /* stmdb sp!, {r3-r11,lr} */
+      0x4770u,          /* bx lr (not executed) */
+  };
+  uint8_t mem_buf[0x200];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  memset(mem_buf + 16, 0xA5, sizeof(mem_buf) - 16);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xE92Du, 0x4FF8u, &di) != 0 || di.op != MANGO_OP_STM ||
+      di.rn != MANGO_REG_SP || di.p != 1 || di.u != 0 || di.w != 1 || di.reglist != 0x4FF8u) {
+    fprintf(stderr, "FAIL(t32_push_w): decode op=%d rn=%u p=%d u=%d w=%d list=0x%x\n", di.op,
+            di.rn, di.p, di.u, di.w, di.reglist);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  uint32_t pre_sp = 0x100u;
+  cpu.r[MANGO_REG_SP] = pre_sp;
+  cpu.r[3] = 0x30033333u;
+  cpu.r[4] = 0x40044444u;
+  cpu.r[5] = 0x50055555u;
+  cpu.r[6] = 0x60066666u;
+  cpu.r[7] = 0x70077777u;
+  cpu.r[8] = 0x80088888u;
+  cpu.r[9] = 0x90099999u;
+  cpu.r[10] = 0xA00AAAAAu;
+  cpu.r[11] = 0xB00BBBBBu;
+  cpu.r[MANGO_REG_LR] = 0xE00EEEEEu;
+
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 10);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(t32_push_w): run rc=%d\n", rc);
+    return 1;
+  }
+  if (cpu.r[MANGO_REG_SP] != pre_sp - 40u) {
+    fprintf(stderr, "FAIL(t32_push_w): sp=0x%x want 0x%x\n", cpu.r[MANGO_REG_SP], pre_sp - 40u);
+    return 1;
+  }
+  static const uint32_t kWant[] = {0x30033333u, 0x40044444u, 0x50055555u, 0x60066666u,
+                                   0x70077777u, 0x80088888u, 0x90099999u, 0xA00AAAAAu,
+                                   0xB00BBBBBu, 0xE00EEEEEu};
+  uint32_t sp = cpu.r[MANGO_REG_SP];
+  for (int i = 0; i < 10; i++) {
+    uint32_t got = bytes_to_u32_le(mem_buf + sp + (uint32_t)i * 4u);
+    if (got != kWant[i]) {
+      fprintf(stderr, "FAIL(t32_push_w): mem[+0x%x]=0x%x want 0x%x\n", i * 4, got, kWant[i]);
+      return 1;
+    }
+  }
+  if (cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_push_w): cpsr changed 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 PUSH.W {r3-r11,lr} (Q-OTTD-0a)\n");
+  return 0;
+}
+
+static int test_t32_mul_ra15(void) {
+  /* Q-OTTD-0b: mul.w r1, r1, r4 = fb01 f104 */
+  MangoInsn di;
+  if (mango_decode_t32(0xFB01u, 0xF104u, &di) != 0 || di.op != MANGO_OP_MUL || di.rd != 1 ||
+      di.rm != 1 || di.rs != 4 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_mul): decode op=%d rd=%u rm=%u rs=%u s=%d\n", di.op, di.rd, di.rm,
+            di.rs, di.sets_flags);
+    return 1;
+  }
+
+  struct {
+    uint32_t r1, r4, want;
+  } cases[] = {
+      {7u, 9u, 0x3fu},
+      {0x12345678u, 0x10u, 0x23456780u},
+      {0xffffffffu, 0xffffffffu, 0x1u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    static const uint16_t kProg[] = {0xFB01u, 0xF104u, 0x4770u};
+    uint8_t mem_buf[32];
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[1] = cases[c].r1;
+    cpu.r[4] = cases[c].r4;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+    if (rc != 0 || cpu.r[1] != cases[c].want || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_mul#%u): rc=%d r1=0x%x want 0x%x cpsr 0x%x->0x%x\n", c, rc,
+              cpu.r[1], cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 MUL Rd,Rn,Rm Ra=15 flags off (Q-OTTD-0b)\n");
+  return 0;
+}
+
 static int test_thumb_bx_pc_veneer(void) {
   /* Thumb BX PC into ARM PLT-style veneer: dest is addr+4, not r15. */
   uint8_t mem_buf[32];
@@ -3929,6 +4034,8 @@ int main(void) {
   failures += test_thumb_blx_reg();
   failures += test_thumb32_ldr_str_imm();
   failures += test_thumb32_addw();
+  failures += test_t32_push_w_stmdb_sp();
+  failures += test_t32_mul_ra15();
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
   failures += test_vldr_s_from_stack();

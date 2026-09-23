@@ -1729,5 +1729,43 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     }
   }
 
+  /* Q-OTTD-0a: T32 STMDB / PUSH.W SP! — hw1 E92D form, Rn=SP, W=1, P(hw2)=0.
+   * Reuse MANGO_OP_STM (p=1 u=0 w=1). Not full T32 LDM/STMIA. */
+  if ((hw1 & 0xFFD0u) == 0xE900u && (hw1 & 0x0020u) != 0 && (hw1 & 0xFu) == MANGO_REG_SP &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t reglist = hw2 & 0x7FFFu; /* M<<14 | R[12:0]; PC forbidden */
+    if (reglist == 0) {
+      return -1; /* empty list UNPRED */
+    }
+    out->op = MANGO_OP_STM;
+    out->rn = MANGO_REG_SP;
+    out->reglist = reglist;
+    out->p = 1;
+    out->u = 0;
+    out->w = 1;
+    return 0;
+  }
+
+  /* Q-OTTD-0b: T32 MUL (DDI0597 T2) Ra=15 op2=0000 — Rd = Rn * Rm, S=0.
+   * Reuse MANGO_OP_MUL (rm*rs multiplicands; sets_flags=0). Not MLA/MLS. */
+  if ((hw1 & 0xFFF0u) == 0xFB00u && (hw2 & 0xF0F0u) == 0xF000u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t ra = (hw2 >> 12) & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (ra != 0xFu) {
+      return -1; /* MLA/MLS — out of scope */
+    }
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MUL;
+    out->rd = rd;
+    out->rm = rn; /* multiplicand Rn → interp rm lane */
+    out->rs = rm; /* multiplicand Rm → interp rs lane */
+    out->sets_flags = 0;
+    return 0;
+  }
+
   return -1;
 }
