@@ -223,7 +223,8 @@
 #define MANGO_LIBC_SRAND48 139
 #define MANGO_LIBC_TIME 140
 #define MANGO_LIBC_SDL_SET_VIDEO_MODE 141
-#define MANGO_LIBC_COUNT 142
+#define MANGO_LIBC_SDL_SET_COLOR_KEY 142
+#define MANGO_LIBC_COUNT 143
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x4000000u
@@ -425,6 +426,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "srand48",
     "time",
     "SDL_SetVideoMode",
+    "SDL_SetColorKey",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -458,6 +460,8 @@ static uint64_t g_blit_count;
 static uint64_t g_blit_bytes;
 static uint64_t g_fill_count;
 static int g_frame_dumped;
+static uint64_t g_ckey_blit_count;
+static uint64_t g_ckey_pixels_skipped;
 static uint64_t g_lrand48_state = 0x1234abcd330eull; /* POSIX drand48 seed */
 /* Soft-float host-stub call histogram (Meritous mapgen / title plasma). */
 static uint64_t g_aeabi_calls[MANGO_LIBC_COUNT];
@@ -2247,11 +2251,20 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_SDL_UPDATE_RECT: {
+      /* Android Meritous VideoUpdate calls UpdateRect (not Flip). Dump once
+       * after DrawPlayer has colorkey-blitted onto the framebuffer. */
       static int s_ur;
-      (void)r0; (void)r1; (void)r2;
-      if (s_ur < 5) {
-        fprintf(stderr, "mango: SDL_UpdateRect stub\n");
+      uint32_t surf = r0 ? r0 : g_fb_surf;
+      if (s_ur < 8) {
+        fprintf(stderr,
+                "mango: SDL_UpdateRect surf=0x%x ckey_blits=%llu blits=%llu\n",
+                (unsigned)surf, (unsigned long long)g_ckey_blit_count,
+                (unsigned long long)g_blit_count);
         s_ur++;
+      }
+      if (!g_frame_dumped && surf &&
+          (g_ckey_blit_count >= 1ull || g_blit_count >= 350ull)) {
+        mango_dump_framebuffer_pgm(g_fb_lib ? g_fb_lib : lib, surf);
       }
       cpu->r[0] = 0;
       break;
@@ -2259,6 +2272,36 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_SDL_SET_PALETTE:
     case MANGO_LIBC_SDL_SET_COLORS: {
       cpu->r[0] = 1; /* success */
+      break;
+    }
+    case MANGO_LIBC_SDL_SET_COLOR_KEY: {
+      /* SDL_SetColorKey(surface, flag, key) — Meritous Android sprites use SRCCOLORKEY (often key=255). */
+      uint32_t surf = r0, flag = r1, key = r2;
+      uint32_t fmt, flags;
+      static int s_ck;
+      if (!surf || !mango_guest_range_ok(lib, surf, 60u)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      fmt = mango_load_u32_guest(lib->guest_mem, surf + 4u);
+      flags = mango_load_u32_guest(lib->guest_mem, surf + 0u);
+      if (!fmt || !mango_guest_range_ok(lib, fmt, 40u)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (flag & 0x00001000u) { /* SDL_SRCCOLORKEY */
+        mango_store_u32_guest(lib->guest_mem, surf + 0u, flags | 0x00001000u);
+        mango_store_u32_guest(lib->guest_mem, fmt + 32u, key);
+      } else {
+        mango_store_u32_guest(lib->guest_mem, surf + 0u, flags & ~0x00001000u);
+      }
+      if (s_ck < 24) {
+        fprintf(stderr,
+                "mango: SDL_SetColorKey surf=0x%x flag=0x%x key=%u\n",
+                (unsigned)surf, (unsigned)flag, (unsigned)key);
+        s_ck++;
+      }
+      cpu->r[0] = 0;
       break;
     }
     case MANGO_LIBC_SDL_FILL_RECT: {
@@ -3184,12 +3227,63 @@ static int mango_sdl_soft_blit(MangoLoadedLibrary* lib, uint32_t src, uint32_t s
       !mango_guest_range_ok(lib, dpix, dpitch * dh)) {
     return -1;
   }
-  for (row = 0; row < shgt; row++) {
-    uint8_t* srow =
-        lib->guest_mem + spix + (uint32_t)(sy + row) * spitch + (uint32_t)sx * sbpp;
-    uint8_t* drow =
-        lib->guest_mem + dpix + (uint32_t)(dy + row) * dpitch + (uint32_t)dx * dbpp;
-    memcpy(drow, srow, (size_t)swid * (size_t)sbpp);
+  {
+    uint32_t sflags = mango_load_u32_guest(lib->guest_mem, src + 0u);
+    int use_ckey = (sflags & 0x00001000u) != 0;
+    uint32_t ckey = 0;
+    if (use_ckey && mango_guest_range_ok(lib, sfmt, 40u)) {
+      ckey = mango_load_u32_guest(lib->guest_mem, sfmt + 32u);
+    } else {
+      use_ckey = 0;
+    }
+    if (!use_ckey) {
+      for (row = 0; row < shgt; row++) {
+        uint8_t* srow =
+            lib->guest_mem + spix + (uint32_t)(sy + row) * spitch + (uint32_t)sx * sbpp;
+        uint8_t* drow =
+            lib->guest_mem + dpix + (uint32_t)(dy + row) * dpitch + (uint32_t)dx * dbpp;
+        memcpy(drow, srow, (size_t)swid * (size_t)sbpp);
+      }
+    } else if (sbpp == 1) {
+      uint8_t key8 = (uint8_t)(ckey & 0xffu);
+      int col;
+      uint64_t skipped = 0;
+      for (row = 0; row < shgt; row++) {
+        uint8_t* srow =
+            lib->guest_mem + spix + (uint32_t)(sy + row) * spitch + (uint32_t)sx;
+        uint8_t* drow =
+            lib->guest_mem + dpix + (uint32_t)(dy + row) * dpitch + (uint32_t)dx;
+        for (col = 0; col < swid; col++) {
+          if (srow[col] == key8) {
+            skipped++;
+          } else {
+            drow[col] = srow[col];
+          }
+        }
+      }
+      g_ckey_blit_count++;
+      g_ckey_pixels_skipped += skipped;
+    } else if (sbpp == 4) {
+      int col;
+      uint64_t skipped = 0;
+      for (row = 0; row < shgt; row++) {
+        uint32_t* srow = (uint32_t*)(lib->guest_mem + spix +
+                                     (uint32_t)(sy + row) * spitch + (uint32_t)sx * 4u);
+        uint32_t* drow = (uint32_t*)(lib->guest_mem + dpix +
+                                     (uint32_t)(dy + row) * dpitch + (uint32_t)dx * 4u);
+        for (col = 0; col < swid; col++) {
+          if (srow[col] == ckey) {
+            skipped++;
+          } else {
+            drow[col] = srow[col];
+          }
+        }
+      }
+      g_ckey_blit_count++;
+      g_ckey_pixels_skipped += skipped;
+    } else {
+      return -1;
+    }
   }
   g_blit_count++;
   g_blit_bytes += (uint64_t)swid * (uint64_t)shgt * (uint64_t)sbpp;
@@ -3197,9 +3291,7 @@ static int mango_sdl_soft_blit(MangoLoadedLibrary* lib, uint32_t src, uint32_t s
     g_fb_surf = dst;
     g_fb_lib = lib;
   }
-  if (!g_frame_dumped && g_blit_count >= 300ull && g_fb_surf) {
-    mango_dump_framebuffer_pgm(g_fb_lib ? g_fb_lib : lib, g_fb_surf);
-  }
+  /* Frame dump deferred to SDL_Flip (after DrawPlayer/entities). */
   if (dstrect) {
     mango_store_i16_guest(lib->guest_mem, dstrect, (int16_t)dx);
     mango_store_i16_guest(lib->guest_mem, dstrect + 2u, (int16_t)dy);
@@ -3329,10 +3421,11 @@ static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf) {
   g_frame_dumped = 1;
   fprintf(stderr,
           "mango: dumped framebuffer %ux%u pgm '%s' (%u nonzero, blits=%llu fills=%llu "
-          "bytes=%llu)\n",
+          "bytes=%llu ckey_blits=%llu ckey_skip=%llu)\n",
           (unsigned)w, (unsigned)h, out_path, (unsigned)nonzero,
           (unsigned long long)g_blit_count, (unsigned long long)g_fill_count,
-          (unsigned long long)g_blit_bytes);
+          (unsigned long long)g_blit_bytes, (unsigned long long)g_ckey_blit_count,
+          (unsigned long long)g_ckey_pixels_skipped);
 }
 
 static int mango_is_meritous_sdl_image(const MangoLoadedLibrary* lib) {
@@ -3435,12 +3528,7 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 0u] = 0x70u;
     lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
   }
-  /* VideoUpdate @ ELF VA 0x16118: skip SDL_UpdateRect path. */
-  addr = lib->load_bias + 0x16118u;
-  if (mango_guest_range_ok(lib, addr, 4u)) {
-    lib->guest_mem[addr + 0u] = 0x70u;
-    lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
-  }
+  /* VideoUpdate left live: SDL_Flip dumps the painted frame after DrawPlayer. */
   /* draw_text @ ELF VA 0x17f4c: title string blit is slow under interp. */
   addr = lib->load_bias + 0x17f4cu;
   if (mango_guest_range_ok(lib, addr, 4u)) {
@@ -3450,11 +3538,9 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   /* Gameplay draw path: tile walk + DrawCircle sqrt dominate after mapgen. */
   {
-    /* DrawLevel left live: host soft UpperBlit/FillRect paint the 8bpp
-     * framebuffer from tileset PNGs. Keep circle/entity/arc stubs. */
+    /* DrawLevel + DrawPlayer + DrawEntities live (host soft blit + colorkey).
+     * Keep circle/shield/arc stubs (sqrt / heavy soft-draw). */
     static const uint32_t kBx[] = {
-        0x11db4u, /* DrawEntities */
-        0x16a88u, /* DrawPlayer */
         0x18a90u, /* DrawCircle */
         0x18ba4u, /* DrawCircleEx */
         0x18cb8u, /* DrawShield */
@@ -3470,7 +3556,7 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
         lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
       }
     }
-    fprintf(stderr, "mango: Meritous stub gameplay draw helpers\n");
+    fprintf(stderr, "mango: Meritous live DrawPlayer/Entities; stub circle/shield\n");
   }
 
   /* Title loop HEAD: first visit -> New Game; after one DungeonPlay the progress
