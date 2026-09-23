@@ -3570,9 +3570,9 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   /* DungeonPlay left intact — title head branches to New Game at 0x1cf86. */
 
-  /* Generate() → 3000 rooms (vanilla). Dist gate >20. InitEnemies keep
-   * place give-up (skip cr_w/h<2, n_enemies=1, IsSolid-fail→next room),
-   * type-5 50→2 at even VA, walk →999 — full Generate stays ~2.6s. */
+  /* Generate() → 3000 rooms (vanilla). Dist gate >20. InitEnemies: full
+   * walk →3000 with place give-up (skip cr_w/h<2, n_enemies=1,
+   * IsSolid-fail→next room), type-5 50→2 at even VA — ~2.7s drive. */
   addr = lib->load_bias + 0x1e61cu;
   if (mango_guest_range_ok(lib, addr, 4u)) {
     mango_store_u32_guest(lib->guest_mem, addr, 3000u);
@@ -3630,8 +3630,8 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
   }
   addr = lib->load_bias + 0x135c0u;
   if (mango_guest_range_ok(lib, addr, 4u)) {
-    mango_store_u32_guest(lib->guest_mem, addr, 999u * 0x34u);
-    fprintf(stderr, "mango: Meritous InitEnemies room loop ->999 (of 1000)\n");
+    mango_store_u32_guest(lib->guest_mem, addr, 3000u * 0x34u);
+    fprintf(stderr, "mango: Meritous InitEnemies room loop ->3000 (of 3000)\n");
   }
 
   g_meritous_progress_armed = 1;
