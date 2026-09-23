@@ -36,6 +36,8 @@ typedef enum MangoOp {
   MANGO_OP_BL,
   MANGO_OP_BLX,
   MANGO_OP_BX,
+  MANGO_OP_CBZ,  /* T16 compare-and-branch-zero; tests Rn, not CPSR.Z */
+  MANGO_OP_CBNZ, /* T16 compare-and-branch-nonzero */
   MANGO_OP_MOVT,
   MANGO_OP_IT,
   MANGO_OP_LDR,

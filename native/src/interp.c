@@ -692,6 +692,15 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
         }
 
+        case MANGO_OP_CBZ:
+        case MANGO_OP_CBNZ: {
+          /* Branch on Rn==0 / Rn!=0. Does not read or write NZCV (unlike B+EQ/NE). */
+          uint32_t rn_val = mango_read_reg(cpu, addr, insn.rn);
+          int taken = (insn.op == MANGO_OP_CBZ) ? (rn_val == 0u) : (rn_val != 0u);
+          next_addr = taken ? (addr + 4u + insn.imm) : (addr + 2u);
+          break;
+        }
+
         case MANGO_OP_BL:
           if (cpu->cpsr & MANGO_CPSR_T) {
             cpu->r[MANGO_REG_LR] = (addr + 4u) | 1u;

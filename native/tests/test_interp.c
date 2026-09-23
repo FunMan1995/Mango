@@ -3448,6 +3448,219 @@ static int test_t32_ldrsh_str_reject(void) {
   return 0;
 }
 
+
+static int test_t16_cbz_b1ff(void) {
+  /* Q-OTTD-0h: b1ff = cbz r7, #+62. Taken → pc+66 (+0x42); fall → pc+2.
+   * NZCV untouched. Must NOT read CPSR.Z (Z set + r7!=0 still falls). */
+  MangoInsn di;
+  if (mango_decode_t16(0xB1FFu, &di) != 0 || di.op != MANGO_OP_CBZ || di.rn != 7 ||
+      di.is_imm != 1 || di.imm != 62u || di.cond != 0xEu) {
+    fprintf(stderr,
+            "FAIL(t16_cbz_b1ff): decode op=%d rn=%u imm=%u cond=0x%x "
+            "(want CBZ r7,#62)\n",
+            di.op, di.rn, di.imm, di.cond);
+    return 1;
+  }
+
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = 0xff;
+  mem_buf[1] = 0xb1; /* b1ff at addr 0 */
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  /* taken: r7==0 → next = 0+4+62 = 66 */
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C | MANGO_CPSR_V; /* Z clear */
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[7] = 0;
+    cpu.r[MANGO_REG_PC] = 0;
+    int rc = mango_interp_run(&cpu, &mem, 66u, 10);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != 66u) {
+      fprintf(stderr, "FAIL(t16_cbz_b1ff taken): rc=%d pc=0x%x want 66\n", rc,
+              cpu.r[MANGO_REG_PC]);
+      return 1;
+    }
+    if (cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t16_cbz_b1ff taken): cpsr 0x%x -> 0x%x (NZCV must hold)\n",
+              cpsr_before, cpu.cpsr);
+      return 1;
+    }
+    if (cpu.r[7] != 0) {
+      fprintf(stderr, "FAIL(t16_cbz_b1ff taken): r7 mutated\n");
+      return 1;
+    }
+  }
+
+  /* fall: r7==1 → next = 0+2 = 2 */
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C; /* Z set intentionally */
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[7] = 1;
+    cpu.r[MANGO_REG_PC] = 0;
+    int rc = mango_interp_run(&cpu, &mem, 2u, 10);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != 2u) {
+      fprintf(stderr, "FAIL(t16_cbz_b1ff fall): rc=%d pc=0x%x want 2\n", rc,
+              cpu.r[MANGO_REG_PC]);
+      return 1;
+    }
+    if (cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t16_cbz_b1ff fall): cpsr 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+
+  /* Z≠Rn proof: CPSR.Z set but r7!=0 → CBZ must FALL (would TAKE if B+EQ). */
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_N | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[7] = 0x42u; /* nonzero */
+    cpu.r[MANGO_REG_PC] = 0;
+    int rc = mango_interp_run(&cpu, &mem, 2u, 10);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != 2u) {
+      fprintf(stderr,
+              "FAIL(t16_cbz_b1ff Z!=Rn): rc=%d pc=0x%x — CBZ must test Rn not CPSR.Z "
+              "(Z set + r7!=0 must fall)\n",
+              rc, cpu.r[MANGO_REG_PC]);
+      return 1;
+    }
+    if (cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t16_cbz_b1ff Z!=Rn): cpsr changed\n");
+      return 1;
+    }
+  }
+
+  printf("ok: T16 CBZ b1ff r7 #+62 taken/fall + NZCV + Z!=Rn (Q-OTTD-0h)\n");
+  return 0;
+}
+
+static int test_t16_cbz_b369(void) {
+  /* Q-OTTD-0h: b369 = cbz r1, #+90 (op bit11=0 → CBZ, not CBNZ).
+   * Taken → pc+94 (+0x5e); fall → pc+2. */
+  MangoInsn di;
+  if (mango_decode_t16(0xB369u, &di) != 0 || di.op != MANGO_OP_CBZ || di.rn != 1 ||
+      di.is_imm != 1 || di.imm != 90u) {
+    fprintf(stderr,
+            "FAIL(t16_cbz_b369): decode op=%d rn=%u imm=%u "
+            "(want CBZ r1,#90 — bit11=0 is CBZ not CBNZ)\n",
+            di.op, di.rn, di.imm);
+    return 1;
+  }
+  if (di.op == MANGO_OP_CBNZ) {
+    fprintf(stderr, "FAIL(t16_cbz_b369): decoded as CBNZ — guest b369 is CBZ\n");
+    return 1;
+  }
+
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = 0x69;
+  mem_buf[1] = 0xb3;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[1] = 0;
+    int rc = mango_interp_run(&cpu, &mem, 94u, 10);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != 94u) {
+      fprintf(stderr, "FAIL(t16_cbz_b369 taken): rc=%d pc=0x%x want 94\n", rc,
+              cpu.r[MANGO_REG_PC]);
+      return 1;
+    }
+    if (cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t16_cbz_b369 taken): cpsr changed\n");
+      return 1;
+    }
+  }
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[1] = 5;
+    int rc = mango_interp_run(&cpu, &mem, 2u, 10);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != 2u) {
+      fprintf(stderr, "FAIL(t16_cbz_b369 fall): rc=%d pc=0x%x want 2\n", rc,
+              cpu.r[MANGO_REG_PC]);
+      return 1;
+    }
+    if (cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t16_cbz_b369 fall): cpsr changed\n");
+      return 1;
+    }
+  }
+
+  printf("ok: T16 CBZ b369 r1 #+90 taken/fall (Q-OTTD-0h)\n");
+  return 0;
+}
+
+static int test_t16_cbnz_b978(void) {
+  /* Q-OTTD-0h sibling: b978 = cbnz r0, #+30. Taken → pc+34 (+0x22); fall → pc+2. */
+  MangoInsn di;
+  if (mango_decode_t16(0xB978u, &di) != 0 || di.op != MANGO_OP_CBNZ || di.rn != 0 ||
+      di.is_imm != 1 || di.imm != 30u || di.cond != 0xEu) {
+    fprintf(stderr,
+            "FAIL(t16_cbnz_b978): decode op=%d rn=%u imm=%u "
+            "(want CBNZ r0,#30)\n",
+            di.op, di.rn, di.imm);
+    return 1;
+  }
+
+  uint8_t mem_buf[64];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = 0x78;
+  mem_buf[1] = 0xb9;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_V; /* Z clear */
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = 7;
+    int rc = mango_interp_run(&cpu, &mem, 34u, 10);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != 34u) {
+      fprintf(stderr, "FAIL(t16_cbnz_b978 taken): rc=%d pc=0x%x want 34\n", rc,
+              cpu.r[MANGO_REG_PC]);
+      return 1;
+    }
+    if (cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t16_cbnz_b978 taken): cpsr changed\n");
+      return 1;
+    }
+  }
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    /* Z clear + r0==0: CBNZ must FALL (would TAKE if wrongly B+NE on Z). */
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = 0;
+    int rc = mango_interp_run(&cpu, &mem, 2u, 10);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != 2u) {
+      fprintf(stderr,
+              "FAIL(t16_cbnz_b978 fall/Z!=Rn): rc=%d pc=0x%x — CBNZ must test Rn "
+              "not CPSR.Z\n",
+              rc, cpu.r[MANGO_REG_PC]);
+      return 1;
+    }
+    if (cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t16_cbnz_b978 fall): cpsr changed\n");
+      return 1;
+    }
+  }
+
+  printf("ok: T16 CBNZ b978 r0 #+30 taken/fall + Z!=Rn (Q-OTTD-0h)\n");
+  return 0;
+}
+
 static int test_thumb_bx_pc_veneer(void) {
   /* Thumb BX PC into ARM PLT-style veneer: dest is addr+4, not r15. */
   uint8_t mem_buf[32];
@@ -4738,6 +4951,9 @@ int main(void) {
   failures += test_t32_ldrsh_w_imm12();
   failures += test_t32_str_w_imm8_neg();
   failures += test_t32_ldrsh_str_reject();
+  failures += test_t16_cbz_b1ff();
+  failures += test_t16_cbz_b369();
+  failures += test_t16_cbnz_b978();
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
   failures += test_vldr_s_from_stack();

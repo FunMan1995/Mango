@@ -1533,6 +1533,18 @@ int mango_decode_t16(uint16_t hw, MangoInsn* out) {
       out->w = 1;
       return 0;
     }
+    /* CBZ/CBNZ: 1011 op 0 i 1 imm5 Rn — (hw & 0xF500) == 0xB100.
+     * op bit11: 0=CBZ, 1=CBNZ. Tests Rn vs zero; does not touch NZCV. */
+    if ((hw & 0xF500u) == 0xB100u) {
+      uint32_t i = (hw >> 9) & 1u;
+      uint32_t imm5 = (hw >> 3) & 0x1Fu;
+      out->op = ((hw >> 11) & 1u) ? MANGO_OP_CBNZ : MANGO_OP_CBZ;
+      out->rn = hw & 7u;
+      out->is_imm = 1;
+      out->imm = (i << 6) | (imm5 << 1);
+      out->cond = 0xEu; /* always execute the compare-branch itself */
+      return 0;
+    }
     return -1;
   }
 

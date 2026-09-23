@@ -66,7 +66,7 @@ synthetic programs, not real app code yet.
   implemented: low-register ALU, `MOV`/`ADD`/`SUB`/`CMP` immediates,
   shifts, load/store (imm, register, SP-relative, PC-literal), `ADR`,
   `ADD`/`SUB SP`, `PUSH`/`POP`, `STMIA`/`LDMIA`, conditional and
-  unconditional `B`, `SVC`, and `BX`. `BX` and `POP {pc}` interwork:
+  unconditional `B`, `CBZ`/`CBNZ` (Rn-vs-zero; NZCV untouched), `SVC`, and `BX`. `BX` and `POP {pc}` interwork:
   bit 0 of the target selects Thumb vs ARM (odd stop-sentinels used by
   the tests are left intact so a `BX LR` halt still matches). 32-bit
   Thumb covers `BL`/`BLX` (immediate), `B.W` / `B<cond>.W`, `MOVW`/`MOVT`,
