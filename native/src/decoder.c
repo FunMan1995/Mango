@@ -2073,8 +2073,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * f809 0c04 (P=1 U=0 W=0), pre WB f804 3f01, neg offset f804 3c01.
    * Mirror 0s STR.W imm8 (F840); reuse MANGO_OP_STR with b=1. Execute already
    * honors p/u/w + byte. Distinct from F880 STRB imm12 (bit7=1) and F810 LDRB
-   * reg (bit11=0). Reject STRBT (P=0 W=0) and Rt/Rn=PC. Hold LDRH.W WB / LDRB
-   * imm8 T4 this bite. */
+   * reg (bit11=0). Reject STRBT (P=0 W=0) and Rt/Rn=PC. LDRB imm8 T4 is 0aa;
+   * hold LDRH.W WB for a later bite. */
   if ((hw1 & 0xFFF0u) == 0xF800u && (hw2 & 0x0800u) != 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
@@ -2150,6 +2150,37 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->u = 1;
     out->w = 0;
     out->b = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0aa: T32 LDRB.W Rt,[Rn,#±imm8]!? T4 — size=00 L=1, bit11=1 P/U/W.
+   * Guest f810 3b01 = ldrb.w r3,[r0],#1 (P=0 U=1 W=1). Also covers pre WB
+   * f810 3f01 and U=0 no-WB f810 3c01. Mirror 0z STRB.W imm8 (F800); reuse
+   * MANGO_OP_LDR with b=1. Execute already honors p/u/w + byte. Distinct from
+   * F890 LDRB imm12 (bit7=1) and 0m LDRB-reg (bit11=0). Reject LDRBT (P=0 W=0)
+   * and Rt/Rn=PC. Hold LDRH.W WB / T32 CLZ this bite. */
+  if ((hw1 & 0xFFF0u) == 0xF810u && (hw2 & 0x0800u) != 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw2 >> 10) & 1u);
+    int u = (int)((hw2 >> 9) & 1u);
+    int w = (int)((hw2 >> 8) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* LDRBT */
+    }
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDR;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm8; /* byte offset, not shifted */
+    out->p = p;
+    out->u = u;
+    out->w = w;
+    out->b = 1;
     return 0;
   }
 
