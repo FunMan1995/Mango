@@ -3570,10 +3570,9 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   /* DungeonPlay left intact — title head branches to New Game at 0x1cf86. */
 
-  /* Generate() → 1000 rooms (boss index 999 exists). InitEnemies for all
-   * 999 non-start rooms is the wall under interp (enemy place loops); keep
-   * map topology large but only spawn into the first 256 rooms. Dist gate
-   * >20 (vanilla >49) so 1k-room maps pass without ResetLevel storms. */
+  /* Generate() → 1000 rooms (boss index 999 exists). InitEnemies walk raised
+   * to 450 (500+ cliffs on a pathological place-loop under interp). Type-5
+   * n_enemies 50→2. Dist gate >20 (vanilla >49). */
   addr = lib->load_bias + 0x1e61cu;
   if (mango_guest_range_ok(lib, addr, 4u)) {
     mango_store_u32_guest(lib->guest_mem, addr, 1000u);
@@ -3585,13 +3584,19 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 1u] = 0x29u; /* cmp r1, #0x14 */
     fprintf(stderr, "mango: Meritous Generate dist gate >49 -> >20\n");
   }
+    addr = lib->load_bias + 0x1345du;
+  if (mango_guest_range_ok(lib, addr, 2u)) {
+    lib->guest_mem[addr + 0u] = 0x02u;
+    lib->guest_mem[addr + 1u] = 0x23u; /* movs r3, #2 (was #50 type-5) */
+    fprintf(stderr, "mango: Meritous InitEnemies type5 enemies 50->2\n");
+  }
   addr = lib->load_bias + 0x135c0u;
   if (mango_guest_range_ok(lib, addr, 4u)) {
-    mango_store_u32_guest(lib->guest_mem, addr, 256u * 0x34u);
-    fprintf(stderr, "mango: Meritous InitEnemies room loop ->256 (of 1000)\n");
+    mango_store_u32_guest(lib->guest_mem, addr, 450u * 0x34u);
+    fprintf(stderr, "mango: Meritous InitEnemies room loop ->450 (of 1000)\n");
   }
 
-  g_meritous_progress_armed = 1;
+g_meritous_progress_armed = 1;
   g_meritous_bias = lib->load_bias;
   g_meritous_seen_mask = 0;
   setvbuf(stderr, NULL, _IONBF, 0);
