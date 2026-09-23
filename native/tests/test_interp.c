@@ -3727,6 +3727,96 @@ static int test_neon_ctor_vmul_vswp(void) {
 }
 
 
+
+static int test_neon_ctor_vmov_scalar32(void) {
+  /* OFDP ctor uncovered 0xee212b90: vmov.32 d17[1], r2 */
+  MangoInsn insn;
+
+  if (mango_decode(0xEE212B90u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 7 ||
+      insn.b != 0 || insn.rd != 17u || insn.rn != 2u || insn.imm != 1u) {
+    fprintf(stderr, "FAIL(ctor_vmov32): decode op=%d u=%d rd=%u rn=%u imm=%u b=%d\n",
+            (int)insn.op, insn.u, insn.rd, insn.rn, insn.imm, insn.b);
+    return 1;
+  }
+  /* Reverse L=1 and lane 0 encodings (trivial same path). */
+  if (mango_decode(0xEE312B90u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 7 ||
+      insn.b != 1 || insn.rd != 17u || insn.rn != 2u || insn.imm != 1u) {
+    fprintf(stderr, "FAIL(ctor_vmov32): reverse.decode op=%d u=%d b=%d imm=%u\n", (int)insn.op,
+            insn.u, insn.b, insn.imm);
+    return 1;
+  }
+  if (mango_decode(0xEE012B90u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 7 ||
+      insn.b != 0 || insn.imm != 0u) {
+    fprintf(stderr, "FAIL(ctor_vmov32): lane0.decode op=%d u=%d imm=%u\n", (int)insn.op, insn.u,
+            insn.imm);
+    return 1;
+  }
+
+  {
+    /* Insert into upper lane; lower must stay. */
+    static const uint32_t kProg[] = {0xEE212B90u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[34] = 0xAAAABBBBu; /* d17 low */
+    cpu.s[35] = 0xCCCCDDDDu; /* d17 high — overwritten */
+    cpu.r[2] = 0x12345678u;
+    cpu.r[MANGO_REG_LR] = 0xBBBBu;
+    int rc = mango_interp_run(&cpu, &mem, 0xBBBBu, 100);
+    if (rc != 0 || cpu.s[34] != 0xAAAABBBBu || cpu.s[35] != 0x12345678u) {
+      fprintf(stderr, "FAIL(ctor_vmov32): insert rc=%d d17=%08x %08x\n", rc, cpu.s[34],
+              cpu.s[35]);
+      return 1;
+    }
+  }
+
+  {
+    /* Extract upper lane into r2; D unchanged. */
+    static const uint32_t kProg[] = {0xEE312B90u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[34] = 0x11112222u;
+    cpu.s[35] = 0x33334444u;
+    cpu.r[2] = 0xDEADBEEFu;
+    cpu.r[MANGO_REG_LR] = 0xCCCCu;
+    int rc = mango_interp_run(&cpu, &mem, 0xCCCCu, 100);
+    if (rc != 0 || cpu.r[2] != 0x33334444u || cpu.s[34] != 0x11112222u ||
+        cpu.s[35] != 0x33334444u) {
+      fprintf(stderr, "FAIL(ctor_vmov32): extract rc=%d r2=%08x d17=%08x %08x\n", rc, cpu.r[2],
+              cpu.s[34], cpu.s[35]);
+      return 1;
+    }
+  }
+
+  {
+    /* Insert into lower lane; upper must stay. */
+    static const uint32_t kProg[] = {0xEE012B90u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[34] = 0xAAAABBBBu;
+    cpu.s[35] = 0xCCCCDDDDu;
+    cpu.r[2] = 0x55AA55AAu;
+    cpu.r[MANGO_REG_LR] = 0xDDDDu;
+    int rc = mango_interp_run(&cpu, &mem, 0xDDDDu, 100);
+    if (rc != 0 || cpu.s[34] != 0x55AA55AAu || cpu.s[35] != 0xCCCCDDDDu) {
+      fprintf(stderr, "FAIL(ctor_vmov32): lane0.insert rc=%d d17=%08x %08x\n", rc, cpu.s[34],
+              cpu.s[35]);
+      return 1;
+    }
+  }
+
+  printf("ok: OFDP ctor VMOV.32 Dd[x], Rt / Rt, Dd[x]\n");
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -3809,6 +3899,7 @@ int main(void) {
   failures += test_neon_ctor_vmov_vmvn_vrecpe_vext();
   failures += test_neon_ctor_vrecps_vorr();
   failures += test_neon_ctor_vmul_vswp();
+  failures += test_neon_ctor_vmov_scalar32();
   failures += test_strexd();
 
   if (failures != 0) {

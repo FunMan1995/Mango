@@ -406,6 +406,24 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       out->imm = esize;
       return 0;
     }
+    /* VMOV.32 Dd[x], Rt / Rt, Dd[x] (A8.8.340): bit4=1, cp=1011, bit23=0,
+     * opc1=0H (bits22:21), opc2=00, bits3-0=0000. u=7; b=L (0=to neon). */
+    if (dbl && ((word >> 4) & 1u) && ((word >> 23) & 1u) == 0 && (word & 0xFu) == 0 &&
+        ((word >> 21) & 2u) == 0 && ((word >> 5) & 3u) == 0) {
+      uint32_t rt = vd; /* bits 15-12 */
+      uint32_t d = (nbit << 4) | vn; /* D is bit 7, Vd is bits 19-16 */
+      uint32_t lane = (word >> 21) & 1u;
+      if (rt == MANGO_REG_PC || d >= 32u) {
+        return -1;
+      }
+      out->op = MANGO_OP_VMOV;
+      out->u = 7; /* scalar 32-bit lane ↔ GPR */
+      out->rd = d;
+      out->rn = rt;
+      out->imm = lane;
+      out->b = (int)((word >> 20) & 1u); /* L: 0 = Dd[x]←Rt, 1 = Rt←Dd[x] */
+      return 0;
+    }
     if (dbl && ((word >> 16) & 0xBFu) == 0xB8u && ((word >> 4) & 0xDu) == 0xCu) {
       out->op = MANGO_OP_VCVT; /* vcvt.f64.s32 Dd, Sm */
       out->rd = (dbit << 4) | vd;
