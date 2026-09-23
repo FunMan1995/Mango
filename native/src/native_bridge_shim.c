@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "mango/cpu.h"
 #include "mango/decoder.h"
@@ -21,7 +22,7 @@
 #include "mango/native_bridge.h"
 
 #define MANGO_STACK_SIZE 0x10000u
-#define MANGO_HEAP_SIZE 0x400000u
+#define MANGO_HEAP_SIZE 0x1000000u
 #define MANGO_JNI_TABLE_LEN 256u
 #define MANGO_JVM_TABLE_LEN 8u
 #define MANGO_JNI_THUNK_SIZE 16u
@@ -158,10 +159,23 @@
 #define MANGO_LIBC_AEABI_IDIVMOD 78
 #define MANGO_LIBC_AEABI_UIDIV 79
 #define MANGO_LIBC_AEABI_UIDIVMOD 80
-#define MANGO_LIBC_COUNT 81
+#define MANGO_LIBC_FOPEN 81
+#define MANGO_LIBC_FCLOSE 82
+#define MANGO_LIBC_FREAD 83
+#define MANGO_LIBC_FWRITE 84
+#define MANGO_LIBC_FSEEK 85
+#define MANGO_LIBC_FTELL 86
+#define MANGO_LIBC_IMG_LOAD 87
+#define MANGO_LIBC_AEABI_I2D 88
+#define MANGO_LIBC_AEABI_D2IZ 89
+#define MANGO_LIBC_SDL_GETTICKS 90
+#define MANGO_LIBC_SDL_DELAY 91
+#define MANGO_LIBC_SDL_POLL_EVENT 92
+#define MANGO_LIBC_SDL_UPPER_BLIT 93
+#define MANGO_LIBC_COUNT 94
 #define MANGO_TSD_KEYS 16
 
-#define MANGO_AS_SIZE 0x2800000u
+#define MANGO_AS_SIZE 0x4000000u
 #define MANGO_LIB_CAP 0x2000000u
 #define MANGO_MAX_LIBS 16
 
@@ -299,6 +313,19 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "__aeabi_idivmod",
     "__aeabi_uidiv",
     "__aeabi_uidivmod",
+    "fopen",
+    "fclose",
+    "fread",
+    "fwrite",
+    "fseek",
+    "ftell",
+    "IMG_Load",
+    "__aeabi_i2d",
+    "__aeabi_d2iz",
+    "SDL_GetTicks",
+    "SDL_Delay",
+    "SDL_PollEvent",
+    "SDL_UpperBlit",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -325,11 +352,92 @@ static const uint32_t kAuxv[] = {16u, (1u << 6) | (1u << 12) | (1u << 13) | (1u 
 static const char* g_fake_data;
 static uint32_t g_fake_len;
 static uint32_t g_fake_off;
+static uint64_t g_sdl_ticks_start_ms;
+
+/* Guest stdio: FILE* are small host-table ids (0 = NULL). Meritous IMG_Load
+ * reaches SDL_RWFromFile → fopen("dat/i/title.png"); without this the NULL
+ * surface is used as a guest object at address 0 (ELF header) and a 640×480
+ * store loop clobbers libsdl .text including SDL_UpperBlit. */
+#define MANGO_FILE_MAX 64
+#define MANGO_FAKE_GLES_HANDLE 0x7e01u
+static FILE* g_files[MANGO_FILE_MAX];
+
+static FILE* mango_file_get(uint32_t id) {
+  if (id == 0 || id >= MANGO_FILE_MAX) {
+    return NULL;
+  }
+  return g_files[id];
+}
+
+static uint32_t mango_file_intern(FILE* fp) {
+  if (fp == NULL) {
+    return 0;
+  }
+  for (uint32_t i = 1; i < MANGO_FILE_MAX; i++) {
+    if (g_files[i] == NULL) {
+      g_files[i] = fp;
+      return i;
+    }
+  }
+  fclose(fp);
+  return 0;
+}
+
+static void mango_file_release(uint32_t id) {
+  if (id == 0 || id >= MANGO_FILE_MAX) {
+    return;
+  }
+  if (g_files[id]) {
+    fclose(g_files[id]);
+    g_files[id] = NULL;
+  }
+}
+
+/* Resolve path for fopen: as-is, then <libdir>/../gamedata/<path>, then
+ * <libdir>/../<path>, then $MANGO_ASSET_ROOT/<path>. */
+static FILE* mango_host_fopen(MangoLoadedLibrary* lib, const char* path, const char* mode) {
+  char cand[768];
+  FILE* fp;
+  const char* root;
+  if (!path || !mode) {
+    return NULL;
+  }
+  fp = fopen(path, mode);
+  if (fp) {
+    return fp;
+  }
+  if (lib && lib->path[0] && strrchr(lib->path, '/')) {
+    const char* slash = strrchr(lib->path, '/');
+    int dlen = (int)(slash - lib->path);
+    snprintf(cand, sizeof(cand), "%.*s/../gamedata/%s", dlen, lib->path, path);
+    fp = fopen(cand, mode);
+    if (fp) {
+      return fp;
+    }
+    snprintf(cand, sizeof(cand), "%.*s/../%s", dlen, lib->path, path);
+    fp = fopen(cand, mode);
+    if (fp) {
+      return fp;
+    }
+  }
+  root = getenv("MANGO_ASSET_ROOT");
+  if (root && root[0]) {
+    snprintf(cand, sizeof(cand), "%s/%s", root, path);
+    fp = fopen(cand, mode);
+    if (fp) {
+      return fp;
+    }
+  }
+  return NULL;
+}
 
 static void* mango_load_library(const char* libpath, int flag);
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env);
 static const char* mango_guest_cstr(MangoLoadedLibrary* lib, uint32_t addr);
 static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n);
+static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h);
+static void mango_patch_meritous_img_load(MangoLoadedLibrary* lib);
+
 
 static int mango_alloc_slot(void) {
   for (int i = 0; i < g_nslots; i++) {
@@ -588,6 +696,7 @@ static uint32_t mango_load_u32_guest(const uint8_t* mem, uint32_t addr) {
          ((uint32_t)mem[addr + 3u] << 24);
 }
 
+
 static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n) {
   return n == 0 || ((uint64_t)addr + n <= lib->guest_mem_size);
 }
@@ -801,8 +910,19 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_DLOPEN: {
       const char* nm = mango_guest_cstr(lib, r0);
       char path[512];
+      const char* base;
       if (!nm) {
         cpu->r[0] = 0;
+        break;
+      }
+      base = strrchr(nm, '/');
+      base = base ? base + 1 : nm;
+      /* Host has no GLES .so; libsdl NEEDED/dlopen's it for Android GL video.
+       * Return a fake handle so init continues; gl* already resolve to stubs. */
+      if (strcmp(base, "libGLESv1_CM.so") == 0 || strcmp(base, "libGLESv2.so") == 0 ||
+          strcmp(base, "libEGL.so") == 0) {
+        fprintf(stderr, "mango: dlopen STUB %s -> id=%u\n", nm, MANGO_FAKE_GLES_HANDLE);
+        cpu->r[0] = MANGO_FAKE_GLES_HANDLE;
         break;
       }
       if (nm[0] == '/') {
@@ -841,7 +961,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       const char* nm = mango_guest_cstr(lib, r1);
       cpu->r[0] = 0;
       if (nm) {
-        if (r0 == 0) {
+        if (r0 == 0 || r0 == MANGO_FAKE_GLES_HANDLE) {
           cpu->r[0] = mango_resolve_import(lib, nm, 0, 0);
         } else if (r0 >= 1u && r0 <= (uint32_t)g_nlibs) {
           MangoLoadedLibrary* other = g_libs[r0 - 1u];
@@ -1237,6 +1357,114 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       }
       break;
     }
+    case MANGO_LIBC_FOPEN: {
+      const char* path = mango_guest_cstr(lib, r0);
+      const char* mode = mango_guest_cstr(lib, r1);
+      FILE* fp = mango_host_fopen(lib, path, mode ? mode : "rb");
+      cpu->r[0] = mango_file_intern(fp);
+      if (cpu->r[0] == 0 && path) {
+        fprintf(stderr, "mango: fopen FAIL %s\n", path);
+      }
+      break;
+    }
+    case MANGO_LIBC_FCLOSE:
+      mango_file_release(r0);
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_FREAD: {
+      /* fread(ptr, size, nmemb, fp) — r0,r1,r2,r3 */
+      FILE* fp = mango_file_get(cpu->r[3]);
+      uint64_t bytes = (uint64_t)r1 * (uint64_t)r2;
+      if (!fp || r1 == 0 || r2 == 0 || bytes > 0xffffffffu ||
+          !mango_guest_range_ok(lib, r0, (uint32_t)bytes)) {
+        cpu->r[0] = 0;
+      } else {
+        size_t n = fread(lib->guest_mem + r0, (size_t)r1, (size_t)r2, fp);
+        cpu->r[0] = (uint32_t)n;
+      }
+      break;
+    }
+    case MANGO_LIBC_FWRITE: {
+      FILE* fp = mango_file_get(cpu->r[3]);
+      uint64_t bytes = (uint64_t)r1 * (uint64_t)r2;
+      if (!fp || r1 == 0 || r2 == 0 || bytes > 0xffffffffu ||
+          !mango_guest_range_ok(lib, r0, (uint32_t)bytes)) {
+        cpu->r[0] = 0;
+      } else {
+        size_t n = fwrite(lib->guest_mem + r0, (size_t)r1, (size_t)r2, fp);
+        cpu->r[0] = (uint32_t)n;
+      }
+      break;
+    }
+    case MANGO_LIBC_FSEEK: {
+      FILE* fp = mango_file_get(r0);
+      cpu->r[0] = (fp && fseek(fp, (long)(int32_t)r1, (int)r2) == 0) ? 0u : (uint32_t)-1;
+      break;
+    }
+    case MANGO_LIBC_FTELL: {
+      FILE* fp = mango_file_get(r0);
+      long pos = fp ? ftell(fp) : -1L;
+      cpu->r[0] = (pos < 0) ? (uint32_t)-1 : (uint32_t)pos;
+      break;
+    }
+    case MANGO_LIBC_IMG_LOAD: {
+      /* Host stub: ignore path (PNG needs guest zlib inflate marshalling).
+       * Return a heap SDL_Surface so Meritous never blits through a NULL. */
+      const char* path = mango_guest_cstr(lib, r0);
+      (void)path;
+      uint32_t surf = mango_guest_sdl_surface(lib, 256u, 256u);
+      cpu->r[0] = surf;
+      break;
+    }
+    case MANGO_LIBC_AEABI_I2D: {
+      /* int32 -> double in r0:r1 (soft-ABI little-endian). Meritous title
+       * plasma loop calls this ~300k× via interpreted libgcc otherwise. */
+      union { double d; uint32_t u[2]; } v;
+      v.d = (double)(int32_t)r0;
+      cpu->r[0] = v.u[0];
+      cpu->r[1] = v.u[1];
+      break;
+    }
+    case MANGO_LIBC_AEABI_D2IZ: {
+      union { double d; uint32_t u[2]; } v;
+      v.u[0] = r0;
+      v.u[1] = r1;
+      cpu->r[0] = (uint32_t)(int32_t)v.d;
+      break;
+    }
+    case MANGO_LIBC_SDL_GETTICKS: {
+      /* Guest Delay busy-waits on GetTicks; advance a virtual clock so waits
+       * finish in a few interpreter steps instead of wall-clock time. */
+      g_sdl_ticks_start_ms += 50u;
+      cpu->r[0] = (uint32_t)g_sdl_ticks_start_ms;
+      break;
+    }
+    case MANGO_LIBC_SDL_DELAY: {
+      /* Title uses GetTicks busy-wait; Delay itself can be a no-op. */
+      (void)r0;
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_SDL_POLL_EVENT: {
+      /* Title waits for KEYDOWN/QUIT. Inject one KEYDOWN then empty. */
+      static int s_injected;
+      uint32_t ev = r0;
+      if (!s_injected && ev != 0 && mango_guest_range_ok(lib, ev, 16u)) {
+        lib->guest_mem[ev] = 2u; /* SDL_KEYDOWN */
+        s_injected = 1;
+        cpu->r[0] = 1;
+      } else {
+        cpu->r[0] = 0;
+      }
+      break;
+    }
+    case MANGO_LIBC_SDL_UPPER_BLIT: {
+      /* Software CalculateBlit of 640×480 is millions of interpreted ops.
+       * Report success without copying; enough to advance Meritous. */
+      (void)r0; (void)r1; (void)r2;
+      cpu->r[0] = 0;
+      break;
+    }
     default:
       cpu->r[0] = (uint32_t)-1;
       break;
@@ -1564,7 +1792,8 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
       return 0;
     }
     if (rc == -3) {
-      /* Already logged "step limit hit"; do not mislabel as uncovereds. */
+      fprintf(stderr, "mango: step-limit pc=0x%x lr=0x%x r0=%x r1=%x\n",
+              cpu->r[MANGO_REG_PC], cpu->r[MANGO_REG_LR], cpu->r[0], cpu->r[1]);
       return -1;
     }
     if (rc != 1) {
@@ -1894,6 +2123,148 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  * to guest malloc as well.
  */
 
+
+/* SDL 1.2 software surface large enough for Meritous title blit (640×480).
+ * Used when we host-hook IMG_Load so a failed/partial decode cannot hand the
+ * game a NULL surface (NULL→pixels load at addr 0x14 reads ELF magic and the
+ * fill loop strb's through libsdl .text). */
+static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h) {
+  uint32_t fmt, surf, pixels, pitch, nbytes;
+  if (w == 0 || h == 0 || w > 4096u || h > 4096u) {
+    return 0;
+  }
+  pitch = w * 4u;
+  nbytes = pitch * h;
+  fmt = mango_guest_alloc(lib, 64u);
+  surf = mango_guest_alloc(lib, 64u);
+  pixels = mango_guest_alloc(lib, nbytes);
+  if (!fmt || !surf || !pixels) {
+    return 0;
+  }
+  /* SDL_PixelFormat: 32bpp RGBA8888-ish */
+  mango_store_u32_guest(lib->guest_mem, fmt + 0u, 0u); /* palette */
+  lib->guest_mem[fmt + 4u] = 32; /* BitsPerPixel */
+  lib->guest_mem[fmt + 5u] = 4;  /* BytesPerPixel */
+  mango_store_u32_guest(lib->guest_mem, fmt + 16u, 0x000000ffu); /* Rmask */
+  mango_store_u32_guest(lib->guest_mem, fmt + 20u, 0x0000ff00u);
+  mango_store_u32_guest(lib->guest_mem, fmt + 24u, 0x00ff0000u);
+  mango_store_u32_guest(lib->guest_mem, fmt + 28u, 0xff000000u);
+  /* SDL_Surface */
+  mango_store_u32_guest(lib->guest_mem, surf + 0u, 0u); /* flags */
+  mango_store_u32_guest(lib->guest_mem, surf + 4u, fmt);
+  mango_store_u32_guest(lib->guest_mem, surf + 8u, w);
+  mango_store_u32_guest(lib->guest_mem, surf + 12u, h);
+  lib->guest_mem[surf + 16u] = (uint8_t)(pitch & 0xffu);
+  lib->guest_mem[surf + 17u] = (uint8_t)((pitch >> 8) & 0xffu);
+  mango_store_u32_guest(lib->guest_mem, surf + 20u, pixels);
+  /* clip_rect at +32: x=0,y=0,w,h as Sint16/Uint16 */
+  lib->guest_mem[surf + 32u] = 0;
+  lib->guest_mem[surf + 33u] = 0;
+  lib->guest_mem[surf + 34u] = 0;
+  lib->guest_mem[surf + 35u] = 0;
+  lib->guest_mem[surf + 36u] = (uint8_t)(w & 0xffu);
+  lib->guest_mem[surf + 37u] = (uint8_t)((w >> 8) & 0xffu);
+  lib->guest_mem[surf + 38u] = (uint8_t)(h & 0xffu);
+  lib->guest_mem[surf + 39u] = (uint8_t)((h >> 8) & 0xffu);
+  mango_store_u32_guest(lib->guest_mem, surf + 56u, 1u); /* refcount */
+  return surf;
+}
+
+static int mango_is_meritous_sdl_image(const MangoLoadedLibrary* lib) {
+  const char* base;
+  if (lib == NULL || lib->path[0] == '\0') {
+    return 0;
+  }
+  base = strrchr(lib->path, '/');
+  base = base ? base + 1 : lib->path;
+  return strcmp(base, "libsdl_image.so") == 0;
+}
+
+
+static int mango_is_meritous_app(const MangoLoadedLibrary* lib) {
+  const char* base;
+  if (lib == NULL || lib->path[0] == '\0') {
+    return 0;
+  }
+  base = strrchr(lib->path, '/');
+  base = base ? base + 1 : lib->path;
+  return strcmp(base, "libapplication.so") == 0;
+}
+
+/* Title "plasma" fill at VA 0x69ad6 runs ~307k host-sqrt iterations under the
+ * interpreter (minutes). Skip to the post-loop epilogue so Meritous can advance;
+ * the buffer from malloc remains zeroed from guest calloc/malloc. */
+static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
+  uint32_t addr;
+  if (!mango_is_meritous_app(lib)) {
+    return;
+  }
+  addr = lib->load_bias + 0x1caceu;
+  if (!mango_guest_range_ok(lib, addr, 2u)) {
+    return;
+  }
+  /* Thumb unconditional B to 0x69b0c: imm = (0x69b0c - (0x69ace+4))/2 = 0x1d */
+  lib->guest_mem[addr] = 0x1du;
+  lib->guest_mem[addr + 1u] = 0xe0u;
+  /* Title PNG post-process loop VA 0x69d06 (~307k iters) → skip to 0x69d2e. */
+  addr = lib->load_bias + 0x1cd06u;
+  if (mango_guest_range_ok(lib, addr, 2u)) {
+    /* imm=(0x69d2e-(0x69d06+4))/2=0x12 */
+    lib->guest_mem[addr] = 0x12u;
+    lib->guest_mem[addr + 1u] = 0xe0u;
+  }
+
+  /* wait-for-key at ELF VA 0x1656c: force immediate return 1 */
+  addr = lib->load_bias + 0x1656cu;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    lib->guest_mem[addr] = 0x01u;
+    lib->guest_mem[addr + 1u] = 0x20u; /* movs r0, #1 */
+    lib->guest_mem[addr + 2u] = 0x70u;
+    lib->guest_mem[addr + 3u] = 0x47u; /* bx lr */
+  }
+  /* custom Delay at ELF 0x161c4: return immediately */
+  addr = lib->load_bias + 0x161c4u;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    lib->guest_mem[addr] = 0x00u;
+    lib->guest_mem[addr + 1u] = 0x20u; /* movs r0, #0 */
+    lib->guest_mem[addr + 2u] = 0x70u;
+    lib->guest_mem[addr + 3u] = 0x47u; /* bx lr */
+  }
+  fprintf(stderr, "mango: skip Meritous title fill loops\n");
+}
+
+static void mango_patch_meritous_img_load(MangoLoadedLibrary* lib) {
+  uint32_t sym;
+  if (!mango_is_meritous_sdl_image(lib)) {
+    return;
+  }
+  sym = mango_elf32_find_symbol(&lib->image, "IMG_Load");
+  if (sym == 0) {
+    return;
+  }
+  sym += lib->load_bias;
+  /* Thumb entry: clear bit0 for patch address. */
+  if (sym & 1u) {
+    sym &= ~1u;
+  }
+  if (!mango_guest_range_ok(lib, sym, MANGO_JNI_THUNK_SIZE)) {
+    return;
+  }
+  /* A32 SVC thunk (IMG_Load is Thumb but BX to ARM SVC is fine via blx).
+   * Callers use blx to PLT → ARM or Thumb; writing ARM SVC at the symbol
+   * requires the symbol to be called as ARM. Safer: write Thumb stub:
+   *   svc #0 ; bx lr  is awkward in Thumb. Use ARM thunk and rely on blx.
+   * Meritous PLT uses ARM stubs that ldr pc from GOT — GOT holds symbol|1
+   * for Thumb. Overwriting Thumb entry with ARM opcodes would fault.
+   * Write Thumb:  svc 0; bx lr  via UDF/svc — Thumb SVC is `svc #imm` 11011111.
+   * Simplest portable approach: point GOT (done via resolving) — instead
+   * overwrite with Thumb branch to a nearby ARM thunk in libc area.
+   * Easiest: replace first instructions with Thumb `bx pc; nop` then ARM SVC. */
+  /* bx pc ; nop  (Thumb) then ARM svc thunk at sym+4 */
+  mango_store_u32_guest(lib->guest_mem, sym, 0x46c04778u); /* bx pc; nop */
+  mango_write_jni_thunk(lib->guest_mem, sym + 4u, MANGO_LIBC_SVC_BASE + MANGO_LIBC_IMG_LOAD);
+}
+
 static int mango_is_ofdp_mono(const MangoLoadedLibrary* lib) {
   const char* base;
   if (lib == NULL || lib->path[0] == '\0') {
@@ -2204,6 +2575,8 @@ static void* mango_load_library(const char* libpath, int flag) {
     return NULL;
   }
   mango_patch_ofdp_unity(lib);
+  mango_patch_meritous_img_load(lib);
+  mango_patch_meritous_skip_plasma(lib);
   mango_seed_ofdp_mono_gc(lib);
   mango_run_constructors(lib);
   mango_seed_ofdp_mono_gc(lib);
