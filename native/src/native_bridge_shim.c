@@ -14,6 +14,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#ifndef ANDROID
+#include <png.h>
+#endif
 
 #include "mango/cpu.h"
 #include "mango/decoder.h"
@@ -645,11 +648,167 @@ static FILE* mango_host_fopen(MangoLoadedLibrary* lib, const char* path, const c
   return NULL;
 }
 
+/* Resolve guest asset path to a host filesystem path (same search order as
+ * mango_host_fopen). Returns 1 on success with out filled. */
+static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path,
+                                   char* out, size_t outsz) {
+  const char* root;
+  if (!path || !out || outsz == 0) {
+    return 0;
+  }
+  if (access(path, R_OK) == 0) {
+    snprintf(out, outsz, "%s", path);
+    return 1;
+  }
+  if (lib && lib->path[0] && strrchr(lib->path, '/')) {
+    const char* slash = strrchr(lib->path, '/');
+    int dlen = (int)(slash - lib->path);
+    snprintf(out, outsz, "%.*s/../gamedata/%s", dlen, lib->path, path);
+    if (access(out, R_OK) == 0) {
+      return 1;
+    }
+    snprintf(out, outsz, "%.*s/../%s", dlen, lib->path, path);
+    if (access(out, R_OK) == 0) {
+      return 1;
+    }
+  }
+  root = getenv("MANGO_ASSET_ROOT");
+  if (root && root[0]) {
+    snprintf(out, outsz, "%s/%s", root, path);
+    if (access(out, R_OK) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+#ifndef ANDROID
+/* Decode PNG via host libpng into tightly packed RGBA8888 (row-major).
+ * Meritous assets are 8-bit grayscale; expand to RGB + opaque A. */
+static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
+                                 uint32_t* out_w, uint32_t* out_h) {
+  FILE* fp;
+  png_structp png = NULL;
+  png_infop info = NULL;
+  png_bytep* rows = NULL;
+  uint8_t* rgba = NULL;
+  png_uint_32 w = 0, h = 0;
+  size_t rowbytes, nbytes;
+  png_uint_32 y;
+  if (!host_path || !out_rgba || !out_w || !out_h) {
+    return -1;
+  }
+  *out_rgba = NULL;
+  *out_w = 0;
+  *out_h = 0;
+  fp = fopen(host_path, "rb");
+  if (!fp) {
+    return -1;
+  }
+  png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if (!png) {
+    fclose(fp);
+    return -1;
+  }
+  info = png_create_info_struct(png);
+  if (!info) {
+    png_destroy_read_struct(&png, NULL, NULL);
+    fclose(fp);
+    return -1;
+  }
+  if (setjmp(png_jmpbuf(png))) {
+    free(rgba);
+    if (rows) {
+      free(rows);
+    }
+    png_destroy_read_struct(&png, &info, NULL);
+    fclose(fp);
+    return -1;
+  }
+  png_init_io(png, fp);
+  png_read_info(png, info);
+  w = png_get_image_width(png, info);
+  h = png_get_image_height(png, info);
+  if (w == 0 || h == 0 || w > 4096u || h > 4096u) {
+    longjmp(png_jmpbuf(png), 1);
+  }
+  {
+    int bit_depth = png_get_bit_depth(png, info);
+    int color_type = png_get_color_type(png, info);
+    if (color_type == PNG_COLOR_TYPE_PALETTE) {
+      png_set_palette_to_rgb(png);
+    }
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
+      png_set_expand_gray_1_2_4_to_8(png);
+    }
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) {
+      png_set_tRNS_to_alpha(png);
+    }
+    if (bit_depth == 16) {
+      png_set_strip_16(png);
+    }
+    if (color_type == PNG_COLOR_TYPE_GRAY ||
+        color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+      png_set_gray_to_rgb(png);
+    }
+    if (color_type == PNG_COLOR_TYPE_RGB ||
+        color_type == PNG_COLOR_TYPE_GRAY ||
+        color_type == PNG_COLOR_TYPE_PALETTE) {
+      png_set_filler(png, 0xff, PNG_FILLER_AFTER);
+    }
+  }
+  png_read_update_info(png, info);
+  rowbytes = png_get_rowbytes(png, info);
+  if (rowbytes < (size_t)w * 4u) {
+    longjmp(png_jmpbuf(png), 1);
+  }
+  nbytes = (size_t)w * (size_t)h * 4u;
+  rgba = (uint8_t*)malloc(nbytes);
+  rows = (png_bytep*)malloc(sizeof(png_bytep) * h);
+  if (!rgba || !rows) {
+    longjmp(png_jmpbuf(png), 1);
+  }
+  for (y = 0; y < h; y++) {
+    rows[y] = rgba + (size_t)y * (size_t)w * 4u;
+  }
+  /* If libpng rowbytes > w*4 (padding), read into temp then compact — Meritous
+   * assets are tightly packed after expand, so direct rows are fine when equal. */
+  if (rowbytes == (size_t)w * 4u) {
+    png_read_image(png, rows);
+  } else {
+    png_bytep tmp = (png_bytep)malloc(rowbytes);
+    if (!tmp) {
+      longjmp(png_jmpbuf(png), 1);
+    }
+    for (y = 0; y < h; y++) {
+      png_read_row(png, tmp, NULL);
+      memcpy(rows[y], tmp, (size_t)w * 4u);
+    }
+    free(tmp);
+  }
+  png_read_end(png, NULL);
+  png_destroy_read_struct(&png, &info, NULL);
+  fclose(fp);
+  free(rows);
+  *out_rgba = rgba;
+  *out_w = (uint32_t)w;
+  *out_h = (uint32_t)h;
+  return 0;
+}
+#endif
+
+
 static void* mango_load_library(const char* libpath, int flag);
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env);
 static const char* mango_guest_cstr(MangoLoadedLibrary* lib, uint32_t addr);
 static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n);
 static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h);
+static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path,
+                                   char* out, size_t outsz);
+#ifndef ANDROID
+static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
+                                 uint32_t* out_w, uint32_t* out_h);
+#endif
 static void mango_patch_meritous_img_load(MangoLoadedLibrary* lib);
 
 
@@ -1813,17 +1972,55 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_IMG_LOAD: {
-      /* Host stub: ignore path (PNG needs guest zlib inflate marshalling).
-       * Return a heap SDL_Surface so Meritous never blits through a NULL. */
+      /* Meritous libsdl_image IMG_Load (basename-gated thunk). Prefer real
+       * host libpng decode into an RGBA8888 guest SDL_Surface so DrawLevel
+       * sees real tileset/mons pixels; fall back to a blank 256x256 surface. */
       const char* path = mango_guest_cstr(lib, r0);
-      {
-        static int s_img;
-        if (s_img < 8) {
-          fprintf(stderr, "mango: IMG_Load '%s'\n", path ? path : "(null)");
+      uint32_t surf = 0;
+      char host_path[768];
+      static int s_img;
+#ifndef ANDROID
+      uint8_t* rgba = NULL;
+      uint32_t pw = 0, ph = 0;
+#endif
+      if (path && mango_host_resolve_path(lib, path, host_path, sizeof(host_path))) {
+#ifndef ANDROID
+        if (mango_png_decode_rgba(host_path, &rgba, &pw, &ph) == 0 && rgba) {
+          surf = mango_guest_sdl_surface(lib, pw, ph);
+          if (surf) {
+            uint32_t pixels = 0;
+            uint32_t nbytes = pw * ph * 4u;
+            uint32_t nonzero = 0;
+            uint32_t i;
+            pixels = mango_load_u32_guest(lib->guest_mem, surf + 20u);
+            if (pixels && mango_guest_range_ok(lib, pixels, nbytes)) {
+              memcpy(lib->guest_mem + pixels, rgba, nbytes);
+              for (i = 0; i < nbytes; i++) {
+                if (rgba[i] != 0) {
+                  nonzero++;
+                }
+              }
+            }
+            if (s_img < 40) {
+              fprintf(stderr,
+                      "mango: IMG_Load '%s' -> %ux%u png (%u nonzero bytes)\n",
+                      path, (unsigned)pw, (unsigned)ph, (unsigned)nonzero);
+              s_img++;
+            }
+          }
+          free(rgba);
+          rgba = NULL;
+        }
+#endif
+      }
+      if (!surf) {
+        if (s_img < 40) {
+          fprintf(stderr, "mango: IMG_Load '%s' (blank fallback)\n",
+                  path ? path : "(null)");
           s_img++;
         }
+        surf = mango_guest_sdl_surface(lib, 256u, 256u);
       }
-      uint32_t surf = mango_guest_sdl_surface(lib, 256u, 256u);
       cpu->r[0] = surf;
       break;
     }

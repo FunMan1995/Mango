@@ -4,6 +4,9 @@ project(mango_native C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Host Meritous IMG_Load uses libpng (not needed for NDK mango_translator).
+find_package(PNG)
+
 # Portable core: decoder + interpreter + ELF32 parsing, no Android/NDK
 # headers. Builds and tests on any host, that's on purpose, see
 # native/README.md.
@@ -34,6 +37,9 @@ add_executable(mango_native_bridge_shim_tests
 )
 target_include_directories(mango_native_bridge_shim_tests PRIVATE tests/fake_jni)
 target_link_libraries(mango_native_bridge_shim_tests PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_native_bridge_shim_tests PRIVATE PNG::PNG)
+endif()
 add_test(NAME native_bridge_shim_smoke_test COMMAND mango_native_bridge_shim_tests)
 
 # The actual native bridge .so. Only buildable with the NDK toolchain file,
@@ -54,6 +60,9 @@ add_executable(mango_host_unity_drive
 )
 target_include_directories(mango_host_unity_drive PRIVATE tests/fake_jni)
 target_link_libraries(mango_host_unity_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_unity_drive PRIVATE PNG::PNG)
+endif()
 
 # Host-only Meritous/SDL drive helper for Test Lab (not a ctest). Loads
 # armeabi libsdl-1.2.so + libapplication.so through the same shim.
@@ -63,3 +72,6 @@ add_executable(mango_host_meritous_drive
 )
 target_include_directories(mango_host_meritous_drive PRIVATE tests/fake_jni)
 target_link_libraries(mango_host_meritous_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_meritous_drive PRIVATE PNG::PNG)
+endif()
