@@ -4308,12 +4308,16 @@ static int test_t32_cmp_w_modimm_reject(void) {
     fprintf(stderr, "FAIL(t32_cmp_w_reject): CMN f1100f00 decoded as op=%d\n", di.op);
     return 1;
   }
-  /* footnote bic.w f026 060f */
-  if (mango_decode_t32(0xF026u, 0x060Fu, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_cmp_w_reject): BIC f026060f decoded as op=%d\n", di.op);
+  /* footnote bic.w f026 060f — cleared by Q-OTTD-0q (expect BIC) */
+  if (mango_decode_t32(0xF026u, 0x060Fu, &di) != 0 || di.op != MANGO_OP_BIC || di.rd != 6 ||
+      di.rn != 6 || di.imm != 15u || di.sets_flags != 0) {
+    fprintf(stderr,
+            "FAIL(t32_cmp_w_reject): BIC f026060f op=%d rd=%u rn=%u imm=0x%x s=%d "
+            "(want BIC r6,r6,#15 cleared by 0q)\n",
+            di.op, di.rd, di.rn, di.imm, di.sets_flags);
     return 1;
   }
-  printf("ok: T32 CMP.W reject SUBS/Rn=PC/CMN/BIC (Q-OTTD-0k)\n");
+  printf("ok: T32 CMP.W reject SUBS/Rn=PC/CMN; BIC cleared by 0q (Q-OTTD-0k)\n");
   return 0;
 }
 
@@ -4653,18 +4657,162 @@ static int test_t32_dmb_reject_dsb_isb(void) {
     fprintf(stderr, "FAIL(t32_dmb_reject): CLREX f3bf8f2f decoded as op=%d\n", di.op);
     return 1;
   }
-  /* Footnotes stay uncover */
-  if (mango_decode_t32(0xF026u, 0x060Fu, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_dmb_reject): BIC f026060f decoded as op=%d\n", di.op);
+  /* BIC footnote cleared by Q-OTTD-0q; LDR.W reg LSL#2 stays uncover */
+  if (mango_decode_t32(0xF026u, 0x060Fu, &di) != 0 || di.op != MANGO_OP_BIC) {
+    fprintf(stderr, "FAIL(t32_dmb_reject): BIC f026060f want BIC after 0q, got rc/op=%d\n", di.op);
     return 1;
   }
   if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
     fprintf(stderr, "FAIL(t32_dmb_reject): LDR.W reg f8555021 decoded as op=%d\n", di.op);
     return 1;
   }
-  printf("ok: T32 DMB reject DSB/ISB/CLREX + footnotes (Q-OTTD-0p)\n");
+  printf("ok: T32 DMB reject DSB/ISB/CLREX; BIC cleared by 0q (Q-OTTD-0p)\n");
   return 0;
 }
+
+static int test_t32_bic_w_modimm_3(void) {
+  /* Q-OTTD-0q: bic.w r6,r6,#3 = f026 0603.
+   * ThumbExpandImm(0x003)=3. R6 = R6 & ~3; S=0 leaves NZCV; pc+=4. */
+  static const uint16_t kProg[] = {0xF026u, 0x0603u, 0x4770u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF026u, 0x0603u, &di) != 0 || di.op != MANGO_OP_BIC || di.rd != 6 ||
+      di.rn != 6 || di.is_imm != 1 || di.sets_flags != 0 || di.imm != 3u) {
+    fprintf(stderr,
+            "FAIL(t32_bic_w_3): decode op=%d rd=%u rn=%u imm=0x%x (want BIC r6,r6,#3) s=%d "
+            "is_imm=%d\n",
+            di.op, di.rd, di.rn, di.imm, di.sets_flags, di.is_imm);
+    return 1;
+  }
+
+  struct {
+    uint32_t r6;
+    uint32_t want;
+    const char* name;
+  } cases[] = {
+      {4u, 4u, "drive"},
+      {7u, 4u, "align"},
+      {0xffffffffu, 0xfffffffcu, "allones"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[6] = cases[i].r6;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+    if (rc != 0 || cpu.r[6] != cases[i].want || cpu.cpsr != cpsr_before) {
+      fprintf(stderr,
+              "FAIL(t32_bic_w_3 %s): rc=%d r6=0x%x want 0x%x cpsr=0x%x (before 0x%x)\n",
+              cases[i].name, rc, cpu.r[6], cases[i].want, cpu.cpsr, cpsr_before);
+      return 1;
+    }
+  }
+  printf("ok: T32 BIC.W r6,r6,#3 modified-imm (Q-OTTD-0q)\n");
+  return 0;
+}
+
+static int test_t32_bic_w_modimm_15(void) {
+  /* Q-OTTD-0q sibling: bic.w r6,r6,#15 = f026 060f. ThumbExpandImm(0x00F)=15. */
+  static const uint16_t kProg[] = {0xF026u, 0x060Fu, 0x4770u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF026u, 0x060Fu, &di) != 0 || di.op != MANGO_OP_BIC || di.rd != 6 ||
+      di.rn != 6 || di.is_imm != 1 || di.sets_flags != 0 || di.imm != 15u) {
+    fprintf(stderr,
+            "FAIL(t32_bic_w_15): decode op=%d rd=%u rn=%u imm=0x%x (want BIC r6,r6,#15) s=%d "
+            "is_imm=%d\n",
+            di.op, di.rd, di.rn, di.imm, di.sets_flags, di.is_imm);
+    return 1;
+  }
+
+  struct {
+    uint32_t r6;
+    uint32_t want;
+    const char* name;
+  } cases[] = {
+      {0x2fu, 0x20u, "drive"},
+      {0xffu, 0xf0u, "low"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[6] = cases[i].r6;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+    if (rc != 0 || cpu.r[6] != cases[i].want || cpu.cpsr != cpsr_before) {
+      fprintf(stderr,
+              "FAIL(t32_bic_w_15 %s): rc=%d r6=0x%x want 0x%x cpsr=0x%x (before 0x%x)\n",
+              cases[i].name, rc, cpu.r[6], cases[i].want, cpu.cpsr, cpsr_before);
+      return 1;
+    }
+  }
+  printf("ok: T32 BIC.W r6,r6,#15 modified-imm (Q-OTTD-0q)\n");
+  return 0;
+}
+
+static int test_t32_bic_w_modimm_reject(void) {
+  /* BICS S=1, Rd/Rn=PC, AND/ORN contrasts, LDR.W reg LSL#2 stay uncover this bite. */
+  MangoInsn di;
+  /* f036 0603 = bics.w r6,r6,#3 — S=1 out of minimal */
+  if (mango_decode_t32(0xF036u, 0x0603u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): BICS f0360603 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* f02f 0603 = bic.w r6,pc,#3 — Rn=PC */
+  if (mango_decode_t32(0xF02Fu, 0x0603u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): Rn=PC f02f0603 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* f026 0f03 = bic.w pc,r6,#3 — Rd=PC */
+  if (mango_decode_t32(0xF026u, 0x0F03u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): Rd=PC f0260f03 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* f006 0603 = and.w — not BIC */
+  if (mango_decode_t32(0xF006u, 0x0603u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): AND f0060603 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* f066 0603 = orn — not BIC (MVN requires Rn=15) */
+  if (mango_decode_t32(0xF066u, 0x0603u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): ORN f0660603 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* A32 e3c66003 bic r6,r6,#3 still BIC */
+  if (mango_decode(0xE3C66003u, &di) != 0 || di.op != MANGO_OP_BIC || di.rd != 6 ||
+      di.rn != 6 || di.is_imm != 1) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): A32 e3c66003 op=%d rd=%u rn=%u (want BIC)\n",
+            di.op, di.rd, di.rn);
+    return 1;
+  }
+  /* 0p DMB still NOP */
+  if (mango_decode_t32(0xF3BFu, 0x8F5Fu, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): DMB f3bf8f5f want NOP, got op=%d\n", di.op);
+    return 1;
+  }
+  /* distractor ldr.w reg lsl#2 stays uncover */
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): LDR.W reg f8555021 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  printf("ok: T32 BIC.W reject BICS/PC/AND/ORN; A32 BIC+DMB ok (Q-OTTD-0q)\n");
+  return 0;
+}
+
 
 static int test_t32_add_w_reg_lsl2(void) {
   /* Q-OTTD-0l-add: add.w r0,lr,r0,lsl#2 = eb0e 0080.
@@ -6354,6 +6502,9 @@ int main(void) {
   failures += test_t32_dmb_ish_sib();
   failures += test_a32_dmb_sy_still_nop();
   failures += test_t32_dmb_reject_dsb_isb();
+  failures += test_t32_bic_w_modimm_3();
+  failures += test_t32_bic_w_modimm_15();
+  failures += test_t32_bic_w_modimm_reject();
   failures += test_t32_add_w_reg_lsl2();
   failures += test_t32_add_w_reg_reject();
   failures += test_t32_ldrb_w_reg_lsl3();
