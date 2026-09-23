@@ -1545,6 +1545,21 @@ int mango_decode_t16(uint16_t hw, MangoInsn* out) {
       out->cond = 0xEu; /* always execute the compare-branch itself */
       return 0;
     }
+    /* Q-OTTD-0l: T16 UXTH/UXTB/SXTH/SXTB — Misc extract, no rotate.
+     * (hw & 0xFF00) == 0xB200; bits[7:6]: 00=SXTH, 01=SXTB, 10=UXTH, 11=UXTB.
+     * Guest b2b6 = uxth r6,r6; sibling b2f6 = uxtb r6,r6. Map → XTEND
+     * (rn=15, imm=0); do not open A32 accumulate / T32 FA this bite. */
+    if ((hw & 0xFF00u) == 0xB200u) {
+      out->op = MANGO_OP_XTEND;
+      out->rd = hw & 7u;
+      out->rm = (hw >> 3) & 7u;
+      out->rn = 15u; /* no accumulate */
+      out->imm = 0;  /* T16 has no ROR */
+      out->u = (int)((hw >> 7) & 1u);
+      out->b = !((hw >> 6) & 1u); /* half when bit6=0 (UXTH/SXTH) */
+      out->sets_flags = 0;
+      return 0;
+    }
     return -1;
   }
 
@@ -1707,6 +1722,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->sets_flags = 1;
     out->imm = imm;
     out->shift_amount = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0l-add: ADD.W Rd,Rn,Rm{,shift} register (op=1000, S=0).
+   * Guest eb0e 0080 = add.w r0,lr,r0,lsl#2. Opening all ADD.W reg S=0
+   * (any shift) also clears drive eb04/eb05. Do NOT open AND (EA0x) /
+   * full DP-reg / S=1 this bite. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEB00u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_ADD;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
     return 0;
   }
 

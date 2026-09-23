@@ -4199,6 +4199,170 @@ static int test_t32_cmp_w_modimm_reject(void) {
   return 0;
 }
 
+
+static int test_t16_uxth_b2b6(void) {
+  /* Q-OTTD-0l: uxth r6,r6 = b2b6. R6 = R6 & 0xFFFF; NZCV hold; pc+=2. */
+  static const uint16_t kProg[] = {0xB2B6u, 0x4770u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t16(0xB2B6u, &di) != 0 || di.op != MANGO_OP_XTEND || di.rd != 6 ||
+      di.rm != 6 || di.rn != 15 || di.imm != 0 || di.u != 1 || di.b != 1 || di.sets_flags != 0) {
+    fprintf(stderr,
+            "FAIL(t16_uxth_b2b6): decode op=%d rd=%u rm=%u rn=%u imm=%u u=%d b=%d s=%d "
+            "(want XTEND r6,r6 rn=15 u=1 b=1)\n",
+            di.op, di.rd, di.rm, di.rn, di.imm, di.u, di.b, di.sets_flags);
+    return 1;
+  }
+
+  struct {
+    uint32_t pre;
+    uint32_t want;
+    const char* name;
+  } cases[] = {
+      {0x1234abcdu, 0x0000abcdu, "abcd"},
+      {0xffffffffu, 0x0000ffffu, "ffff"},
+      {1u, 1u, "drive"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[6] = cases[i].pre;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+    if (rc != 0 || cpu.r[6] != cases[i].want || cpu.cpsr != cpsr_before) {
+      fprintf(stderr,
+              "FAIL(t16_uxth_b2b6 %s): rc=%d r6=0x%x want 0x%x cpsr=0x%x want 0x%x\n",
+              cases[i].name, rc, cpu.r[6], cases[i].want, cpu.cpsr, cpsr_before);
+      return 1;
+    }
+  }
+  printf("ok: T16 UXTH r6,r6 b2b6 → XTEND (Q-OTTD-0l)\n");
+  return 0;
+}
+
+static int test_t16_uxtb_b2f6(void) {
+  /* Q-OTTD-0l sibling: uxtb r6,r6 = b2f6. Same Misc 0xB2xx mask. */
+  static const uint16_t kProg[] = {0xB2F6u, 0x4770u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t16(0xB2F6u, &di) != 0 || di.op != MANGO_OP_XTEND || di.rd != 6 ||
+      di.rm != 6 || di.rn != 15 || di.u != 1 || di.b != 0 || di.sets_flags != 0) {
+    fprintf(stderr,
+            "FAIL(t16_uxtb_b2f6): decode op=%d rd=%u rm=%u rn=%u u=%d b=%d (want XTEND u=1 b=0)\n",
+            di.op, di.rd, di.rm, di.rn, di.u, di.b);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[6] = 0x1234abcdu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0 || cpu.r[6] != 0xCDu || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t16_uxtb_b2f6): rc=%d r6=0x%x want 0xcd cpsr=0x%x\n", rc, cpu.r[6],
+            cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T16 UXTB r6,r6 b2f6 → XTEND (Q-OTTD-0l)\n");
+  return 0;
+}
+
+static int test_t32_add_w_reg_lsl2(void) {
+  /* Q-OTTD-0l-add: add.w r0,lr,r0,lsl#2 = eb0e 0080.
+   * Drive: lr=0x9fee80, r0=0xffffffff → r0=0x9fee7c; LR/NZCV hold; pc+=4.
+   * Stop at pc=4 (after ADD.W) — cannot bx lr because Rn=LR is the source. */
+  static const uint16_t kProg[] = {0xEB0Eu, 0x0080u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xEB0Eu, 0x0080u, &di) != 0 || di.op != MANGO_OP_ADD || di.rd != 0 ||
+      di.rn != MANGO_REG_LR || di.rm != 0 || di.is_imm != 0 || di.sets_flags != 0 ||
+      di.shift_type != 0 || di.shift_amount != 2) {
+    fprintf(stderr,
+            "FAIL(t32_add_w_reg): decode op=%d rd=%u rn=%u rm=%u is_imm=%d s=%d type=%u amt=%u "
+            "(want ADD r0,lr,r0 LSL#2)\n",
+            di.op, di.rd, di.rn, di.rm, di.is_imm, di.sets_flags, di.shift_type, di.shift_amount);
+    return 1;
+  }
+
+  struct {
+    uint32_t r0;
+    uint32_t lr;
+    uint32_t want_r0;
+    const char* name;
+  } cases[] = {
+      {0xffffffffu, 0x009fee80u, 0x009fee7cu, "drive"},
+      {3u, 0x1000u, 0x100cu, "simple"},
+      {0u, 0xabcd0000u, 0xabcd0000u, "copy"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = cases[i].r0;
+    cpu.r[MANGO_REG_LR] = cases[i].lr;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+    if (rc != 0 || cpu.r[0] != cases[i].want_r0 || cpu.r[MANGO_REG_LR] != cases[i].lr ||
+        cpu.cpsr != cpsr_before) {
+      fprintf(stderr,
+              "FAIL(t32_add_w_reg %s): rc=%d r0=0x%x want 0x%x lr=0x%x want 0x%x cpsr=0x%x\n",
+              cases[i].name, rc, cpu.r[0], cases[i].want_r0, cpu.r[MANGO_REG_LR], cases[i].lr,
+              cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 ADD.W r0,lr,r0,lsl#2 eb0e0080 (Q-OTTD-0l-add)\n");
+  return 0;
+}
+
+static int test_t32_add_w_reg_reject(void) {
+  /* AND.W ea0e0080 stays uncover; PC Rd/Rn/Rm reject; S=1 uncover. */
+  MangoInsn di;
+  if (mango_decode_t32(0xEA0Eu, 0x0080u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_add_w_reg_reject): AND ea0e0080 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* eb0e 0f80 = ADD.W pc,lr,r0,lsl#2 — Rd=PC */
+  if (mango_decode_t32(0xEB0Eu, 0x0F80u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_add_w_reg_reject): Rd=PC eb0e0f80 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* eb0f 0080 = ADD.W r0,pc,r0,lsl#2 — Rn=PC */
+  if (mango_decode_t32(0xEB0Fu, 0x0080u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_add_w_reg_reject): Rn=PC eb0f0080 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* eb0e 008f = ADD.W r0,lr,pc,lsl#2 — Rm=PC */
+  if (mango_decode_t32(0xEB0Eu, 0x008Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_add_w_reg_reject): Rm=PC eb0e008f decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* eb1e 0080 = ADD.W S=1 — out of scope */
+  if (mango_decode_t32(0xEB1Eu, 0x0080u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_add_w_reg_reject): S=1 eb1e0080 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  printf("ok: T32 ADD.W reg reject AND/PC/S=1 (Q-OTTD-0l-add)\n");
+  return 0;
+}
+
 static int test_thumb_bx_pc_veneer(void) {
   /* Thumb BX PC into ARM PLT-style veneer: dest is addr+4, not r15. */
   uint8_t mem_buf[32];
@@ -5502,6 +5666,10 @@ int main(void) {
   failures += test_t32_cmp_w_modimm_80000000();
   failures += test_t32_cmp_w_modimm_1a();
   failures += test_t32_cmp_w_modimm_reject();
+  failures += test_t16_uxth_b2b6();
+  failures += test_t16_uxtb_b2f6();
+  failures += test_t32_add_w_reg_lsl2();
+  failures += test_t32_add_w_reg_reject();
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
   failures += test_vldr_s_from_stack();
