@@ -2032,6 +2032,24 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+
+  /* Q-OTTD-0j: T32 STMIA Rn,{reglist} W=0 — guest e880 002c.
+   * Reuse MANGO_OP_STM (p=0 u=1 w=0). Not W=1 (e8a0) or STMDB non-SP. */
+  if ((hw1 & 0xFFD0u) == 0xE880u && (hw1 & 0x0020u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t reglist = hw2 & 0x7FFFu;
+    if (rn == MANGO_REG_PC || reglist == 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_STM;
+    out->rn = rn;
+    out->reglist = reglist;
+    out->p = 0;
+    out->u = 1;
+    out->w = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0c: T32 LDMIA / POP.W SP! — hw1 E8BD form, Rn=SP, W=1, P(hw2)=0.
    * Reuse MANGO_OP_LDM (p=0 u=1 w=1). PC-in-list is Q-OTTD-0i-pop sibling. */
   if ((hw1 & 0xFFD0u) == 0xE890u && (hw1 & 0x0020u) != 0 && (hw1 & 0xFu) == MANGO_REG_SP &&
@@ -2085,6 +2103,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rm = rn; /* multiplicand Rn → interp rm lane */
     out->rs = rm; /* multiplicand Rm → interp rs lane */
     out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0j-ubfx: T32 UBFX — guest f3c1 070a (lsb=0, widthm1=10 → width 11).
+   * Reuse MANGO_OP_UBFX (imm=lsb, rs=widthm1). Not SBFX/BFI/BFC this bite. */
+  if ((hw1 & 0xFFF0u) == 0xF3C0u && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t lsb = (((hw2 >> 12) & 7u) << 2) | ((hw2 >> 6) & 3u);
+    uint32_t widthm1 = hw2 & 0x3Fu;
+    uint32_t width = widthm1 + 1u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (lsb + width > 32u) {
+      return -1;
+    }
+    out->op = MANGO_OP_UBFX;
+    out->rd = rd;
+    out->rn = rn;
+    out->imm = lsb;
+    out->rs = widthm1;
     return 0;
   }
 
