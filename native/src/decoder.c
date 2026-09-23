@@ -2134,7 +2134,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * Guest f804 b003 = strb.w fp,[r4,r3] imm2=0; also f804 b013 LSL#1 etc.
    * Mutually exclusive with tip 0z STRB.W imm8 (bit11=1) and F880 imm12 (bit7=1).
    * Reuse MANGO_OP_STR b=1 is_imm=0; execute already honors reg+shift via
-   * mango_eval_operand2. Reject Rt/Rn/Rm=PC. Do not open STRH.W imm8 / CLZ. */
+   * mango_eval_operand2. Reject Rt/Rn/Rm=PC. STRH.W imm8 is 0ae; hold CLZ. */
   if ((hw1 & 0xFFF0u) == 0xF800u && (hw2 & 0x0FC0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
@@ -2187,7 +2187,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * Guest f822 600c = strh.w r6,[r2,ip] imm2=0; footnote f820 6012 LSL#1.
    * Open any imm2 0..3 (mirror 0u STR.W / 0m LDRB.W). Execute must honor
    * shift_amount. Distinct from F8A0 STRH imm12 (bit7=1) and F840 STR.W (0u).
-   * Reject Rt/Rn/Rm=PC. Do not open LDRH.W-reg / LDR.W-reg this bite. */
+   * Reject Rt/Rn/Rm=PC. STRH.W imm8 T4 is 0ae (bit11=1). */
   if ((hw1 & 0xFFF0u) == 0xF820u && (hw2 & 0x0FC0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
@@ -2206,6 +2206,41 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->p = 1;
     out->u = 1;
     out->w = 0;
+    out->b = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0ae: T32 STRH.W Rt,[Rn,#±imm8]!? T4 — size=01 L=0, bit11=1 P/U/W.
+   * Guest f823 2c08 = strh.w r2,[r3,#-8] (P=1 U=0 W=0). Also covers post
+   * f824 1b02 and pre WB f824 1f02. Mirror 0ab LDRH.W imm8 (F830) / 0z STRB
+   * imm8 (F800); reuse MANGO_OP_STRH. Execute already honors p/u/w + halfword.
+   * Distinct from F8A0 STRH imm12 (bit7=1) and 0v STRH-reg (bits[11:6]==0).
+   * Reject STRHT (P=0 W=0), Rt/Rn=PC, and writeback into Rt (W=1 && Rt==Rn).
+   * Do not open T32 CLZ / TBB / BFI / T16 REV16. */
+  if ((hw1 & 0xFFF0u) == 0xF820u && (hw2 & 0x0800u) != 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw2 >> 10) & 1u);
+    int u = (int)((hw2 >> 9) & 1u);
+    int w = (int)((hw2 >> 8) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* STRHT */
+    }
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (w && rt == rn) {
+      return -1; /* WB into Rt UNPRED for STRH */
+    }
+    out->op = MANGO_OP_STRH;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm8; /* byte offset, not <<1 */
+    out->p = p;
+    out->u = u;
+    out->w = w;
     out->b = 0;
     return 0;
   }
@@ -2247,7 +2282,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * MANGO_OP_LDRH. Execute already honors p/u/w + halfword. Distinct from
    * F8B0 LDRH imm12 (bit7=1) and 0v STRH-reg (F820 bit11=0). Reject LDRHT
    * (P=0 W=0), Rt/Rn=PC, and writeback into Rt (W=1 && Rt==Rn UNPRED).
-   * Hold T32 CLZ / optional STRH.W imm8 this bite. */
+   * Hold T32 CLZ; STRH.W imm8 is 0ae. */
   if ((hw1 & 0xFFF0u) == 0xF830u && (hw2 & 0x0800u) != 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
