@@ -4058,6 +4058,147 @@ static int test_t32_stmia_ubfx_reject(void) {
   return 0;
 }
 
+
+static int test_t32_cmp_w_modimm_80000000(void) {
+  /* Q-OTTD-0k: cmp.w r5,#0x80000000 = f1b5 4f00.
+   * imm12=0x400 → ThumbExpandImm = 0x80000000 (NOT #0x400 / f5b5 6f80).
+   * NZCV from R5 - 0x80000000; R5 unchanged; pc+=4 via bx lr. */
+  static const uint16_t kProg[] = {0xF1B5u, 0x4F00u, 0x4770u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF1B5u, 0x4F00u, &di) != 0 || di.op != MANGO_OP_CMP || di.rn != 5 ||
+      di.is_imm != 1 || di.sets_flags != 1 || di.imm != 0x80000000u) {
+    fprintf(stderr,
+            "FAIL(t32_cmp_w_80000000): decode op=%d rn=%u imm=0x%x (want 0x80000000) s=%d "
+            "is_imm=%d\n",
+            di.op, di.rn, di.imm, di.sets_flags, di.is_imm);
+    return 1;
+  }
+  if (di.imm == 0x400u) {
+    fprintf(stderr,
+            "FAIL(t32_cmp_w_80000000): treated as plain #0x400 — must be ThumbExpandImm→0x80000000\n");
+    return 1;
+  }
+
+  struct {
+    uint32_t r5;
+    uint32_t want_nzcv;
+    const char* name;
+  } cases[] = {
+      {0x80000000u, MANGO_CPSR_Z | MANGO_CPSR_C, "EQ"},
+      {0x7fffffffu, MANGO_CPSR_N | MANGO_CPSR_V, "LO"},
+      {0x80000001u, MANGO_CPSR_C, "HI"},
+      {1u, MANGO_CPSR_N | MANGO_CPSR_V, "drive"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T; /* NZCV clear before CMP */
+    cpu.r[5] = cases[i].r5;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[5] != cases[i].r5 || nzcv != cases[i].want_nzcv ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr,
+              "FAIL(t32_cmp_w_80000000 %s): rc=%d r5=0x%x nzcv=0x%x want 0x%x cpsr=0x%x\n",
+              cases[i].name, rc, cpu.r[5], nzcv, cases[i].want_nzcv, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 CMP.W r5,#0x80000000 modified-imm (Q-OTTD-0k)\n");
+  return 0;
+}
+
+static int test_t32_cmp_w_modimm_1a(void) {
+  /* Q-OTTD-0k-1a: cmp.w r9,#0x1a = f1b9 0f1a. ThumbExpandImm(0x01A)=0x1A.
+   * NZCV from R9 - 0x1A; R9 unchanged; pc+=4 via bx lr. */
+  static const uint16_t kProg[] = {0xF1B9u, 0x0F1Au, 0x4770u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF1B9u, 0x0F1Au, &di) != 0 || di.op != MANGO_OP_CMP || di.rn != 9 ||
+      di.is_imm != 1 || di.sets_flags != 1 || di.imm != 0x1Au) {
+    fprintf(stderr,
+            "FAIL(t32_cmp_w_1a): decode op=%d rn=%u imm=0x%x (want 0x1a) s=%d is_imm=%d\n",
+            di.op, di.rn, di.imm, di.sets_flags, di.is_imm);
+    return 1;
+  }
+
+  struct {
+    uint32_t r9;
+    uint32_t want_nzcv;
+    const char* name;
+  } cases[] = {
+      {0x1Au, MANGO_CPSR_Z | MANGO_CPSR_C, "EQ"},
+      {0x19u, MANGO_CPSR_N, "LO"},
+      {0x1Bu, MANGO_CPSR_C, "HI"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[9] = cases[i].r9;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[9] != cases[i].r9 || nzcv != cases[i].want_nzcv ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr, "FAIL(t32_cmp_w_1a %s): rc=%d r9=0x%x nzcv=0x%x want 0x%x cpsr=0x%x\n",
+              cases[i].name, rc, cpu.r[9], nzcv, cases[i].want_nzcv, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 CMP.W r9,#0x1a modified-imm (Q-OTTD-0k-1a)\n");
+  return 0;
+}
+
+static int test_t32_cmp_w_modimm_reject(void) {
+  /* S=1 Rd≠15 is SUBS — out of scope; Rn=PC UNPRED; CMN/BIC footnotes uncover. */
+  MangoInsn di;
+  /* f1b5 0f00 with Rd≠15 forced: use f1b5 0400 = SUBS-like Rd=4 S=1 */
+  if (mango_decode_t32(0xF1B5u, 0x0400u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_cmp_w_reject): S=1 Rd≠15 f1b50400 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* f1bf 4f00 = CMP.W pc,#0x80000000 — Rn=PC */
+  if (mango_decode_t32(0xF1BFu, 0x4F00u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_cmp_w_reject): Rn=PC f1bf4f00 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* f1a5 4400 = SUB.W r4,r5,#0x80000000 S=0 Rd=4 — already 0d, not CMP
+   * (research typo f1a54f00 has Rd=15 which SUB rejects as PC). */
+  if (mango_decode_t32(0xF1A5u, 0x4400u, &di) != 0 || di.op != MANGO_OP_SUB || di.rd != 4 ||
+      di.rn != 5 || di.sets_flags != 0 || di.imm != 0x80000000u) {
+    fprintf(stderr,
+            "FAIL(t32_cmp_w_reject): S=0 SUB f1a54400 op=%d rd=%u rn=%u imm=0x%x s=%d "
+            "want SUB r4,r5,#0x80000000 s=0\n",
+            di.op, di.rd, di.rn, di.imm, di.sets_flags);
+    return 1;
+  }
+  /* f110 0f00 = CMN.W — not this bite */
+  if (mango_decode_t32(0xF110u, 0x0F00u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_cmp_w_reject): CMN f1100f00 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* footnote bic.w f026 060f */
+  if (mango_decode_t32(0xF026u, 0x060Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_cmp_w_reject): BIC f026060f decoded as op=%d\n", di.op);
+    return 1;
+  }
+  printf("ok: T32 CMP.W reject SUBS/Rn=PC/CMN/BIC (Q-OTTD-0k)\n");
+  return 0;
+}
+
 static int test_thumb_bx_pc_veneer(void) {
   /* Thumb BX PC into ARM PLT-style veneer: dest is addr+4, not r15. */
   uint8_t mem_buf[32];
@@ -5358,6 +5499,9 @@ int main(void) {
   failures += test_t32_stmia_w0();
   failures += test_t32_ubfx();
   failures += test_t32_stmia_ubfx_reject();
+  failures += test_t32_cmp_w_modimm_80000000();
+  failures += test_t32_cmp_w_modimm_1a();
+  failures += test_t32_cmp_w_modimm_reject();
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
   failures += test_vldr_s_from_stack();

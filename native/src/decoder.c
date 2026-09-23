@@ -1683,6 +1683,32 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0k: CMP.W Rn,#<const> modified-imm (op=1101, S=1, Rd=15 flags-only).
+   * Primary f1b5 4f00 = cmp.w r5,#0x80000000 (imm12 0x400 → ThumbExpandImm 0x80000000,
+   * NOT #0x400 / f5b5 6f80). Sibling f1b9 0f1a = cmp.w r9,#0x1a.
+   * Same op as 0d SUB but S=1 + Rd=15; do not accept S=1 Rd≠15 (SUBS) this bite. */
+  if ((hw1 & 0xFBE0u) == 0xF1A0u && (hw1 & 0x10u) != 0 && ((hw2 >> 8) & 0xFu) == 0xFu &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_CMP;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->sets_flags = 1;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
 
   /* Q-OTTD-0e: ADD.W Rd,Rn,#<const> modified-imm (S=0). Guest f50d 5108 =
    * add.w r1,sp,#0x2200 (ThumbExpandImm(0xD08)=0x2200). Plain ADDW #0xD08 is
