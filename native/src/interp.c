@@ -111,6 +111,45 @@ static uint64_t mango_f64_to_u64(double d) {
   return v;
 }
 
+/* Arm FPRecipEstimate for binary32 (AdvSIMD / StandardFPSCR flush-to-zero).
+ * ~8-bit fraction estimate via RecipEstimate; guests refine with VRECPS. */
+#define MANGO_FPSCR_DZC (1u << 1)
+#define MANGO_F32_DEFAULT_NAN 0x7FC00000u
+
+static uint32_t mango_recip_estimate_u9(uint32_t a) {
+  /* a in 256..511 representing [0.5, 1.0); returns 256..511. */
+  a = a * 2u + 1u;
+  uint32_t b = (1u << 19) / a;
+  return (b + 1u) / 2u;
+}
+
+static uint32_t mango_fp_recip_estimate_f32(uint32_t op, uint32_t* fpscr) {
+  uint32_t sign = op >> 31;
+  uint32_t exp = (op >> 23) & 0xFFu;
+  uint32_t frac = op & 0x7FFFFFu;
+  if (exp == 0xFFu) {
+    if (frac != 0u) {
+      return MANGO_F32_DEFAULT_NAN; /* any NaN → Default NaN */
+    }
+    return sign << 31; /* ±Inf → ±0 */
+  }
+  /* ±0 / denormal → ±Inf; set FPSCR.DZC (Arm table note a). */
+  if (exp == 0u) {
+    *fpscr |= MANGO_FPSCR_DZC;
+    return (sign << 31) | 0x7F800000u;
+  }
+  /* |op| >= 2^126 (exp >= 253) → ±0 */
+  if (exp >= 253u) {
+    return sign << 31;
+  }
+  uint32_t scaled = 0x100u | ((frac >> 15) & 0xFFu);
+  uint32_t estimate = mango_recip_estimate_u9(scaled);
+  uint32_t result_exp = 253u - exp; /* in 1..252 for exp in 1..252 */
+  uint32_t result_frac = (estimate & 0xFFu) << 15;
+  return (sign << 31) | (result_exp << 23) | result_frac;
+}
+
+
 /* T16 ADR and LDR-literal: (PC + 4) AND NOT 3. High-register ADD Rd, PC does not. */
 static uint32_t mango_thumb_align_pc(const MangoCpu* cpu, const MangoInsn* insn, uint32_t value) {
   if ((cpu->cpsr & MANGO_CPSR_T) && insn->rn == MANGO_REG_PC && insn->is_imm) {
@@ -1169,6 +1208,50 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           }
           for (uint32_t i = 0; i < nd; i++) {
             mango_vfp_set_d(cpu, insn.rd + i, pat);
+          }
+          break;
+        }
+
+        case MANGO_OP_VRECPE: {
+          /* Arm FPRecipEstimate.F32 per lane (not exact 1/x). */
+          uint32_t nd = insn.b ? 2u : 1u;
+          for (uint32_t di = 0; di < nd; di++) {
+            uint64_t src = mango_vfp_get_d(cpu, insn.rm + di);
+            uint64_t dst = 0;
+            for (uint32_t lane = 0; lane < 2u; lane++) {
+              uint32_t bits = (uint32_t)(src >> (lane * 32u));
+              uint32_t ob = mango_fp_recip_estimate_f32(bits, &cpu->fpscr);
+              dst |= (uint64_t)ob << (lane * 32u);
+            }
+            mango_vfp_set_d(cpu, insn.rd + di, dst);
+          }
+          break;
+        }
+
+        case MANGO_OP_VEXT: {
+          /* Extract nbytes from {Dn.., Dm..} concat starting at byte imm. */
+          uint32_t nbytes = insn.b ? 16u : 8u;
+          uint32_t nd = insn.b ? 2u : 1u;
+          uint8_t concat[32];
+          for (uint32_t i = 0; i < nd; i++) {
+            uint64_t v = mango_vfp_get_d(cpu, insn.rn + i);
+            for (uint32_t b = 0; b < 8u; b++) {
+              concat[i * 8u + b] = (uint8_t)(v >> (b * 8u));
+            }
+          }
+          for (uint32_t i = 0; i < nd; i++) {
+            uint64_t v = mango_vfp_get_d(cpu, insn.rm + i);
+            for (uint32_t b = 0; b < 8u; b++) {
+              concat[nbytes + i * 8u + b] = (uint8_t)(v >> (b * 8u));
+            }
+          }
+          uint32_t off = insn.imm;
+          for (uint32_t i = 0; i < nd; i++) {
+            uint64_t v = 0;
+            for (uint32_t b = 0; b < 8u; b++) {
+              v |= (uint64_t)concat[off + i * 8u + b] << (b * 8u);
+            }
+            mango_vfp_set_d(cpu, insn.rd + i, v);
           }
           break;
         }

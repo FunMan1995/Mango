@@ -3373,6 +3373,129 @@ static int test_strexd(void) {
   return 0;
 }
 
+static int test_neon_ctor_vmov_vmvn_vrecpe_vext(void) {
+  /* OFDP ctor uncovereds: VMOV.I32 cmode C, VMVN, VRECPE.F32, VEXT. */
+  MangoInsn insn;
+
+  if (mango_decode(0xF3C70C5Fu, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 3 ||
+      insn.b != 1 || insn.rd != 16u || insn.imm != 0x0000FFFFu || insn.rs != 0x0000FFFFu) {
+    fprintf(stderr, "FAIL(ctor_neon): vmov.decode op=%d u=%d rd=%u imm=0x%x rs=0x%x\n",
+            (int)insn.op, insn.u, insn.rd, insn.imm, insn.rs);
+    return 1;
+  }
+  if (mango_decode(0xF3C00670u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 3 ||
+      insn.b != 1 || insn.rd != 16u || insn.imm != 0x7FFFFFFFu || insn.rs != 0x7FFFFFFFu) {
+    fprintf(stderr, "FAIL(ctor_neon): vmvn.decode op=%d imm=0x%x rs=0x%x\n", (int)insn.op,
+            insn.imm, insn.rs);
+    return 1;
+  }
+  if (mango_decode(0xF3FB2560u, &insn) != 0 || insn.op != MANGO_OP_VRECPE || insn.b != 1 ||
+      insn.rd != 18u || insn.rm != 16u) {
+    fprintf(stderr, "FAIL(ctor_neon): vrecpe.decode op=%d rd=%u rm=%u\n", (int)insn.op, insn.rd,
+            insn.rm);
+    return 1;
+  }
+  if (mango_decode(0xF2F104A4u, &insn) != 0 || insn.op != MANGO_OP_VEXT || insn.b != 0 ||
+      insn.rd != 16u || insn.rn != 17u || insn.rm != 20u || insn.imm != 4u) {
+    fprintf(stderr, "FAIL(ctor_neon): vext.decode op=%d rd=%u rn=%u rm=%u imm=%u\n", (int)insn.op,
+            insn.rd, insn.rn, insn.rm, insn.imm);
+    return 1;
+  }
+
+  {
+    static const uint32_t kProg[] = {0xF3C70C5Fu, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[MANGO_REG_LR] = 0x1111u;
+    int rc = mango_interp_run(&cpu, &mem, 0x1111u, 100);
+    if (rc != 0 || cpu.s[32] != 0x0000FFFFu || cpu.s[33] != 0x0000FFFFu ||
+        cpu.s[34] != 0x0000FFFFu || cpu.s[35] != 0x0000FFFFu) {
+      fprintf(stderr, "FAIL(ctor_neon): vmov.exec rc=%d\n", rc);
+      return 1;
+    }
+  }
+
+  {
+    static const uint32_t kProg[] = {0xF3C00670u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.r[MANGO_REG_LR] = 0x2222u;
+    int rc = mango_interp_run(&cpu, &mem, 0x2222u, 100);
+    if (rc != 0 || cpu.s[32] != 0x7FFFFFFFu || cpu.s[33] != 0x7FFFFFFFu ||
+        cpu.s[34] != 0x7FFFFFFFu || cpu.s[35] != 0x7FFFFFFFu) {
+      fprintf(stderr, "FAIL(ctor_neon): vmvn.exec rc=%d\n", rc);
+      return 1;
+    }
+  }
+
+  {
+    /* Arm FPRecipEstimate — not exact 1/x. */
+    static const uint32_t kProg[] = {0xF3FB2560u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[32] = 0x40000000u; /* 2.0f → 0x3eff8000 */
+    cpu.s[33] = 0x40800000u; /* 4.0f → 0x3e7f8000 */
+    cpu.s[34] = 0x3F000000u; /* 0.5f → 0x3fff8000 */
+    cpu.s[35] = 0xC0000000u; /* -2.0f → 0xbeff8000 */
+    cpu.r[MANGO_REG_LR] = 0x3333u;
+    int rc = mango_interp_run(&cpu, &mem, 0x3333u, 100);
+    if (rc != 0 || cpu.s[36] != 0x3EFF8000u || cpu.s[37] != 0x3E7F8000u ||
+        cpu.s[38] != 0x3FFF8000u || cpu.s[39] != 0xBEFF8000u) {
+      fprintf(stderr, "FAIL(ctor_neon): vrecpe.exec rc=%d q9=%08x %08x %08x %08x\n", rc, cpu.s[36],
+              cpu.s[37], cpu.s[38], cpu.s[39]);
+      return 1;
+    }
+    /* Specials: 0 → +Inf + DZC; NaN → DefaultNaN */
+    cpu.s[32] = 0;
+    cpu.s[33] = 0x7FC00001u;
+    cpu.s[34] = 0x7F800000u;
+    cpu.s[35] = 0x80000000u;
+    cpu.s[36] = cpu.s[37] = cpu.s[38] = cpu.s[39] = 0;
+    cpu.fpscr = 0;
+    cpu.r[MANGO_REG_PC] = 0;
+    rc = mango_interp_run(&cpu, &mem, 0x3333u, 100);
+    if (rc != 0 || cpu.s[36] != 0x7F800000u || cpu.s[37] != 0x7FC00000u ||
+        cpu.s[38] != 0u || cpu.s[39] != 0xFF800000u || (cpu.fpscr & (1u << 1)) == 0) {
+      fprintf(stderr,
+              "FAIL(ctor_neon): vrecpe.specials rc=%d q9=%08x %08x %08x %08x fpscr=0x%x\n", rc,
+              cpu.s[36], cpu.s[37], cpu.s[38], cpu.s[39], cpu.fpscr);
+      return 1;
+    }
+  }
+
+  {
+    static const uint32_t kProg[] = {0xF2F104A4u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[34] = 0xA3A2A1A0u;
+    cpu.s[35] = 0xB3B2B1B0u;
+    cpu.s[40] = 0xC3C2C1C0u;
+    cpu.s[41] = 0xD3D2D1D0u;
+    cpu.r[MANGO_REG_LR] = 0x4444u;
+    int rc = mango_interp_run(&cpu, &mem, 0x4444u, 100);
+    if (rc != 0 || cpu.s[32] != 0xB3B2B1B0u || cpu.s[33] != 0xC3C2C1C0u) {
+      fprintf(stderr, "FAIL(ctor_neon): vext.exec rc=%d d16=%08x %08x\n", rc, cpu.s[32],
+              cpu.s[33]);
+      return 1;
+    }
+  }
+
+  printf("ok: OFDP ctor NEON VMOV.I32#0xffff / VMVN / VRECPE.F32 / VEXT\n");
+  return 0;
+}
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -3452,6 +3575,7 @@ int main(void) {
   failures += test_vmov_f32_scalar_imm();
   failures += test_ofdp_native_render_vmul_vcmp();
   failures += test_vcmp_fpscr_nzcv();
+  failures += test_neon_ctor_vmov_vmvn_vrecpe_vext();
   failures += test_strexd();
 
   if (failures != 0) {

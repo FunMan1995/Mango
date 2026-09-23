@@ -16,38 +16,10 @@ static void mango_insn_clear(MangoInsn* out) {
   out->op = MANGO_OP_UNKNOWN;
 }
 
-/* NEON VMOV.I* / VMOV.F32 imm8 → 64-bit D-lane pattern (repeated across Q). */
+/* NEON VMOV.I* / VMOV.F32 / VMVN imm8 → 64-bit D-lane pattern (repeated across Q).
+ * op==1 && cmode==0xE is VMOV.I64 byte-mask (not VMVN). Other op==1 cmodes expand as
+ * VMOV (op=0) then bitwise-NOT the 64-bit pattern. */
 static int mango_neon_expand_imm(uint32_t cmode, uint32_t op, uint32_t imm8, uint64_t* out) {
-  if (op == 0 && (cmode & 1u) == 0 && cmode <= 0x6u) {
-    uint32_t w = imm8 << ((cmode >> 1) * 8u);
-    *out = (uint64_t)w | ((uint64_t)w << 32);
-    return 0;
-  }
-  if (op == 0 && cmode == 0x8u) {
-    uint32_t w = imm8 | (imm8 << 16);
-    *out = (uint64_t)w | ((uint64_t)w << 32);
-    return 0;
-  }
-  if (op == 0 && cmode == 0xAu) {
-    uint32_t w = (imm8 << 8) | (imm8 << 24);
-    *out = (uint64_t)w | ((uint64_t)w << 32);
-    return 0;
-  }
-  if (op == 0 && cmode == 0xEu) {
-    uint64_t p = 0;
-    for (uint32_t i = 0; i < 8u; i++) {
-      p |= (uint64_t)imm8 << (8u * i);
-    }
-    *out = p;
-    return 0;
-  }
-  if (op == 0 && cmode == 0xFu) {
-    uint32_t b = (imm8 >> 6) & 1u;
-    uint32_t w = ((imm8 & 0x80u) << 24) | ((1u - b) << 30) | (b ? 0x3E000000u : 0) |
-                 ((imm8 & 0x3Fu) << 19);
-    *out = (uint64_t)w | ((uint64_t)w << 32);
-    return 0;
-  }
   if (op == 1 && cmode == 0xEu) {
     uint64_t p = 0;
     for (uint32_t i = 0; i < 8u; i++) {
@@ -58,7 +30,40 @@ static int mango_neon_expand_imm(uint32_t cmode, uint32_t op, uint32_t imm8, uin
     *out = p;
     return 0;
   }
-  return -1;
+  /* VMVN: expand like VMOV then invert. */
+  uint32_t eop = (op == 1u) ? 0u : op;
+  int invert = (op == 1u);
+  if (eop == 0 && (cmode & 1u) == 0 && cmode <= 0x6u) {
+    uint32_t w = imm8 << ((cmode >> 1) * 8u);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+  } else if (eop == 0 && cmode == 0x8u) {
+    uint32_t w = imm8 | (imm8 << 16);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+  } else if (eop == 0 && cmode == 0xAu) {
+    uint32_t w = (imm8 << 8) | (imm8 << 24);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+  } else if (eop == 0 && cmode == 0xCu) {
+    /* I32: each lane = imm8 | (imm8 << 8) in bits[15:0] (e.g. #0xffff). */
+    uint32_t w = imm8 | (imm8 << 8);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+  } else if (eop == 0 && cmode == 0xEu) {
+    uint64_t p = 0;
+    for (uint32_t i = 0; i < 8u; i++) {
+      p |= (uint64_t)imm8 << (8u * i);
+    }
+    *out = p;
+  } else if (eop == 0 && cmode == 0xFu) {
+    uint32_t b = (imm8 >> 6) & 1u;
+    uint32_t w = ((imm8 & 0x80u) << 24) | ((1u - b) << 30) | (b ? 0x3E000000u : 0) |
+                 ((imm8 & 0x3Fu) << 19);
+    *out = (uint64_t)w | ((uint64_t)w << 32);
+  } else {
+    return -1;
+  }
+  if (invert) {
+    *out = ~*out;
+  }
+  return 0;
 }
 
 int mango_decode(uint32_t word, MangoInsn* out) {
@@ -115,6 +120,47 @@ int mango_decode(uint32_t word, MangoInsn* out) {
         out->b = (int)q;
         out->imm = (uint32_t)pat;
         out->rs = (uint32_t)(pat >> 32);
+        return 0;
+      }
+      /* VEXT: 1111 0010 1 D 11 Vn Vd imm4 N Q M 0 Vm (bit24=0, bit4=0). */
+      if (((word >> 23) & 1u) == 1 && ((word >> 20) & 3u) == 3u && ((word >> 24) & 1u) == 0 &&
+          ((word >> 4) & 1u) == 0) {
+        uint32_t q = (word >> 6) & 1u;
+        uint32_t imm4 = (word >> 8) & 0xFu;
+        uint32_t d = (((word >> 22) & 1u) << 4) | ((word >> 12) & 0xFu);
+        uint32_t n = (((word >> 7) & 1u) << 4) | ((word >> 16) & 0xFu);
+        uint32_t m = (((word >> 5) & 1u) << 4) | (word & 0xFu);
+        if (q && ((d | n | m) & 1u)) {
+          return -1;
+        }
+        if ((!q && imm4 >= 8u) || (q && imm4 >= 16u)) {
+          return -1;
+        }
+        out->op = MANGO_OP_VEXT;
+        out->cond = 0xE;
+        out->rd = d;
+        out->rn = n;
+        out->rm = m;
+        out->b = (int)q;
+        out->imm = imm4; /* byte offset */
+        return 0;
+      }
+      /* VRECPE: 1111 0011 1 D 11 size 11 Vd 0 10 F 0 Q M 0 Vm; F=1 size=10 → F32. */
+      if (((word >> 23) & 1u) == 1 && ((word >> 20) & 3u) == 3u && ((word >> 24) & 1u) == 1 &&
+          ((word >> 16) & 3u) == 3u && ((word >> 18) & 3u) == 2u && ((word >> 8) & 0xFu) == 0x5u &&
+          ((word >> 7) & 1u) == 0 && ((word >> 4) & 1u) == 0) {
+        uint32_t q = (word >> 6) & 1u;
+        uint32_t d = (((word >> 22) & 1u) << 4) | ((word >> 12) & 0xFu);
+        uint32_t m = (((word >> 5) & 1u) << 4) | (word & 0xFu);
+        if (q && ((d | m) & 1u)) {
+          return -1;
+        }
+        out->op = MANGO_OP_VRECPE;
+        out->cond = 0xE;
+        out->rd = d;
+        out->rm = m;
+        out->b = (int)q;
+        out->imm = 4; /* F32 lane size in bytes */
         return 0;
       }
       return -1;
