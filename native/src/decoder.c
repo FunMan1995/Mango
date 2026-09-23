@@ -66,6 +66,50 @@ static int mango_neon_expand_imm(uint32_t cmode, uint32_t op, uint32_t imm8, uin
   return 0;
 }
 
+
+/* ThumbExpandImm (modified immediate): Arm ARM Immediate constants in A32/T32.
+ * imm12 = i:imm3:imm8. Expand at decode into out->imm (like A32 imm8/rot).
+ * Returns -1 for architecturally UNPREDICTABLE encodings (copy forms with imm8=0). */
+static int mango_thumb_expand_imm(uint32_t imm12, uint32_t* out) {
+  imm12 &= 0xFFFu;
+  if (((imm12 >> 10) & 3u) == 0u) {
+    uint32_t imm8 = imm12 & 0xFFu;
+    switch ((imm12 >> 8) & 3u) {
+      case 0:
+        *out = imm8;
+        return 0;
+      case 1:
+        if (imm8 == 0u) {
+          return -1;
+        }
+        *out = (imm8 << 16) | imm8;
+        return 0;
+      case 2:
+        if (imm8 == 0u) {
+          return -1;
+        }
+        *out = (imm8 << 24) | (imm8 << 8);
+        return 0;
+      default: /* case 3 */
+        if (imm8 == 0u) {
+          return -1;
+        }
+        *out = (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8;
+        return 0;
+    }
+  }
+  {
+    uint32_t unrot = 0x80u | (imm12 & 0x7Fu);
+    uint32_t rot = (imm12 >> 7) & 0x1Fu;
+    if (rot == 0u) {
+      *out = unrot;
+    } else {
+      *out = (unrot >> rot) | (unrot << (32u - rot));
+    }
+    return 0;
+  }
+}
+
 int mango_decode(uint32_t word, MangoInsn* out) {
   mango_insn_clear(out);
   out->cond = (word >> 28) & 0xF;
@@ -1573,6 +1617,59 @@ static uint32_t mango_t32_bcond_imm(uint16_t hw1, uint16_t hw2) {
 int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   mango_insn_clear(out);
   out->cond = 0xE;
+
+  /* Q-OTTD-0d: MOV.W Rd,#<const> modified-imm (Rn=15, S=0).
+   * Primary f04f 0800 = mov.w r8,#0; sibling f04f 0825 = mov.w r8,#0x25.
+   * Not MOVW (F240). Do not open S=1 / Rn!=15 (ORR) this bite. */
+  if ((hw1 & 0xFBE0u) == 0xF040u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) == 0 &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->is_imm = 1;
+    out->sets_flags = 0;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0d: SUB.W Rd,Rn,#<const> modified-imm (S=0). Guest f5ad 5d08 =
+   * sub.w sp,sp,#0x2200 (ThumbExpandImm(0xD08)=0x2200). Plain SUBW #0xD08 is
+   * f6ad 5d08 (already handled). SP as Rd/Rn allowed; PC rejected. */
+  if ((hw1 & 0xFBE0u) == 0xF1A0u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_SUB;
+    out->rd = rd;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->sets_flags = 0;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
 
   /* MOVW: 11110 i 100100 imm4 / 0 imm3 Rd imm8 */
   if ((hw1 & 0xFBF0u) == 0xF240u && (hw2 & 0x8000u) == 0) {
