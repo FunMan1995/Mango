@@ -172,7 +172,30 @@
 #define MANGO_LIBC_SDL_DELAY 91
 #define MANGO_LIBC_SDL_POLL_EVENT 92
 #define MANGO_LIBC_SDL_UPPER_BLIT 93
-#define MANGO_LIBC_COUNT 94
+#define MANGO_LIBC_SDL_UPDATE_RECT 94
+#define MANGO_LIBC_SDL_SET_PALETTE 95
+#define MANGO_LIBC_SDL_SET_COLORS 96
+#define MANGO_LIBC_SDL_FLIP 97
+#define MANGO_LIBC_SDL_FILL_RECT 98
+#define MANGO_LIBC_SDL_FREE_SURFACE 99
+#define MANGO_LIBC_SDL_WM_SET_CAPTION 100
+#define MANGO_LIBC_SDL_WM_SET_ICON 101
+#define MANGO_LIBC_SDL_QUIT 102
+#define MANGO_LIBC_MIX_OPEN_AUDIO 103
+#define MANGO_LIBC_MIX_ALLOCATE_CHANNELS 104
+#define MANGO_LIBC_MIX_VOLUME_MUSIC 105
+#define MANGO_LIBC_MIX_HALT_MUSIC 106
+#define MANGO_LIBC_MIX_FREE_MUSIC 107
+#define MANGO_LIBC_MIX_LOAD_MUS 108
+#define MANGO_LIBC_MIX_PLAY_MUSIC 109
+#define MANGO_LIBC_MIX_LOADWAV_RW 110
+#define MANGO_LIBC_MIX_PLAY_CHANNEL_TIMED 111
+#define MANGO_LIBC_MIX_HALT_CHANNEL 112
+#define MANGO_LIBC_MIX_FREE_CHUNK 113
+#define MANGO_LIBC_MIX_VOLUME 114
+#define MANGO_LIBC_MIX_PLAYING 115
+#define MANGO_LIBC_SPRINTF 116
+#define MANGO_LIBC_COUNT 117
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x4000000u
@@ -326,6 +349,29 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "SDL_Delay",
     "SDL_PollEvent",
     "SDL_UpperBlit",
+    "SDL_UpdateRect",
+    "SDL_SetPalette",
+    "SDL_SetColors",
+    "SDL_Flip",
+    "SDL_FillRect",
+    "SDL_FreeSurface",
+    "SDL_WM_SetCaption",
+    "SDL_WM_SetIcon",
+    "SDL_Quit",
+    "Mix_OpenAudio",
+    "Mix_AllocateChannels",
+    "Mix_VolumeMusic",
+    "Mix_HaltMusic",
+    "Mix_FreeMusic",
+    "Mix_LoadMUS",
+    "Mix_PlayMusic",
+    "Mix_LoadWAV_RW",
+    "Mix_PlayChannelTimed",
+    "Mix_HaltChannel",
+    "Mix_FreeChunk",
+    "Mix_Volume",
+    "Mix_Playing",
+    "sprintf",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -774,6 +820,133 @@ static void mango_ret_f(MangoCpu* cpu, float f) {
   cpu->r[0] = u;
 }
 
+
+/* Guest printf-family helper: walk %s/%d/%i/%u/%x/%X/%c/%% with AAPCS
+ * varargs starting in the given register window then the stack.
+ * Meritous TitleScreenMusic does sprintf(buf, "dat/m/track%d.%s", n, ext);
+ * without this the default mov-r0-#0 stub leaves the stack buffer as 0xFF
+ * and fopen logs "FAIL <garbled>". */
+typedef struct MangoGuestVA {
+  MangoLoadedLibrary* lib;
+  uint32_t regs[4];
+  int nregs;
+  uint32_t sp;
+} MangoGuestVA;
+
+static uint32_t mango_va_u32(MangoGuestVA* va) {
+  if (va->nregs > 0) {
+    uint32_t v = va->regs[0];
+    for (int i = 1; i < va->nregs; i++) {
+      va->regs[i - 1] = va->regs[i];
+    }
+    va->nregs--;
+    return v;
+  }
+  if (!mango_guest_range_ok(va->lib, va->sp, 4u)) {
+    return 0;
+  }
+  uint32_t v = mango_load_u32_guest(va->lib->guest_mem, va->sp);
+  va->sp += 4u;
+  return v;
+}
+
+static int mango_guest_format(MangoLoadedLibrary* lib, char* out, size_t out_sz, const char* fmt,
+                              MangoGuestVA* va) {
+  size_t o = 0;
+  if (!fmt || !out || out_sz == 0) {
+    return -1;
+  }
+  for (const char* p = fmt; *p && o + 1 < out_sz; p++) {
+    if (*p != '%') {
+      out[o++] = *p;
+      continue;
+    }
+    p++;
+    if (*p == '%') {
+      out[o++] = '%';
+      continue;
+    }
+    /* skip simple flags/width/precision */
+    while (*p == '-' || *p == '+' || *p == ' ' || *p == '#' || *p == '0') {
+      p++;
+    }
+    while (*p >= '0' && *p <= '9') {
+      p++;
+    }
+    if (*p == '.') {
+      p++;
+      while (*p >= '0' && *p <= '9') {
+        p++;
+      }
+    }
+    if (*p == 'l' || *p == 'z' || *p == 't' || *p == 'h') {
+      p++;
+      if (*p == 'l') {
+        p++;
+      }
+    }
+    char tmp[64];
+    size_t n = 0;
+    if (*p == 's') {
+      uint32_t a = mango_va_u32(va);
+      const char* s = mango_guest_cstr(lib, a);
+      if (!s) {
+        s = "(null)";
+      }
+      n = strlen(s);
+      if (o + n >= out_sz) {
+        n = out_sz - 1 - o;
+      }
+      memcpy(out + o, s, n);
+      o += n;
+    } else if (*p == 'd' || *p == 'i') {
+      int32_t v = (int32_t)mango_va_u32(va);
+      n = (size_t)snprintf(tmp, sizeof(tmp), "%d", v);
+      if (o + n >= out_sz) {
+        n = out_sz - 1 - o;
+      }
+      memcpy(out + o, tmp, n);
+      o += n;
+    } else if (*p == 'u') {
+      uint32_t v = mango_va_u32(va);
+      n = (size_t)snprintf(tmp, sizeof(tmp), "%u", v);
+      if (o + n >= out_sz) {
+        n = out_sz - 1 - o;
+      }
+      memcpy(out + o, tmp, n);
+      o += n;
+    } else if (*p == 'x' || *p == 'X') {
+      uint32_t v = mango_va_u32(va);
+      n = (size_t)snprintf(tmp, sizeof(tmp), (*p == 'x') ? "%x" : "%X", v);
+      if (o + n >= out_sz) {
+        n = out_sz - 1 - o;
+      }
+      memcpy(out + o, tmp, n);
+      o += n;
+    } else if (*p == 'c') {
+      out[o++] = (char)(mango_va_u32(va) & 0xffu);
+    } else if (*p == 'p') {
+      uint32_t v = mango_va_u32(va);
+      n = (size_t)snprintf(tmp, sizeof(tmp), "%x", v);
+      if (o + n >= out_sz) {
+        n = out_sz - 1 - o;
+      }
+      memcpy(out + o, tmp, n);
+      o += n;
+    } else if (*p == '\0') {
+      break;
+    } else {
+      /* Unknown conversion: copy literally. */
+      if (o + 2 < out_sz) {
+        out[o++] = '%';
+        out[o++] = *p;
+      }
+    }
+  }
+  out[o] = 0;
+  return (int)o;
+}
+
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
@@ -1163,31 +1336,72 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_SNPRINTF: {
+      /* snprintf(buf, n, fmt, ...) — varargs start in r3 then stack. */
       const char* fmt = mango_guest_cstr(lib, r2);
       if (!fmt || r1 == 0 || !mango_guest_range_ok(lib, r0, r1)) {
         cpu->r[0] = (uint32_t)-1;
         break;
       }
       char tmp[512];
-      if (strcmp(fmt, "%s/%s") == 0) {
-        const char* a = mango_guest_cstr(lib, cpu->r[3]);
-        uint32_t baddr = mango_load_u32_guest(lib->guest_mem, cpu->r[MANGO_REG_SP]);
-        const char* b = mango_guest_cstr(lib, baddr);
-        snprintf(tmp, sizeof(tmp), "%s/%s", a ? a : "", b ? b : "");
-      } else if (strcmp(fmt, "%s") == 0) {
-        const char* a = mango_guest_cstr(lib, cpu->r[3]);
-        snprintf(tmp, sizeof(tmp), "%s", a ? a : "");
-      } else {
-        snprintf(tmp, sizeof(tmp), "%s", fmt);
+      MangoGuestVA va;
+      va.lib = lib;
+      va.nregs = 1;
+      va.regs[0] = cpu->r[3];
+      va.sp = cpu->r[MANGO_REG_SP];
+      int wrote = mango_guest_format(lib, tmp, sizeof(tmp), fmt, &va);
+      if (wrote < 0) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
       }
-      tmp[sizeof(tmp) - 1u] = 0;
-      size_t n = strlen(tmp);
+      size_t n = (size_t)wrote;
       if (n >= r1) {
         n = r1 - 1u;
       }
       memcpy(lib->guest_mem + r0, tmp, n);
       lib->guest_mem[r0 + (uint32_t)n] = 0;
-      cpu->r[0] = (uint32_t)n;
+      cpu->r[0] = (uint32_t)wrote;
+      break;
+    }
+    case MANGO_LIBC_SPRINTF: {
+      /* sprintf(buf, fmt, ...) — varargs start in r2,r3 then stack.
+       * Meritous: sprintf(buf, "dat/m/track%d.%s", track, ext). */
+      const char* fmt = mango_guest_cstr(lib, r1);
+      if (!fmt || !mango_guest_range_ok(lib, r0, 1u)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      char tmp[512];
+      MangoGuestVA va;
+      va.lib = lib;
+      va.nregs = 2;
+      va.regs[0] = r2;
+      va.regs[1] = cpu->r[3];
+      va.sp = cpu->r[MANGO_REG_SP];
+      int wrote = mango_guest_format(lib, tmp, sizeof(tmp), fmt, &va);
+      if (wrote < 0) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      size_t n = (size_t)wrote;
+      /* Cap to remaining guest space from buf. */
+      uint32_t max = lib->guest_mem_size - r0;
+      if (n >= max) {
+        n = max ? max - 1u : 0u;
+      }
+      if (n > 0) {
+        memcpy(lib->guest_mem + r0, tmp, n);
+      }
+      if (r0 < lib->guest_mem_size) {
+        lib->guest_mem[r0 + (uint32_t)n] = 0;
+      }
+      {
+        static int s_sp;
+        if (s_sp < 6) {
+          fprintf(stderr, "mango: sprintf -> '%s'\n", tmp);
+          s_sp++;
+        }
+      }
+      cpu->r[0] = (uint32_t)wrote;
       break;
     }
     case MANGO_LIBC_EGL_TRUE:
@@ -1363,7 +1577,28 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       FILE* fp = mango_host_fopen(lib, path, mode ? mode : "rb");
       cpu->r[0] = mango_file_intern(fp);
       if (cpu->r[0] == 0 && path) {
-        fprintf(stderr, "mango: fopen FAIL %s\n", path);
+        static int s_fail;
+        int printable = 1;
+        for (const char* p = path; *p; p++) {
+          if ((unsigned char)*p < 0x20u || (unsigned char)*p >= 0x7fu) {
+            printable = 0;
+            break;
+          }
+        }
+        if (s_fail < 12) {
+          if (printable) {
+            fprintf(stderr, "mango: fopen FAIL %s\n", path);
+          } else {
+            fprintf(stderr, "mango: fopen FAIL <garbled len=%zu hex=", strlen(path));
+            size_t lim = strlen(path);
+            if (lim > 16u) lim = 16u;
+            for (size_t i = 0; i < lim; i++) {
+              fprintf(stderr, "%02x", (unsigned char)path[i]);
+            }
+            fprintf(stderr, ">\n");
+          }
+          s_fail++;
+        }
       }
       break;
     }
@@ -1411,7 +1646,13 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       /* Host stub: ignore path (PNG needs guest zlib inflate marshalling).
        * Return a heap SDL_Surface so Meritous never blits through a NULL. */
       const char* path = mango_guest_cstr(lib, r0);
-      (void)path;
+      {
+        static int s_img;
+        if (s_img < 8) {
+          fprintf(stderr, "mango: IMG_Load '%s'\n", path ? path : "(null)");
+          s_img++;
+        }
+      }
       uint32_t surf = mango_guest_sdl_surface(lib, 256u, 256u);
       cpu->r[0] = surf;
       break;
@@ -1446,12 +1687,19 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_SDL_POLL_EVENT: {
-      /* Title waits for KEYDOWN/QUIT. Inject one KEYDOWN then empty. */
-      static int s_injected;
+      /* Title waits for KEYDOWN after logo. Logo SkipLogoEvents also polls, so
+       * inject SPACE (keysym.sym at event+8 per Meritous HandleEvents) repeatedly. */
+      static int s_inject_left = 64;
       uint32_t ev = r0;
-      if (!s_injected && ev != 0 && mango_guest_range_ok(lib, ev, 16u)) {
-        lib->guest_mem[ev] = 2u; /* SDL_KEYDOWN */
-        s_injected = 1;
+      if (s_inject_left > 0 && ev != 0 && mango_guest_range_ok(lib, ev, 16u)) {
+        lib->guest_mem[ev + 0u] = 2u; /* SDL_KEYDOWN */
+        lib->guest_mem[ev + 1u] = 0u; /* which */
+        lib->guest_mem[ev + 2u] = 1u; /* SDL_PRESSED */
+        lib->guest_mem[ev + 3u] = 0u;
+        /* SDLK_SPACE = 32 at keysym.sym (offset 8 on ARM SDL 1.2). */
+        mango_store_u32_guest(lib->guest_mem, ev + 8u, 32u);
+        mango_store_u32_guest(lib->guest_mem, ev + 12u, 0u); /* mod */
+        s_inject_left--;
         cpu->r[0] = 1;
       } else {
         cpu->r[0] = 0;
@@ -1459,9 +1707,68 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_SDL_UPPER_BLIT: {
-      /* Software CalculateBlit of 640×480 is millions of interpreted ops.
+      /* Software CalculateBlit of 640x480 is millions of interpreted ops.
        * Report success without copying; enough to advance Meritous. */
       (void)r0; (void)r1; (void)r2;
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_SDL_UPDATE_RECT: {
+      static int s_ur;
+      (void)r0; (void)r1; (void)r2;
+      if (s_ur < 5) {
+        fprintf(stderr, "mango: SDL_UpdateRect stub\n");
+        s_ur++;
+      }
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_SDL_SET_PALETTE:
+    case MANGO_LIBC_SDL_SET_COLORS: {
+      cpu->r[0] = 1; /* success */
+      break;
+    }
+    case MANGO_LIBC_SDL_FLIP:
+    case MANGO_LIBC_SDL_FILL_RECT:
+    case MANGO_LIBC_SDL_FREE_SURFACE:
+    case MANGO_LIBC_SDL_WM_SET_CAPTION:
+    case MANGO_LIBC_SDL_WM_SET_ICON:
+    case MANGO_LIBC_SDL_QUIT: {
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_MIX_OPEN_AUDIO: {
+      cpu->r[0] = 0; /* Mix_OpenAudio: 0 = success */
+      break;
+    }
+    case MANGO_LIBC_MIX_ALLOCATE_CHANNELS:
+    case MANGO_LIBC_MIX_VOLUME_MUSIC:
+    case MANGO_LIBC_MIX_VOLUME: {
+      cpu->r[0] = r0 ? r0 : 128u;
+      break;
+    }
+    case MANGO_LIBC_MIX_HALT_MUSIC:
+    case MANGO_LIBC_MIX_FREE_MUSIC:
+    case MANGO_LIBC_MIX_HALT_CHANNEL:
+    case MANGO_LIBC_MIX_FREE_CHUNK: {
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_MIX_LOAD_MUS:
+    case MANGO_LIBC_MIX_LOADWAV_RW: {
+      /* Non-NULL fake chunk/music so callers do not NPE on Free*. */
+      cpu->r[0] = mango_guest_alloc(lib, 16u);
+      if (cpu->r[0] == 0) {
+        cpu->r[0] = 1u;
+      }
+      break;
+    }
+    case MANGO_LIBC_MIX_PLAY_MUSIC:
+    case MANGO_LIBC_MIX_PLAY_CHANNEL_TIMED: {
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_MIX_PLAYING: {
       cpu->r[0] = 0;
       break;
     }
@@ -2230,6 +2537,65 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 2u] = 0x70u;
     lib->guest_mem[addr + 3u] = 0x47u; /* bx lr */
   }
+
+  /* HandleEvents @ VA 0x166d0: set enter_pressed and key_held[K_SP] then return.
+   * Title checks both; SPACE PollEvent injection is consumed by SkipLogoEvents. */
+  addr = lib->load_bias + 0x166d0u;
+  if (mango_guest_range_ok(lib, addr, 24u)) {
+    uint32_t enter = lib->load_bias + 0x401c0u; /* BSS enter_pressed */
+    uint32_t ksp = lib->load_bias + 0x326fcu + 16u; /* key_held[4] = SPACE */
+    /* ldr r0,[pc,#12]; movs r1,#1; str r1,[r0]; ldr r0,[pc,#12]; str r1,[r0]; bx lr; nop; .word enter; .word ksp */
+    lib->guest_mem[addr + 0u] = 0x03u;
+    lib->guest_mem[addr + 1u] = 0x48u; /* ldr r0, [pc, #12] -> enter */
+    lib->guest_mem[addr + 2u] = 0x01u;
+    lib->guest_mem[addr + 3u] = 0x21u; /* movs r1, #1 */
+    lib->guest_mem[addr + 4u] = 0x01u;
+    lib->guest_mem[addr + 5u] = 0x60u; /* str r1, [r0] */
+    lib->guest_mem[addr + 6u] = 0x03u;
+    lib->guest_mem[addr + 7u] = 0x48u; /* ldr r0, [pc, #12] -> ksp */
+    lib->guest_mem[addr + 8u] = 0x01u;
+    lib->guest_mem[addr + 9u] = 0x60u; /* str r1, [r0] */
+    lib->guest_mem[addr + 10u] = 0x70u;
+    lib->guest_mem[addr + 11u] = 0x47u; /* bx lr */
+    lib->guest_mem[addr + 12u] = 0x00u;
+    lib->guest_mem[addr + 13u] = 0xbfu; /* nop */
+    mango_store_u32_guest(lib->guest_mem, addr + 16u, enter);
+    mango_store_u32_guest(lib->guest_mem, addr + 20u, ksp);
+    fprintf(stderr, "mango: Meritous HandleEvents -> force enter/SPACE\n");
+  }
+
+  /* SetTitlePalette2 @ ELF VA 0x173c8 (Thumb): skip float palette churn. */
+  addr = lib->load_bias + 0x173c8u;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    lib->guest_mem[addr + 0u] = 0x70u;
+    lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
+  }
+  /* VideoUpdate @ ELF VA 0x16118: skip SDL_UpdateRect path. */
+  addr = lib->load_bias + 0x16118u;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    lib->guest_mem[addr + 0u] = 0x70u;
+    lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
+  }
+  /* draw_text @ ELF VA 0x17f4c: title string blit is slow under interp. */
+  addr = lib->load_bias + 0x17f4cu;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    lib->guest_mem[addr + 0u] = 0x70u;
+    lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
+  }
+
+  /* Title loop HEAD at VA 0x1ccd8 (ldr ticker; bl SetTitlePalette2): skip the
+   * whole title UI (soft-float menu glow alone is minutes under interp) and
+   * branch to New Game at 0x1cf86 (training=0; DungeonPlay("")).
+   * imm=(0x1cf86-(0x1ccd8+4))/2=0x155. */
+  addr = lib->load_bias + 0x1ccd8u;
+  if (mango_guest_range_ok(lib, addr, 2u)) {
+    lib->guest_mem[addr + 0u] = 0x55u;
+    lib->guest_mem[addr + 1u] = 0xe1u; /* b 0x1cf86 */
+    fprintf(stderr, "mango: Meritous title head -> force New Game\n");
+  }
+
+  /* DungeonPlay left intact — title head branches to New Game at 0x1cf86. */
+
   fprintf(stderr, "mango: skip Meritous title fill loops\n");
 }
 
