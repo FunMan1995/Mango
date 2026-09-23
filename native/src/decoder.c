@@ -1966,14 +1966,17 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   }
 
 
-  /* Q-OTTD-0f-ldr: LDR.W Rt,[Rn,Rm] T2 exact guest — size=10 L=1, imm2=0 / LSL#0,
-   * no writeback. Guest f854 a003 = ldr.w r10,[r4,r3]. Tip already has F880 LDR
-   * imm12 (bit7=1); this is F850 (bit7=0). Reject PC; imm2!=0 / STR.W still closed.
-   * Imm8 P/U/W post-index (f855 2b04 / f85d 4b04) is Q-OTTD-0m below. */
-  if ((hw1 & 0xFFF0u) == 0xF850u && (hw2 & 0x0FF0u) == 0) {
+  /* Q-OTTD-0f-ldr / 0y: LDR.W Rt,[Rn,Rm,LSL#imm2] T2 — size=10 L=1, register
+   * form bits[11:6]=0, any imm2 0..3 (mirror 0u STR.W / 0m LDRB / 0v STRH).
+   * Guest f854 a003 = ldr.w r10,[r4,r3] imm2=0; footnote f853 1021 LSL#2.
+   * Tip F880 LDR imm12 (bit7=1); this is F850 (bit7=0). Reject PC.
+   * Imm8 P/U/W post-index (f855 2b04 / f85d 4b04) is Q-OTTD-0m below (bit11=1).
+   * Do not open LDRH.W WB (f834 1f02) — hold for 0z. */
+  if ((hw1 & 0xFFF0u) == 0xF850u && (hw2 & 0x0FC0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
+    uint32_t imm2 = (hw2 >> 4) & 3u;
     if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
       return -1;
     }
@@ -1983,7 +1986,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rm = rm;
     out->is_imm = 0;
     out->shift_type = 0; /* LSL */
-    out->shift_amount = 0;
+    out->shift_amount = imm2;
     out->p = 1;
     out->u = 1;
     out->w = 0;

@@ -3620,8 +3620,225 @@ static int test_t32_ldr_w_reg(void) {
   return 0;
 }
 
+static int test_t32_ldr_w_reg_lsl2(void) {
+  /* Q-OTTD-0y: ldr.w r1,[r3,r1,lsl#2] = f853 1021. Load word at Rn+(Rm<<2);
+   * Rn hold; NZCV hold; pc+=4. Rt==Rm (r1) — Rm read before Rt write. */
+  static const uint16_t kProg[] = {0xF853u, 0x1021u, 0x4770u};
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF853u, 0x1021u, &di) != 0 || di.op != MANGO_OP_LDR || di.rd != 1 ||
+      di.rn != 3 || di.rm != 1 || di.is_imm != 0 || di.shift_type != 0 || di.shift_amount != 2 ||
+      di.p != 1 || di.u != 1 || di.w != 0 || di.b != 0) {
+    fprintf(stderr,
+            "FAIL(t32_ldr_w_lsl2): decode op=%d rd=%u rn=%u rm=%u imm=%d st=%u sh=%u p=%d u=%d "
+            "w=%d b=%d (want LDR r1,[r3,r1,lsl#2])\n",
+            di.op, di.rd, di.rn, di.rm, di.is_imm, di.shift_type, di.shift_amount, di.p, di.u,
+            di.w, di.b);
+    return 1;
+  }
+
+  /* tip 0f imm2=0 still tip */
+  if (mango_decode_t32(0xF854u, 0xA003u, &di) != 0 || di.op != MANGO_OP_LDR || di.is_imm != 0 ||
+      di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_ldr_w_lsl2): 0f f854a003 should still decode LDR reg sh=0\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF853u, 0x1001u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_ldr_w_lsl2): 0f f8531001 should still decode LDR reg sh=0\n");
+    return 1;
+  }
+
+  uint32_t base = 64u;
+  u32_to_bytes_le(mem_buf + base + 0, 0x10011111u);
+  u32_to_bytes_le(mem_buf + base + 4, 0xa00aaaaau);
+  u32_to_bytes_le(mem_buf + base + 8, 0x30033333u);
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[3] = base;
+  cpu.r[1] = 1u; /* index; <<2 → +4 */
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(t32_ldr_w_lsl2): run rc=%d\n", rc);
+    return 1;
+  }
+  if (cpu.r[1] != 0xa00aaaaau) {
+    fprintf(stderr, "FAIL(t32_ldr_w_lsl2): r1=0x%x want 0xa00aaaaa (mem[r3+(1<<2)])\n",
+            cpu.r[1]);
+    return 1;
+  }
+  if (cpu.r[3] != base) {
+    fprintf(stderr, "FAIL(t32_ldr_w_lsl2): r3 writeback 0x%x -> 0x%x (must leave Rn)\n", base,
+            cpu.r[3]);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + base + 0) != 0x10011111u ||
+      bytes_to_u32_le(mem_buf + base + 4) != 0xa00aaaaau ||
+      bytes_to_u32_le(mem_buf + base + 8) != 0x30033333u) {
+    fprintf(stderr, "FAIL(t32_ldr_w_lsl2): memory mutated\n");
+    return 1;
+  }
+  if (cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_ldr_w_lsl2): cpsr changed 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 LDR.W r1,[r3,r1,lsl#2] imm2=2 no WB (Q-OTTD-0y)\n");
+  return 0;
+}
+
+static int test_t32_ldr_w_reg_imm2_contrasts(void) {
+  /* Same-arm imm2=0/1/3 + distractor f855 5021; post 0m tip; LDRH WB uncover. */
+  MangoInsn di;
+  uint8_t mem_buf[128];
+  uint32_t base = 64u;
+
+  /* f853 1001 = ldr.w r1,[r3,r1] imm2=0 → load [base+1] wait Rm=1 unshifted → base+1?
+   * Use Rm=4 for word-aligned slot: actually guest uses r1=1 for lsl forms.
+   * For imm2=0 load at base+4 with r1=4. */
+  {
+    static const uint16_t kProg[] = {0xF853u, 0x1001u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF853u, 0x1001u, &di) != 0 || di.op != MANGO_OP_LDR ||
+        di.shift_amount != 0) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): f8531001 want LDR sh=0\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 0, 0x10011111u);
+    u32_to_bytes_le(mem_buf + base + 4, 0xc00cccccu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[3] = base;
+    cpu.r[1] = 4u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 || cpu.r[1] != 0xc00cccccu ||
+        cpu.r[3] != base) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): lsl#0 r1=0x%x r3=0x%x\n", cpu.r[1], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  /* f853 1011 = ldr.w r1,[r3,r1,lsl#1] → base+(4<<1)=base+8 */
+  {
+    static const uint16_t kProg[] = {0xF853u, 0x1011u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF853u, 0x1011u, &di) != 0 || di.op != MANGO_OP_LDR ||
+        di.shift_amount != 1) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): f8531011 want LDR sh=1\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 8, 0xd11dddddu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[3] = base;
+    cpu.r[1] = 4u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 || cpu.r[1] != 0xd11dddddu ||
+        cpu.r[3] != base) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): lsl#1 r1=0x%x r3=0x%x\n", cpu.r[1], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  /* f853 1031 = ldr.w r1,[r3,r1,lsl#3] → base+(4<<3)=base+32 */
+  {
+    static const uint16_t kProg[] = {0xF853u, 0x1031u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF853u, 0x1031u, &di) != 0 || di.op != MANGO_OP_LDR ||
+        di.shift_amount != 3) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): f8531031 want LDR sh=3\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 32, 0xe33eeeeeu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[3] = base;
+    cpu.r[1] = 4u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 || cpu.r[1] != 0xe33eeeeeu ||
+        cpu.r[3] != base) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): lsl#3 r1=0x%x r3=0x%x\n", cpu.r[1], cpu.r[3]);
+      return 1;
+    }
+  }
+
+  /* Distractor f855 5021 = ldr.w r5,[r5,r1,lsl#2]; Rn==Rt — base saved before load */
+  {
+    static const uint16_t kProg[] = {0xF855u, 0x5021u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF855u, 0x5021u, &di) != 0 || di.op != MANGO_OP_LDR || di.rd != 5 ||
+        di.rn != 5 || di.rm != 1 || di.shift_amount != 2) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): f8555021 want LDR r5,[r5,r1,lsl#2]\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 4, 0xf55fffffu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[5] = base;
+    cpu.r[1] = 1u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 || cpu.r[5] != 0xf55fffffu) {
+      fprintf(stderr, "FAIL(t32_ldr_w_contrast): distractor r5=0x%x want 0xf55fffff\n",
+              cpu.r[5]);
+      return 1;
+    }
+  }
+
+  /* Post 0m still tip; LDRH.W WB still uncover; tip 0f f854 a003 tip */
+  if (mango_decode_t32(0xF855u, 0x2B04u, &di) != 0 || di.op != MANGO_OP_LDR || di.is_imm != 1 ||
+      di.p != 0 || di.w != 1) {
+    fprintf(stderr, "FAIL(t32_ldr_w_contrast): 0m post f8552b04 should still tip\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF854u, 0xA003u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_ldr_w_contrast): 0f f854a003 should still tip\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF834u, 0x1F02u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldr_w_contrast): LDRH.W WB f8341f02 should uncover\n");
+    return 1;
+  }
+
+  /* Reject Rt/Rn/Rm=PC */
+  if (mango_decode_t32(0xF850u, 0xF000u, &di) == 0) { /* Rt=PC */
+    fprintf(stderr, "FAIL(t32_ldr_w_contrast): LDR Rt=PC should uncover\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF85Fu, 0x1000u, &di) == 0) { /* Rn=PC */
+    fprintf(stderr, "FAIL(t32_ldr_w_contrast): LDR Rn=PC should uncover\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF850u, 0x100Fu, &di) == 0) { /* Rm=PC */
+    fprintf(stderr, "FAIL(t32_ldr_w_contrast): LDR Rm=PC should uncover\n");
+    return 1;
+  }
+
+  printf("ok: T32 LDR.W reg imm2=0/1/3 + distractor; 0m/0f tip; LDRH WB uncover (Q-OTTD-0y)\n");
+  return 0;
+}
+
 static int test_t32_mvn_ldr_reject(void) {
-  /* Optional negatives: MVNS S=1; ORN Rn!=15; LDR imm2!=0; LDR hw2 bit11 imm8 form. */
+  /* Optional negatives: MVNS S=1; ORN Rn!=15. LDR imm2!=0 cleared by Q-OTTD-0y. */
   MangoInsn di;
   if (mango_decode_t32(0xF47Fu, 0x5207u, &di) == 0) {
     fprintf(stderr, "FAIL(t32_mvn_ldr_reject): S=1 MVNS decoded as op=%d\n", di.op);
@@ -3632,14 +3849,8 @@ static int test_t32_mvn_ldr_reject(void) {
     fprintf(stderr, "FAIL(t32_mvn_ldr_reject): ORN Rn!=15 decoded as op=%d\n", di.op);
     return 1;
   }
-  /* LDR imm2=1 (LSL#1): hw2 bits[5:4]=01 → (hw2 & 0x0FF0) != 0 — still 0f-only */
-  if (mango_decode_t32(0xF854u, 0xA013u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_mvn_ldr_reject): LDR imm2!=0 decoded as op=%d sh=%u\n", di.op,
-            di.shift_amount);
-    return 1;
-  }
-  /* f85d 4b04 post-index cleared by Q-OTTD-0m — no longer reject here */
-  printf("ok: T32 MVN reject S=1/ORN; LDR reject imm2!=0 (Q-OTTD-0f)\n");
+  /* f85d 4b04 post-index cleared by Q-OTTD-0m; LDR imm2 by 0y — no longer reject */
+  printf("ok: T32 MVN reject S=1/ORN (Q-OTTD-0f)\n");
   return 0;
 }
 
@@ -4418,9 +4629,10 @@ static int test_t32_str_w_reg_imm2_contrasts(void) {
     return 1;
   }
 
-  /* LDR.W-reg LSL#2 still closed this bite (0v opens STRH.W-reg separately) */
-  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_str_w_contrast): LDR.W-reg f8555021 should uncover\n");
+  /* LDR.W-reg LSL#2 cleared by Q-OTTD-0y */
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_str_w_contrast): LDR.W-reg f8555021 should tip sh=2\n");
     return 1;
   }
 
@@ -4636,13 +4848,15 @@ static int test_t32_strh_w_reg_imm2_contrasts(void) {
     return 1;
   }
 
-  /* Do not open LDR.W-reg LSL#2 / LDRH.W WB this bite */
-  if (mango_decode_t32(0xF853u, 0x1021u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_strh_w_contrast): LDR.W-reg f8531021 should uncover\n");
+  /* LDR.W-reg LSL#2 cleared by Q-OTTD-0y; LDRH.W WB still held for 0z */
+  if (mango_decode_t32(0xF853u, 0x1021u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_strh_w_contrast): LDR.W-reg f8531021 should tip sh=2\n");
     return 1;
   }
-  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_strh_w_contrast): LDR.W-reg f8555021 should uncover\n");
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_strh_w_contrast): LDR.W-reg f8555021 should tip sh=2\n");
     return 1;
   }
   if (mango_decode_t32(0xF834u, 0x1F02u, &di) == 0) {
@@ -5476,13 +5690,14 @@ static int test_t32_dmb_reject_dsb_isb(void) {
     fprintf(stderr, "FAIL(t32_dmb_reject): CLREX f3bf8f2f decoded as op=%d\n", di.op);
     return 1;
   }
-  /* BIC footnote cleared by Q-OTTD-0q; LDR.W reg LSL#2 stays uncover */
+  /* BIC footnote cleared by Q-OTTD-0q; LDR.W reg LSL#2 cleared by 0y */
   if (mango_decode_t32(0xF026u, 0x060Fu, &di) != 0 || di.op != MANGO_OP_BIC) {
     fprintf(stderr, "FAIL(t32_dmb_reject): BIC f026060f want BIC after 0q, got rc/op=%d\n", di.op);
     return 1;
   }
-  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_dmb_reject): LDR.W reg f8555021 decoded as op=%d\n", di.op);
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_dmb_reject): LDR.W reg f8555021 want LDR sh=2\n");
     return 1;
   }
   printf("ok: T32 DMB reject DSB/ISB/CLREX; BIC cleared by 0q (Q-OTTD-0p)\n");
@@ -5623,9 +5838,10 @@ static int test_t32_bic_w_modimm_reject(void) {
     fprintf(stderr, "FAIL(t32_bic_w_reject): DMB f3bf8f5f want NOP, got op=%d\n", di.op);
     return 1;
   }
-  /* distractor ldr.w reg lsl#2 stays uncover */
-  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_bic_w_reject): LDR.W reg f8555021 decoded as op=%d\n", di.op);
+  /* distractor ldr.w reg lsl#2 cleared by Q-OTTD-0y */
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): LDR.W reg f8555021 want LDR sh=2\n");
     return 1;
   }
   printf("ok: T32 BIC.W reject BICS/PC/AND/ORN; A32 BIC+DMB ok (Q-OTTD-0q)\n");
@@ -6105,12 +6321,12 @@ static int test_t32_ldr_w_imm8_post_sp(void) {
 }
 
 static int test_t32_ldrb_ldr_post_reject(void) {
-  /* Negatives: LDR.W reg LSL#2 (drive distractor); LDR pre-WB; Rt=PC. */
+  /* Negatives: LDR pre-WB; Rt=PC. LDR.W reg LSL#2 cleared by Q-OTTD-0y. */
   MangoInsn di;
-  /* f855 5021 = ldr.w r5,[r5,r1,lsl#2] — reg imm2=2; extend 0f later */
-  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_0m_reject): LDR reg LSL#2 f8555021 decoded as op=%d sh=%u\n",
-            di.op, di.shift_amount);
+  /* f855 5021 = ldr.w r5,[r5,r1,lsl#2] — now tip via 0y */
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) != 0 || di.op != MANGO_OP_LDR ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_0m_reject): LDR reg LSL#2 f8555021 want LDR sh=2\n");
     return 1;
   }
   /* f855 2f04 = ldr.w r2,[r5,#4]! — P=1 U=1 W=1; exact 0x0B00 rejects */
@@ -7426,6 +7642,8 @@ int main(void) {
   failures += test_t32_ldrd_reject();
   failures += test_t32_mvn_w_modimm();
   failures += test_t32_ldr_w_reg();
+  failures += test_t32_ldr_w_reg_lsl2();
+  failures += test_t32_ldr_w_reg_imm2_contrasts();
   failures += test_t32_mvn_ldr_reject();
   failures += test_t32_ldrsh_w_imm12();
   failures += test_t32_str_w_imm8_neg();
