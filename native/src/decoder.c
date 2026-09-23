@@ -1898,13 +1898,14 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     }
     if (b15_14 == 2u && b12 == 0u) {
       uint32_t cond = (hw1 >> 6) & 0xFu;
-      if (cond >= 0xEu) {
-        return -1;
+      /* cond 0xE/0xF share this shape with hints/barriers (e.g. F3BF 8F5F
+       * DMB) — do not reject; fall through so later arms can match. */
+      if (cond < 0xEu) {
+        out->op = MANGO_OP_B;
+        out->cond = cond;
+        out->imm = mango_t32_bcond_imm(hw1, hw2);
+        return 0;
       }
-      out->op = MANGO_OP_B;
-      out->cond = cond;
-      out->imm = mango_t32_bcond_imm(hw1, hw2);
-      return 0;
     }
   }
 
@@ -2266,6 +2267,15 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->u = 1;
     out->b = 1; /* halfword */
     out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0p: T32 DMB option → MANGO_OP_NOP (single-thread; no GPR/CPSR effect).
+   * Guest f3bf 8f5f = dmb sy; wider (hw2 & 0xFFF0)==0x8F50 opens option sibs
+   * (ish/osh/…). DSB/ISB/CLREX T32 (8F4x/8F6x/8F2F) stay uncover this bite —
+   * A32 F57FF05x/04x/06x/01F already NOP. Execute is existing NOP (pc+=4). */
+  if (hw1 == 0xF3BFu && (hw2 & 0xFFF0u) == 0x8F50u) {
+    out->op = MANGO_OP_NOP;
     return 0;
   }
 

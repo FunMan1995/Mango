@@ -4543,6 +4543,129 @@ static int test_t32_uxth_w_reject(void) {
   return 0;
 }
 
+
+static int test_t32_dmb_sy_nop(void) {
+  /* Q-OTTD-0p: dmb sy = f3bf 8f5f → NOP. GPRs/NZCV hold; pc+=4. */
+  static const uint16_t kProg[] = {0xF3BFu, 0x8F5Fu};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF3BFu, 0x8F5Fu, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_dmb_sy): decode op=%d (want NOP)\n", di.op);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0xa5a5a5a5u;
+  cpu.r[1] = 0x11111111u;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+  if (rc != 0 || cpu.r[0] != 0xa5a5a5a5u || cpu.r[1] != 0x11111111u ||
+      cpu.cpsr != cpsr_before || cpu.r[MANGO_REG_PC] != 4u) {
+    fprintf(stderr,
+            "FAIL(t32_dmb_sy): rc=%d r0=0x%x r1=0x%x cpsr=0x%x pc=0x%x "
+            "(want hold + pc=4)\n",
+            rc, cpu.r[0], cpu.r[1], cpu.cpsr, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: T32 DMB SY f3bf8f5f → NOP (Q-OTTD-0p)\n");
+  return 0;
+}
+
+static int test_t32_dmb_ish_sib(void) {
+  /* Option sib under wider DMB mask: dmb ish = f3bf 8f5b → NOP. */
+  static const uint16_t kProg[] = {0xF3BFu, 0x8F5Bu};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF3BFu, 0x8F5Bu, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_dmb_ish): decode op=%d (want NOP)\n", di.op);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0xdeadbeefu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+  if (rc != 0 || cpu.r[0] != 0xdeadbeefu || cpu.cpsr != cpsr_before ||
+      cpu.r[MANGO_REG_PC] != 4u) {
+    fprintf(stderr, "FAIL(t32_dmb_ish): rc=%d r0=0x%x cpsr=0x%x pc=0x%x\n", rc, cpu.r[0],
+            cpu.cpsr, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: T32 DMB ISH f3bf8f5b sibling → NOP (Q-OTTD-0p)\n");
+  return 0;
+}
+
+static int test_a32_dmb_sy_still_nop(void) {
+  /* A32 F57FF05F dmb sy must remain NOP (do not regress tip barrier path). */
+  static const uint32_t kWord = 0xF57FF05Fu;
+  uint8_t mem_buf[64];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = (uint8_t)(kWord & 0xFFu);
+  mem_buf[1] = (uint8_t)((kWord >> 8) & 0xFFu);
+  mem_buf[2] = (uint8_t)((kWord >> 16) & 0xFFu);
+  mem_buf[3] = (uint8_t)((kWord >> 24) & 0xFFu);
+
+  MangoInsn di;
+  if (mango_decode(0xF57FF05Fu, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(a32_dmb_sy): decode op=%d (want NOP)\n", di.op);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_Z | MANGO_CPSR_C; /* ARM mode */
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0xa5a5a5a5u;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+  if (rc != 0 || cpu.r[0] != 0xa5a5a5a5u || cpu.cpsr != cpsr_before ||
+      cpu.r[MANGO_REG_PC] != 4u) {
+    fprintf(stderr, "FAIL(a32_dmb_sy): rc=%d r0=0x%x cpsr=0x%x pc=0x%x\n", rc, cpu.r[0],
+            cpu.cpsr, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: A32 DMB SY F57FF05F still NOP (Q-OTTD-0p)\n");
+  return 0;
+}
+
+static int test_t32_dmb_reject_dsb_isb(void) {
+  /* DSB/ISB/CLREX T32 stay uncover this bite (DMB-only). */
+  MangoInsn di;
+  if (mango_decode_t32(0xF3BFu, 0x8F4Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_dmb_reject): DSB f3bf8f4f decoded as op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xF3BFu, 0x8F6Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_dmb_reject): ISB f3bf8f6f decoded as op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xF3BFu, 0x8F2Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_dmb_reject): CLREX f3bf8f2f decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* Footnotes stay uncover */
+  if (mango_decode_t32(0xF026u, 0x060Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_dmb_reject): BIC f026060f decoded as op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_dmb_reject): LDR.W reg f8555021 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  printf("ok: T32 DMB reject DSB/ISB/CLREX + footnotes (Q-OTTD-0p)\n");
+  return 0;
+}
+
 static int test_t32_add_w_reg_lsl2(void) {
   /* Q-OTTD-0l-add: add.w r0,lr,r0,lsl#2 = eb0e 0080.
    * Drive: lr=0x9fee80, r0=0xffffffff → r0=0x9fee7c; LR/NZCV hold; pc+=4.
@@ -6227,6 +6350,10 @@ int main(void) {
   failures += test_t32_uxth_w_fa8a_sib();
   failures += test_t32_uxth_w_ror8();
   failures += test_t32_uxth_w_reject();
+  failures += test_t32_dmb_sy_nop();
+  failures += test_t32_dmb_ish_sib();
+  failures += test_a32_dmb_sy_still_nop();
+  failures += test_t32_dmb_reject_dsb_isb();
   failures += test_t32_add_w_reg_lsl2();
   failures += test_t32_add_w_reg_reject();
   failures += test_t32_ldrb_w_reg_lsl3();
