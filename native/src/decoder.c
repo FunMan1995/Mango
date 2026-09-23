@@ -1746,6 +1746,23 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0c: T32 LDMIA / POP.W SP! — hw1 E8BD form, Rn=SP, W=1, P(hw2)=0.
+   * Reuse MANGO_OP_LDM (p=0 u=1 w=1). Not full T32 LDM / PC-in-list. */
+  if ((hw1 & 0xFFD0u) == 0xE890u && (hw1 & 0x0020u) != 0 && (hw1 & 0xFu) == MANGO_REG_SP &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t reglist = hw2 & 0x7FFFu; /* M<<14 | R[12:0]; PC forbidden */
+    if (reglist == 0) {
+      return -1; /* empty list UNPRED */
+    }
+    out->op = MANGO_OP_LDM;
+    out->rn = MANGO_REG_SP;
+    out->reglist = reglist;
+    out->p = 0;
+    out->u = 1;
+    out->w = 1;
+    return 0;
+  }
+
   /* Q-OTTD-0b: T32 MUL (DDI0597 T2) Ra=15 op2=0000 — Rd = Rn * Rm, S=0.
    * Reuse MANGO_OP_MUL (rm*rs multiplicands; sets_flags=0). Not MLA/MLS. */
   if ((hw1 & 0xFFF0u) == 0xFB00u && (hw2 & 0xF0F0u) == 0xF000u) {
