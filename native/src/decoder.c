@@ -1699,6 +1699,33 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+
+  /* Q-OTTD-0f: MVN.W Rd,#<const> modified-imm (op=0011, Rn=15, S=0).
+   * Guest f46f 5207 = mvn.w r2,#0x21c0 (ThumbExpandImm(0xD07)=0x21C0; NOT #0x87000 /
+   * imm12 0xA07 which is f46f 2207). Rn!=15 is ORN — require Rn==15. Do not open S=1. */
+  if ((hw1 & 0xFBE0u) == 0xF060u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) == 0 &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_MVN;
+    out->rd = rd;
+    out->is_imm = 1;
+    out->sets_flags = 0;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
+
   /* MOVW: 11110 i 100100 imm4 / 0 imm3 Rd imm8 */
   if ((hw1 & 0xFBF0u) == 0xF240u && (hw2 & 0x8000u) == 0) {
     uint32_t i = (hw1 >> 10) & 1u;
@@ -1801,6 +1828,32 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       out->imm = mango_t32_bcond_imm(hw1, hw2);
       return 0;
     }
+  }
+
+
+  /* Q-OTTD-0f-ldr: LDR.W Rt,[Rn,Rm] T2 exact guest — size=10 L=1, imm2=0 / LSL#0,
+   * no writeback. Guest f854 a003 = ldr.w r10,[r4,r3]. Tip already has F880 LDR
+   * imm12 (bit7=1); this is F850 (bit7=0). Reject PC; do not open imm2!=0 / STR.W /
+   * hw2 bit11 imm8 P/U/W (e.g. f85d 4b04). */
+  if ((hw1 & 0xFFF0u) == 0xF850u && (hw2 & 0x0FF0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDR;
+    out->rd = rt;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_amount = 0;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    out->b = 0;
+    return 0;
   }
 
   /* LDR/STR/LDRB/STRB/LDRH/STRH imm12: 11111 000 1 size L Rn / Rt imm12.
