@@ -176,6 +176,26 @@ int main(void) {
   }
   printf("ok: JNI trampoline runs guest add (20+22=42) through the interpreter\n");
 
+  /* Raw AAPCS shorty '*IIII': no JNIEnv/jobject. Meritous SDL_main needs this —
+   * JNI marshalling put a handle id in r1 and made Thumb ldm r6!,{r0} see
+   * unaligned r6=0x17. Same guest body: add r0, r2, r3; bx lr. */
+  void* raw_add = NativeBridgeItf.getTrampoline(handle, "mango_add", "*IIII", 5);
+  if (!raw_add) {
+    fprintf(stderr, "FAIL: getTrampoline(mango_add, *IIII) returned NULL\n");
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    return 1;
+  }
+  typedef jint (*mango_raw_add_fn)(jint, jint, jint, jint);
+  jint raw_sum = ((mango_raw_add_fn)raw_add)(0, 0, 20, 22);
+  if (raw_sum != 42) {
+    fprintf(stderr, "FAIL: raw AAPCS trampoline returned %d, want 42\n", (int)raw_sum);
+    NativeBridgeItf.unloadLibrary(handle);
+    unlink(path);
+    return 1;
+  }
+  printf("ok: raw AAPCS '*IIII' trampoline maps args to r0..r3 (20+22=42)\n");
+
   NativeBridgeItf.unloadLibrary(handle);
   unlink(path);
 

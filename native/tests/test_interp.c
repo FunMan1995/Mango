@@ -2102,6 +2102,61 @@ static int test_ldrd_strd_roundtrip(void) {
   return 0;
 }
 
+static int test_thumb_ldmia_wb(void) {
+  /* Meritous SDL_main hit ldm r6!,{r0} (0xce01) with r6=0x17 because argv
+   * was a JNI handle id — not an LDM execute bug. Prove Thumb LDMIA works
+   * with an aligned base, and that an unaligned base still fails (ARM). */
+  MangoInsn insn;
+  if (mango_decode_t16(0xce01u, &insn) != 0 || insn.op != MANGO_OP_LDM || insn.rn != 6u ||
+      insn.reglist != 0x1u || !insn.w || !insn.u || insn.p) {
+    fprintf(stderr, "FAIL(thumb_ldmia_wb): 0xce01 did not decode as ldm r6!,{r0}\n");
+    return 1;
+  }
+
+  static const uint16_t kProg[] = {
+      0xce01u, /* ldm r6!, {r0} */
+      0x4770u, /* bx lr */
+  };
+  uint8_t mem_buf[64];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+  /* word at 16: payload 0xA1B2C3D4 */
+  mem_buf[16] = 0xD4;
+  mem_buf[17] = 0xC3;
+  mem_buf[18] = 0xB2;
+  mem_buf[19] = 0xA1;
+
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[6] = 16u;
+  cpu.r[MANGO_REG_LR] = 0xCAFE0000u;
+  int rc = mango_interp_run(&cpu, &mem, 0xCAFE0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_ldmia_wb): aligned ldm returned %d\n", rc);
+    return 1;
+  }
+  if (cpu.r[0] != 0xA1B2C3D4u || cpu.r[6] != 20u) {
+    fprintf(stderr, "FAIL(thumb_ldmia_wb): r0=0x%x r6=%u want r0=0xa1b2c3d4 r6=20\n", cpu.r[0],
+            cpu.r[6]);
+    return 1;
+  }
+
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[6] = 17u; /* Meritous-shaped unaligned base */
+  cpu.r[MANGO_REG_LR] = 0xCAFE0000u;
+  cpu.r[MANGO_REG_PC] = 0;
+  rc = mango_interp_run(&cpu, &mem, 0xCAFE0000u, 100);
+  if (rc == 0) {
+    fprintf(stderr, "FAIL(thumb_ldmia_wb): unaligned ldm r6=17 should stop\n");
+    return 1;
+  }
+  printf("ok: Thumb ldm r6!,{r0} aligned loads+wb; unaligned base stops\n");
+  return 0;
+}
+
 static int test_thumb_mov_add_bx(void) {
   static const uint16_t kProg[] = {
       0x2002u, /* mov r0, #2 */
@@ -3860,6 +3915,7 @@ int main(void) {
   failures += test_extra_ldst_rejected_shapes();
   failures += test_swp_and_swpb();
   failures += test_ldrd_strd_roundtrip();
+  failures += test_thumb_ldmia_wb();
   failures += test_thumb_mov_add_bx();
   failures += test_thumb_push_pop();
   failures += test_arm_bx_into_thumb();

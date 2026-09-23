@@ -154,7 +154,11 @@
 #define MANGO_LIBC_PTHREAD_EQUAL 74
 #define MANGO_LIBC_EXIT 75
 #define MANGO_LIBC_EXIT_UNDERSCORE 76
-#define MANGO_LIBC_COUNT 77
+#define MANGO_LIBC_AEABI_IDIV 77
+#define MANGO_LIBC_AEABI_IDIVMOD 78
+#define MANGO_LIBC_AEABI_UIDIV 79
+#define MANGO_LIBC_AEABI_UIDIVMOD 80
+#define MANGO_LIBC_COUNT 81
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x2800000u
@@ -291,6 +295,10 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "pthread_equal",
     "exit",
     "_exit",
+    "__aeabi_idiv",
+    "__aeabi_idivmod",
+    "__aeabi_uidiv",
+    "__aeabi_uidivmod",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -1199,6 +1207,36 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
        * Point LR at the JNI stop sentinel so the thunk's bx lr ends the trampoline. */
       cpu->r[MANGO_REG_LR] = MANGO_JNI_STOP;
       break;
+    case MANGO_LIBC_AEABI_IDIV:
+    case MANGO_LIBC_AEABI_IDIVMOD: {
+      /* Meritous SDL_main init loops call soft-div via PLT hundreds of thousands
+       * of times; interpreting libsdl's __aeabi_idivmod burns the step budget.
+       * Host-implement EABI: quot in r0, rem in r1 (idivmod). */
+      int32_t num = (int32_t)r0;
+      int32_t den = (int32_t)r1;
+      if (den == 0) {
+        cpu->r[0] = 0;
+        cpu->r[1] = (uint32_t)num;
+      } else if (num == (int32_t)0x80000000 && den == -1) {
+        cpu->r[0] = (uint32_t)0x80000000u; /* INT_MIN / -1 */
+        cpu->r[1] = 0;
+      } else {
+        cpu->r[0] = (uint32_t)(num / den);
+        cpu->r[1] = (uint32_t)(num % den);
+      }
+      break;
+    }
+    case MANGO_LIBC_AEABI_UIDIV:
+    case MANGO_LIBC_AEABI_UIDIVMOD: {
+      if (r1 == 0) {
+        cpu->r[0] = 0;
+        cpu->r[1] = r0;
+      } else {
+        cpu->r[0] = r0 / r1;
+        cpu->r[1] = r0 % r1;
+      }
+      break;
+    }
     default:
       cpu->r[0] = (uint32_t)-1;
       break;
@@ -1511,12 +1549,23 @@ static int mango_is_jni_onload(const MangoJniSlot* slot) {
   return slot->shorty[0] == 'I' && slot->shorty[1] == 'L' && slot->shorty[2] == '\0';
 }
 
+/* Leading '*' = raw AAPCS (no JNIEnv/jobject). Used for SDL_main etc.
+ * Example: "*II" → returns int, args in r0 then r1 (first trampoline
+ * fixed arg is r0; remaining from va_list). */
+static int mango_is_raw_aapcs(const MangoJniSlot* slot) {
+  return slot->shorty[0] == '*';
+}
+
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) {
   MangoMemory mem = {lib->guest_mem, lib->guest_mem_size};
   for (;;) {
-    int rc = mango_interp_run(cpu, &mem, MANGO_JNI_STOP, 10000000u);
+    int rc = mango_interp_run(cpu, &mem, MANGO_JNI_STOP, 100000000u);
     if (rc == 0) {
       return 0;
+    }
+    if (rc == -3) {
+      /* Already logged "step limit hit"; do not mislabel as uncovereds. */
+      return -1;
     }
     if (rc != 1) {
       uint32_t pc = cpu->r[MANGO_REG_PC];
@@ -1525,7 +1574,18 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         w = mango_load_u32_guest(mem.bytes, pc);
       }
       MangoInsn ins;
-      int dec = (cpu->cpsr & MANGO_CPSR_T) ? -2 : mango_decode(w, &ins);
+      int dec;
+      if (cpu->cpsr & MANGO_CPSR_T) {
+        uint16_t hw = (uint16_t)(w & 0xFFFFu);
+        uint16_t hw2 = (uint16_t)(w >> 16);
+        if ((hw >> 11) >= 0x1Du) {
+          dec = mango_decode_t32(hw, hw2, &ins);
+        } else {
+          dec = mango_decode_t16(hw, &ins);
+        }
+      } else {
+        dec = mango_decode(w, &ins);
+      }
       fprintf(stderr,
               "mango: interp stop pc=0x%x cpsr=0x%x word=0x%08x rc=%d decode=%d op=%d "
               "r0=%x r1=%x r2=%x r3=%x r4=%x r5=%x r6=%x r7=%x sp=%x lr=%x libbias=0x%x\n",
@@ -1570,7 +1630,12 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
   }
   char ret = 'V';
   char args[24];
-  int nargs = mango_parse_shorty(slot->shorty, &ret, args, sizeof(args));
+  int raw = mango_is_raw_aapcs(slot);
+  const char* shorty = slot->shorty;
+  if (raw) {
+    shorty++; /* skip leading '*' */
+  }
+  int nargs = mango_parse_shorty(shorty, &ret, args, sizeof(args));
   if (nargs < 0) {
     return 0;
   }
@@ -1578,9 +1643,21 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
   uint32_t regs[4];
   uint32_t stack[16];
   uint32_t nstack = 0;
-  uint32_t nreg = 2; /* r0 env/vm, r1 thiz/reserved */
+  uint32_t nreg = 2; /* r0 env/vm, r1 thiz/reserved — overridden for raw */
   int onload = mango_is_jni_onload(slot);
-  if (onload) {
+  if (raw) {
+    /* Raw AAPCS: fixed trampoline arg is r0; remaining args from va_list. */
+    nreg = 0;
+    if (nargs > 0) {
+      char t0 = args[0];
+      if (t0 == 'J' || t0 == 'D') {
+        return 0; /* wide first arg cannot arrive in the fixed slot */
+      }
+      regs[nreg++] = (uint32_t)(uintptr_t)env;
+      memmove(args, args + 1, (size_t)(nargs - 1) + 1u);
+      nargs -= 1;
+    }
+  } else if (onload) {
     lib->host_vm = env; /* ART calls JNI_OnLoad(JavaVM*, void*) */
     regs[0] = lib->jni_vm_addr;
     (void)va_arg(ap, void*); /* reserved, typically NULL */
@@ -1610,7 +1687,9 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
       u.f = (float)d;
       lo = u.u;
     } else if (t == 'L' || t == '[') {
-      lo = mango_handle_intern(va_arg(ap, jobject));
+      void* p = va_arg(ap, void*);
+      /* Raw AAPCS: pass the pointer bits (guest addr). JNI: intern a handle. */
+      lo = raw ? (uint32_t)(uintptr_t)p : mango_handle_intern(p);
     } else {
       lo = (uint32_t)va_arg(ap, int);
     }

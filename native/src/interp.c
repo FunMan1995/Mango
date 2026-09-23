@@ -1527,5 +1527,5 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
   }
 
   fprintf(stderr, "mango: step limit hit pc=0x%x cpsr=0x%x\n", cpu->r[15], cpu->cpsr);
-  return -1; /* step limit hit */
+  return -3; /* step limit hit (distinct from uncovered opcode -1) */
 }

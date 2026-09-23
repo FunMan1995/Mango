@@ -54,3 +54,12 @@ add_executable(mango_host_unity_drive
 )
 target_include_directories(mango_host_unity_drive PRIVATE tests/fake_jni)
 target_link_libraries(mango_host_unity_drive PRIVATE mango_core m)
+
+# Host-only Meritous/SDL drive helper for Test Lab (not a ctest). Loads
+# armeabi libsdl-1.2.so + libapplication.so through the same shim.
+add_executable(mango_host_meritous_drive
+  src/native_bridge_shim.c
+  tests/host_meritous_drive.c
+)
+target_include_directories(mango_host_meritous_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_meritous_drive PRIVATE mango_core m)
