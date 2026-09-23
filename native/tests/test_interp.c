@@ -3610,6 +3610,123 @@ static int test_neon_ctor_vrecps_vorr(void) {
   return 0;
 }
 
+
+static int test_neon_ctor_vmul_vswp(void) {
+  /* OFDP ctor uncovereds: VMUL.F32 q9,q9,q10 and VSWP d16,d17. */
+  MangoInsn insn;
+
+  if (mango_decode(0xF3422DF4u, &insn) != 0 || insn.op != MANGO_OP_VMUL || insn.u != 1 ||
+      insn.b != 1 || insn.rd != 18u || insn.rn != 18u || insn.rm != 20u) {
+    fprintf(stderr, "FAIL(ctor_vmul): decode op=%d u=%d rd=%u rn=%u rm=%u b=%d\n", (int)insn.op,
+            insn.u, insn.rd, insn.rn, insn.rm, insn.b);
+    return 1;
+  }
+  if (mango_decode(0xF3F20021u, &insn) != 0 || insn.op != MANGO_OP_VSWP || insn.b != 0 ||
+      insn.rd != 16u || insn.rm != 17u) {
+    fprintf(stderr, "FAIL(ctor_vswp): decode op=%d rd=%u rm=%u b=%d\n", (int)insn.op, insn.rd,
+            insn.rm, insn.b);
+    return 1;
+  }
+
+  {
+    /* VMUL.F32 q9, q9, q10 — four f32 lanes. */
+    static const uint32_t kProg[] = {0xF3422DF4u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    /* q9 = {2, 3, 0.5, -4}, q10 = {4, 5, 8, -0.5} → {8, 15, 4, 2} */
+    cpu.s[36] = 0x40000000u; /* 2.0 */
+    cpu.s[37] = 0x40400000u; /* 3.0 */
+    cpu.s[38] = 0x3F000000u; /* 0.5 */
+    cpu.s[39] = 0xC0800000u; /* -4.0 */
+    cpu.s[40] = 0x40800000u; /* 4.0 */
+    cpu.s[41] = 0x40A00000u; /* 5.0 */
+    cpu.s[42] = 0x41000000u; /* 8.0 */
+    cpu.s[43] = 0xBF000000u; /* -0.5 */
+    cpu.r[MANGO_REG_LR] = 0x8888u;
+    int rc = mango_interp_run(&cpu, &mem, 0x8888u, 100);
+    if (rc != 0 || cpu.s[36] != 0x41000000u || cpu.s[37] != 0x41700000u ||
+        cpu.s[38] != 0x40800000u || cpu.s[39] != 0x40000000u) {
+      fprintf(stderr, "FAIL(ctor_vmul): exec rc=%d q9=%08x %08x %08x %08x\n", rc, cpu.s[36],
+              cpu.s[37], cpu.s[38], cpu.s[39]);
+      return 1;
+    }
+    /* q10 must be unchanged */
+    if (cpu.s[40] != 0x40800000u || cpu.s[41] != 0x40A00000u || cpu.s[42] != 0x41000000u ||
+        cpu.s[43] != 0xBF000000u) {
+      fprintf(stderr, "FAIL(ctor_vmul): q10 clobbered\n");
+      return 1;
+    }
+  }
+
+  {
+    /* VSWP d16, d17 */
+    static const uint32_t kProg[] = {0xF3F20021u, 0xE12FFF1Eu};
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[32] = 0x11111111u;
+    cpu.s[33] = 0x22222222u;
+    cpu.s[34] = 0xAAAABBBBu;
+    cpu.s[35] = 0xCCCCDDDDu;
+    cpu.r[MANGO_REG_LR] = 0x9999u;
+    int rc = mango_interp_run(&cpu, &mem, 0x9999u, 100);
+    if (rc != 0 || cpu.s[32] != 0xAAAABBBBu || cpu.s[33] != 0xCCCCDDDDu ||
+        cpu.s[34] != 0x11111111u || cpu.s[35] != 0x22222222u) {
+      fprintf(stderr, "FAIL(ctor_vswp): exec rc=%d d16=%08x %08x d17=%08x %08x\n", rc, cpu.s[32],
+              cpu.s[33], cpu.s[34], cpu.s[35]);
+      return 1;
+    }
+  }
+
+  {
+    /* VSWP q8, q9 — Q form (synthesize encoding with Q=1, even D indices).
+     * Word: same as d16/d17 but Q=1 → d16↔d17 and d18↔d19 as q8↔q9.
+     * Capstone ofdp word is D-form; also cover Q path. */
+    uint32_t word = 0xF3F20061u; /* Q=1, d16, d17 → actually Q requires even: d16/d18? */
+    /* Rebuild: D=1 Vd=0 → d16; M=1 Vm=2 → d18; Q=1 → vswp q8, q9 */
+    word = 0xF3F20062u;
+    if (mango_decode(word, &insn) != 0 || insn.op != MANGO_OP_VSWP || insn.b != 1 ||
+        insn.rd != 16u || insn.rm != 18u) {
+      fprintf(stderr, "FAIL(ctor_vswp): q.decode op=%d rd=%u rm=%u b=%d\n", (int)insn.op, insn.rd,
+              insn.rm, insn.b);
+      return 1;
+    }
+    static uint32_t kProg[2];
+    kProg[0] = word;
+    kProg[1] = 0xE12FFF1Eu;
+    uint8_t mem_buf[64];
+    load_words(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[32] = 0x1u;
+    cpu.s[33] = 0x2u;
+    cpu.s[34] = 0x3u;
+    cpu.s[35] = 0x4u; /* q8 */
+    cpu.s[36] = 0xAAu;
+    cpu.s[37] = 0xBBu;
+    cpu.s[38] = 0xCCu;
+    cpu.s[39] = 0xDDu; /* q9 */
+    cpu.r[MANGO_REG_LR] = 0xAAAAu;
+    int rc = mango_interp_run(&cpu, &mem, 0xAAAAu, 100);
+    if (rc != 0 || cpu.s[32] != 0xAAu || cpu.s[33] != 0xBBu || cpu.s[34] != 0xCCu ||
+        cpu.s[35] != 0xDDu || cpu.s[36] != 0x1u || cpu.s[37] != 0x2u || cpu.s[38] != 0x3u ||
+        cpu.s[39] != 0x4u) {
+      fprintf(stderr, "FAIL(ctor_vswp): q.exec rc=%d\n", rc);
+      return 1;
+    }
+  }
+
+  printf("ok: OFDP ctor NEON VMUL.F32 / VSWP\n");
+  return 0;
+}
+
+
 int main(void) {
   int failures = 0;
   failures += test_mov_add_bx();
@@ -3691,6 +3808,7 @@ int main(void) {
   failures += test_vcmp_fpscr_nzcv();
   failures += test_neon_ctor_vmov_vmvn_vrecpe_vext();
   failures += test_neon_ctor_vrecps_vorr();
+  failures += test_neon_ctor_vmul_vswp();
   failures += test_strexd();
 
   if (failures != 0) {

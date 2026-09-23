@@ -98,7 +98,7 @@ int mango_decode(uint32_t word, MangoInsn* out) {
         }
         return -1;
       }
-      /* Three-reg same length with o1=1 (bit4): VORR / VRECPS. */
+      /* Three-reg same length with o1=1 (bit4): VORR / VRECPS / VMUL.F32. */
       if (((word >> 23) & 1u) == 0 && ((word >> 4) & 1u) == 1) {
         uint32_t u = (word >> 24) & 1u;
         uint32_t size = (word >> 20) & 3u;
@@ -129,6 +129,19 @@ int mango_decode(uint32_t word, MangoInsn* out) {
           out->rm = m;
           out->b = (int)q;
           out->imm = 4; /* F32 lane size in bytes */
+          return 0;
+        }
+        /* VMUL.F32 AdvSIMD: U=1, size=0sz sz=0, opc=1101, o1=1.
+         * Reuses MANGO_OP_VMUL with u=1 so VFP Sd/Dd (u=0) stays intact. */
+        if (u == 1u && size == 0u && opc == 0xDu) {
+          out->op = MANGO_OP_VMUL;
+          out->cond = 0xE;
+          out->rd = d;
+          out->rn = n;
+          out->rm = m;
+          out->b = (int)q;
+          out->u = 1; /* AdvSIMD D/Q f32 lanes */
+          out->imm = 4;
           return 0;
         }
         return -1;
@@ -178,6 +191,22 @@ int mango_decode(uint32_t word, MangoInsn* out) {
         out->rm = m;
         out->b = (int)q;
         out->imm = imm4; /* byte offset */
+        return 0;
+      }
+      /* VSWP: 1111 0011 1 D 11 size=00 opc1=10 Vd 00000 Q M 0 Vm. */
+      if (((word >> 23) & 1u) == 1 && ((word >> 20) & 3u) == 3u && ((word >> 24) & 1u) == 1 &&
+          ((word >> 16) & 0xFu) == 0x2u && ((word >> 7) & 0x1Fu) == 0 && ((word >> 4) & 1u) == 0) {
+        uint32_t q = (word >> 6) & 1u;
+        uint32_t d = (((word >> 22) & 1u) << 4) | ((word >> 12) & 0xFu);
+        uint32_t m = (((word >> 5) & 1u) << 4) | (word & 0xFu);
+        if (q && ((d | m) & 1u)) {
+          return -1;
+        }
+        out->op = MANGO_OP_VSWP;
+        out->cond = 0xE;
+        out->rd = d;
+        out->rm = m;
+        out->b = (int)q;
         return 0;
       }
       /* VRECPE: 1111 0011 1 D 11 size 11 Vd 0 10 F 0 Q M 0 Vm; F=1 size=10 → F32. */

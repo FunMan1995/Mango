@@ -1018,6 +1018,27 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         case MANGO_OP_VSUB:
         case MANGO_OP_VMUL:
         case MANGO_OP_VDIV: {
+          /* AdvSIMD VMUL.F32 (u=1): per-lane f32 on D (b=0) or Q (b=1). */
+          if (insn.op == MANGO_OP_VMUL && insn.u) {
+            uint32_t nd = insn.b ? 2u : 1u;
+            for (uint32_t di = 0; di < nd; di++) {
+              uint64_t a = mango_vfp_get_d(cpu, insn.rn + di);
+              uint64_t b = mango_vfp_get_d(cpu, insn.rm + di);
+              uint64_t dst = 0;
+              for (uint32_t lane = 0; lane < 2u; lane++) {
+                uint32_t ua = (uint32_t)(a >> (lane * 32u));
+                uint32_t ub = (uint32_t)(b >> (lane * 32u));
+                float fa, fb, fr;
+                memcpy(&fa, &ua, 4);
+                memcpy(&fb, &ub, 4);
+                fr = fa * fb;
+                memcpy(&ua, &fr, 4);
+                dst |= (uint64_t)ua << (lane * 32u);
+              }
+              mango_vfp_set_d(cpu, insn.rd + di, dst);
+            }
+            break;
+          }
           if (insn.b) {
             double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rn));
             double b = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
@@ -1308,6 +1329,18 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             uint64_t a = mango_vfp_get_d(cpu, insn.rn + di);
             uint64_t b = mango_vfp_get_d(cpu, insn.rm + di);
             mango_vfp_set_d(cpu, insn.rd + di, a | b);
+          }
+          break;
+        }
+
+        case MANGO_OP_VSWP: {
+          /* Swap Dd↔Dm (or Qd↔Qm as two D regs). d==m is a no-op. */
+          uint32_t nd = insn.b ? 2u : 1u;
+          for (uint32_t di = 0; di < nd; di++) {
+            uint64_t a = mango_vfp_get_d(cpu, insn.rd + di);
+            uint64_t b = mango_vfp_get_d(cpu, insn.rm + di);
+            mango_vfp_set_d(cpu, insn.rd + di, b);
+            mango_vfp_set_d(cpu, insn.rm + di, a);
           }
           break;
         }
