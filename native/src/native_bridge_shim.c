@@ -222,7 +222,8 @@
 #define MANGO_LIBC_LRAND48 138
 #define MANGO_LIBC_SRAND48 139
 #define MANGO_LIBC_TIME 140
-#define MANGO_LIBC_COUNT 141
+#define MANGO_LIBC_SDL_SET_VIDEO_MODE 141
+#define MANGO_LIBC_COUNT 142
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x4000000u
@@ -423,6 +424,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "lrand48",
     "srand48",
     "time",
+    "SDL_SetVideoMode",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -450,6 +452,12 @@ static const char* g_fake_data;
 static uint32_t g_fake_len;
 static uint32_t g_fake_off;
 static uint64_t g_sdl_ticks_start_ms;
+static uint32_t g_fb_surf;
+static MangoLoadedLibrary* g_fb_lib;
+static uint64_t g_blit_count;
+static uint64_t g_blit_bytes;
+static uint64_t g_fill_count;
+static int g_frame_dumped;
 static uint64_t g_lrand48_state = 0x1234abcd330eull; /* POSIX drand48 seed */
 /* Soft-float host-stub call histogram (Meritous mapgen / title plasma). */
 static uint64_t g_aeabi_calls[MANGO_LIBC_COUNT];
@@ -683,24 +691,27 @@ static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path,
 }
 
 #ifndef ANDROID
-/* Decode PNG via host libpng into tightly packed RGBA8888 (row-major).
- * Meritous assets are 8-bit grayscale; expand to RGB + opaque A. */
-static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
-                                 uint32_t* out_w, uint32_t* out_h) {
+/* Decode PNG via host libpng. Meritous assets are 8-bit grayscale → out_bpp=1;
+ * other PNGs expand to RGBA8888 → out_bpp=4. */
+static int mango_png_decode(const char* host_path, uint8_t** out_pixels,
+                            uint32_t* out_w, uint32_t* out_h, uint32_t* out_bpp) {
   FILE* fp;
   png_structp png = NULL;
   png_infop info = NULL;
   png_bytep* rows = NULL;
-  uint8_t* rgba = NULL;
+  uint8_t* pixels = NULL;
   png_uint_32 w = 0, h = 0;
   size_t rowbytes, nbytes;
   png_uint_32 y;
-  if (!host_path || !out_rgba || !out_w || !out_h) {
+  int want_gray = 0;
+  int bit_depth = 0, color_type = 0;
+  if (!host_path || !out_pixels || !out_w || !out_h || !out_bpp) {
     return -1;
   }
-  *out_rgba = NULL;
+  *out_pixels = NULL;
   *out_w = 0;
   *out_h = 0;
+  *out_bpp = 0;
   fp = fopen(host_path, "rb");
   if (!fp) {
     return -1;
@@ -717,7 +728,7 @@ static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
     return -1;
   }
   if (setjmp(png_jmpbuf(png))) {
-    free(rgba);
+    free(pixels);
     if (rows) {
       free(rows);
     }
@@ -729,17 +740,26 @@ static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
   png_read_info(png, info);
   w = png_get_image_width(png, info);
   h = png_get_image_height(png, info);
+  bit_depth = png_get_bit_depth(png, info);
+  color_type = png_get_color_type(png, info);
   if (w == 0 || h == 0 || w > 4096u || h > 4096u) {
     longjmp(png_jmpbuf(png), 1);
   }
-  {
-    int bit_depth = png_get_bit_depth(png, info);
-    int color_type = png_get_color_type(png, info);
+  want_gray = (color_type == PNG_COLOR_TYPE_GRAY ||
+               color_type == PNG_COLOR_TYPE_GRAY_ALPHA);
+  if (want_gray) {
+    if (color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+      png_set_strip_alpha(png);
+    }
+    if (bit_depth < 8) {
+      png_set_expand_gray_1_2_4_to_8(png);
+    }
+    if (bit_depth == 16) {
+      png_set_strip_16(png);
+    }
+  } else {
     if (color_type == PNG_COLOR_TYPE_PALETTE) {
       png_set_palette_to_rgb(png);
-    }
-    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
-      png_set_expand_gray_1_2_4_to_8(png);
     }
     if (png_get_valid(png, info, PNG_INFO_tRNS)) {
       png_set_tRNS_to_alpha(png);
@@ -759,30 +779,38 @@ static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
   }
   png_read_update_info(png, info);
   rowbytes = png_get_rowbytes(png, info);
-  if (rowbytes < (size_t)w * 4u) {
-    longjmp(png_jmpbuf(png), 1);
+  if (want_gray) {
+    if (rowbytes < (size_t)w) {
+      longjmp(png_jmpbuf(png), 1);
+    }
+    nbytes = (size_t)w * (size_t)h;
+    *out_bpp = 1;
+  } else {
+    if (rowbytes < (size_t)w * 4u) {
+      longjmp(png_jmpbuf(png), 1);
+    }
+    nbytes = (size_t)w * (size_t)h * 4u;
+    *out_bpp = 4;
   }
-  nbytes = (size_t)w * (size_t)h * 4u;
-  rgba = (uint8_t*)malloc(nbytes);
+  pixels = (uint8_t*)malloc(nbytes);
   rows = (png_bytep*)malloc(sizeof(png_bytep) * h);
-  if (!rgba || !rows) {
+  if (!pixels || !rows) {
     longjmp(png_jmpbuf(png), 1);
   }
   for (y = 0; y < h; y++) {
-    rows[y] = rgba + (size_t)y * (size_t)w * 4u;
+    rows[y] = pixels + (size_t)y * (want_gray ? (size_t)w : (size_t)w * 4u);
   }
-  /* If libpng rowbytes > w*4 (padding), read into temp then compact — Meritous
-   * assets are tightly packed after expand, so direct rows are fine when equal. */
-  if (rowbytes == (size_t)w * 4u) {
+  if (rowbytes == (want_gray ? (size_t)w : (size_t)w * 4u)) {
     png_read_image(png, rows);
   } else {
     png_bytep tmp = (png_bytep)malloc(rowbytes);
+    size_t copy = want_gray ? (size_t)w : (size_t)w * 4u;
     if (!tmp) {
       longjmp(png_jmpbuf(png), 1);
     }
     for (y = 0; y < h; y++) {
       png_read_row(png, tmp, NULL);
-      memcpy(rows[y], tmp, (size_t)w * 4u);
+      memcpy(rows[y], tmp, copy);
     }
     free(tmp);
   }
@@ -790,7 +818,7 @@ static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
   png_destroy_read_struct(&png, &info, NULL);
   fclose(fp);
   free(rows);
-  *out_rgba = rgba;
+  *out_pixels = pixels;
   *out_w = (uint32_t)w;
   *out_h = (uint32_t)h;
   return 0;
@@ -803,12 +831,19 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env);
 static const char* mango_guest_cstr(MangoLoadedLibrary* lib, uint32_t addr);
 static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n);
 static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h);
+static uint32_t mango_guest_sdl_surface_bpp(MangoLoadedLibrary* lib, uint32_t w, uint32_t h,
+                                           uint32_t bpp);
 static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path,
                                    char* out, size_t outsz);
 #ifndef ANDROID
-static int mango_png_decode_rgba(const char* host_path, uint8_t** out_rgba,
-                                 uint32_t* out_w, uint32_t* out_h);
+static int mango_png_decode(const char* host_path, uint8_t** out_pixels,
+                            uint32_t* out_w, uint32_t* out_h, uint32_t* out_bpp);
 #endif
+static int mango_sdl_soft_blit(MangoLoadedLibrary* lib, uint32_t src, uint32_t srcrect,
+                               uint32_t dst, uint32_t dstrect);
+static int mango_sdl_soft_fill(MangoLoadedLibrary* lib, uint32_t dst, uint32_t dstrect,
+                               uint32_t color);
+static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf);
 static void mango_patch_meritous_img_load(MangoLoadedLibrary* lib);
 
 
@@ -1972,44 +2007,44 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_IMG_LOAD: {
-      /* Meritous libsdl_image IMG_Load (basename-gated thunk). Prefer real
-       * host libpng decode into an RGBA8888 guest SDL_Surface so DrawLevel
-       * sees real tileset/mons pixels; fall back to a blank 256x256 surface. */
+      /* Meritous libsdl_image IMG_Load (basename-gated thunk). Grayscale PNGs
+       * become 8bpp surfaces (Meritous screen/fog); others RGBA8888. */
       const char* path = mango_guest_cstr(lib, r0);
       uint32_t surf = 0;
       char host_path[768];
       static int s_img;
 #ifndef ANDROID
-      uint8_t* rgba = NULL;
-      uint32_t pw = 0, ph = 0;
+      uint8_t* pix = NULL;
+      uint32_t pw = 0, ph = 0, pbpp = 0;
 #endif
       if (path && mango_host_resolve_path(lib, path, host_path, sizeof(host_path))) {
 #ifndef ANDROID
-        if (mango_png_decode_rgba(host_path, &rgba, &pw, &ph) == 0 && rgba) {
-          surf = mango_guest_sdl_surface(lib, pw, ph);
+        if (mango_png_decode(host_path, &pix, &pw, &ph, &pbpp) == 0 && pix) {
+          uint32_t bpp = (pbpp == 1u) ? 8u : 32u;
+          surf = mango_guest_sdl_surface_bpp(lib, pw, ph, bpp);
           if (surf) {
-            uint32_t pixels = 0;
-            uint32_t nbytes = pw * ph * 4u;
+            uint32_t pixels = mango_load_u32_guest(lib->guest_mem, surf + 20u);
+            uint32_t nbytes = pw * ph * (pbpp == 1u ? 1u : 4u);
             uint32_t nonzero = 0;
             uint32_t i;
-            pixels = mango_load_u32_guest(lib->guest_mem, surf + 20u);
             if (pixels && mango_guest_range_ok(lib, pixels, nbytes)) {
-              memcpy(lib->guest_mem + pixels, rgba, nbytes);
+              memcpy(lib->guest_mem + pixels, pix, nbytes);
               for (i = 0; i < nbytes; i++) {
-                if (rgba[i] != 0) {
+                if (pix[i] != 0) {
                   nonzero++;
                 }
               }
             }
             if (s_img < 40) {
               fprintf(stderr,
-                      "mango: IMG_Load '%s' -> %ux%u png (%u nonzero bytes)\n",
-                      path, (unsigned)pw, (unsigned)ph, (unsigned)nonzero);
+                      "mango: IMG_Load '%s' -> %ux%u %ubpp (%u nonzero bytes)\n",
+                      path, (unsigned)pw, (unsigned)ph, (unsigned)bpp,
+                      (unsigned)nonzero);
               s_img++;
             }
           }
-          free(rgba);
-          rgba = NULL;
+          free(pix);
+          pix = NULL;
         }
 #endif
       }
@@ -2019,7 +2054,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
                   path ? path : "(null)");
           s_img++;
         }
-        surf = mango_guest_sdl_surface(lib, 256u, 256u);
+        surf = mango_guest_sdl_surface_bpp(lib, 256u, 256u, 8u);
       }
       cpu->r[0] = surf;
       break;
@@ -2206,10 +2241,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_SDL_UPPER_BLIT: {
-      /* Software CalculateBlit of 640x480 is millions of interpreted ops.
-       * Report success without copying; enough to advance Meritous. */
-      (void)r0; (void)r1; (void)r2;
-      cpu->r[0] = 0;
+      /* Host soft blit (same BytesPerPixel). DrawLevel ~350 tile copies. */
+      uint32_t dstrect = cpu->r[3];
+      cpu->r[0] = (uint32_t)mango_sdl_soft_blit(lib, r0, r1, r2, dstrect);
       break;
     }
     case MANGO_LIBC_SDL_UPDATE_RECT: {
@@ -2227,8 +2261,35 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = 1; /* success */
       break;
     }
-    case MANGO_LIBC_SDL_FLIP:
-    case MANGO_LIBC_SDL_FILL_RECT:
+    case MANGO_LIBC_SDL_FILL_RECT: {
+      cpu->r[0] = (uint32_t)mango_sdl_soft_fill(lib, r0, r1, r2);
+      break;
+    }
+    case MANGO_LIBC_SDL_SET_VIDEO_MODE: {
+      uint32_t w = r0, h = r1, bpp = r2;
+      uint32_t surf;
+      if (bpp != 8u && bpp != 32u) {
+        bpp = 8u;
+      }
+      surf = mango_guest_sdl_surface_bpp(lib, w, h, bpp);
+      if (surf) {
+        g_fb_surf = surf;
+        g_fb_lib = lib;
+        fprintf(stderr, "mango: SDL_SetVideoMode %ux%u %ubpp -> surf=0x%x\n",
+                (unsigned)w, (unsigned)h, (unsigned)bpp, (unsigned)surf);
+      }
+      cpu->r[0] = surf;
+      break;
+    }
+    case MANGO_LIBC_SDL_FLIP: {
+      if (r0) {
+        mango_dump_framebuffer_pgm(lib, r0);
+      } else if (g_fb_surf) {
+        mango_dump_framebuffer_pgm(g_fb_lib ? g_fb_lib : lib, g_fb_surf);
+      }
+      cpu->r[0] = 0;
+      break;
+    }
     case MANGO_LIBC_SDL_FREE_SURFACE:
     case MANGO_LIBC_SDL_WM_SET_CAPTION:
     case MANGO_LIBC_SDL_WM_SET_ICON:
@@ -2963,16 +3024,19 @@ static bool mango_initialize(const struct NativeBridgeRuntimeCallbacks* runtime_
  */
 
 
-/* SDL 1.2 software surface large enough for Meritous title blit (640×480).
- * Used when we host-hook IMG_Load so a failed/partial decode cannot hand the
- * game a NULL surface (NULL→pixels load at addr 0x14 reads ELF magic and the
- * fill loop strb's through libsdl .text). */
-static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h) {
-  uint32_t fmt, surf, pixels, pitch, nbytes;
+/* SDL 1.2 software surface. bpp 8 (Meritous screen/tiles) or 32 (RGBA). */
+static uint32_t mango_guest_sdl_surface_bpp(MangoLoadedLibrary* lib, uint32_t w, uint32_t h,
+                                           uint32_t bpp) {
+  uint32_t fmt, surf, pixels, pitch, nbytes, bpp_bytes;
+  uint32_t pal = 0, colors = 0;
   if (w == 0 || h == 0 || w > 4096u || h > 4096u) {
     return 0;
   }
-  pitch = w * 4u;
+  if (bpp != 8u && bpp != 32u) {
+    return 0;
+  }
+  bpp_bytes = bpp / 8u;
+  pitch = w * bpp_bytes;
   nbytes = pitch * h;
   fmt = mango_guest_alloc(lib, 64u);
   surf = mango_guest_alloc(lib, 64u);
@@ -2980,23 +3044,46 @@ static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uin
   if (!fmt || !surf || !pixels) {
     return 0;
   }
-  /* SDL_PixelFormat: 32bpp RGBA8888-ish */
-  mango_store_u32_guest(lib->guest_mem, fmt + 0u, 0u); /* palette */
-  lib->guest_mem[fmt + 4u] = 32; /* BitsPerPixel */
-  lib->guest_mem[fmt + 5u] = 4;  /* BytesPerPixel */
-  mango_store_u32_guest(lib->guest_mem, fmt + 16u, 0x000000ffu); /* Rmask */
-  mango_store_u32_guest(lib->guest_mem, fmt + 20u, 0x0000ff00u);
-  mango_store_u32_guest(lib->guest_mem, fmt + 24u, 0x00ff0000u);
-  mango_store_u32_guest(lib->guest_mem, fmt + 28u, 0xff000000u);
-  /* SDL_Surface */
-  mango_store_u32_guest(lib->guest_mem, surf + 0u, 0u); /* flags */
+  if (bpp == 8u) {
+    pal = mango_guest_alloc(lib, 16u);
+    colors = mango_guest_alloc(lib, 256u * 4u);
+    if (!pal || !colors) {
+      return 0;
+    }
+    {
+      uint32_t i;
+      for (i = 0; i < 256u; i++) {
+        lib->guest_mem[colors + i * 4u + 0u] = (uint8_t)i;
+        lib->guest_mem[colors + i * 4u + 1u] = (uint8_t)i;
+        lib->guest_mem[colors + i * 4u + 2u] = (uint8_t)i;
+        lib->guest_mem[colors + i * 4u + 3u] = 0;
+      }
+    }
+    mango_store_u32_guest(lib->guest_mem, pal + 0u, 256u);
+    mango_store_u32_guest(lib->guest_mem, pal + 4u, colors);
+    mango_store_u32_guest(lib->guest_mem, fmt + 0u, pal);
+    lib->guest_mem[fmt + 4u] = 8;
+    lib->guest_mem[fmt + 5u] = 1;
+    mango_store_u32_guest(lib->guest_mem, fmt + 16u, 0u);
+    mango_store_u32_guest(lib->guest_mem, fmt + 20u, 0u);
+    mango_store_u32_guest(lib->guest_mem, fmt + 24u, 0u);
+    mango_store_u32_guest(lib->guest_mem, fmt + 28u, 0u);
+  } else {
+    mango_store_u32_guest(lib->guest_mem, fmt + 0u, 0u);
+    lib->guest_mem[fmt + 4u] = 32;
+    lib->guest_mem[fmt + 5u] = 4;
+    mango_store_u32_guest(lib->guest_mem, fmt + 16u, 0x000000ffu);
+    mango_store_u32_guest(lib->guest_mem, fmt + 20u, 0x0000ff00u);
+    mango_store_u32_guest(lib->guest_mem, fmt + 24u, 0x00ff0000u);
+    mango_store_u32_guest(lib->guest_mem, fmt + 28u, 0xff000000u);
+  }
+  mango_store_u32_guest(lib->guest_mem, surf + 0u, 0u);
   mango_store_u32_guest(lib->guest_mem, surf + 4u, fmt);
   mango_store_u32_guest(lib->guest_mem, surf + 8u, w);
   mango_store_u32_guest(lib->guest_mem, surf + 12u, h);
   lib->guest_mem[surf + 16u] = (uint8_t)(pitch & 0xffu);
   lib->guest_mem[surf + 17u] = (uint8_t)((pitch >> 8) & 0xffu);
   mango_store_u32_guest(lib->guest_mem, surf + 20u, pixels);
-  /* clip_rect at +32: x=0,y=0,w,h as Sint16/Uint16 */
   lib->guest_mem[surf + 32u] = 0;
   lib->guest_mem[surf + 33u] = 0;
   lib->guest_mem[surf + 34u] = 0;
@@ -3005,8 +3092,247 @@ static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uin
   lib->guest_mem[surf + 37u] = (uint8_t)((w >> 8) & 0xffu);
   lib->guest_mem[surf + 38u] = (uint8_t)(h & 0xffu);
   lib->guest_mem[surf + 39u] = (uint8_t)((h >> 8) & 0xffu);
-  mango_store_u32_guest(lib->guest_mem, surf + 56u, 1u); /* refcount */
+  mango_store_u32_guest(lib->guest_mem, surf + 56u, 1u);
   return surf;
+}
+
+static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h) {
+  return mango_guest_sdl_surface_bpp(lib, w, h, 32u);
+}
+
+static int16_t mango_load_i16_guest(const uint8_t* mem, uint32_t addr) {
+  return (int16_t)(uint16_t)((uint16_t)mem[addr] | ((uint16_t)mem[addr + 1u] << 8));
+}
+
+static void mango_store_i16_guest(uint8_t* mem, uint32_t addr, int16_t v) {
+  uint16_t u = (uint16_t)v;
+  mem[addr] = (uint8_t)(u & 0xffu);
+  mem[addr + 1u] = (uint8_t)((u >> 8) & 0xffu);
+}
+
+static int mango_sdl_read_rect(const uint8_t* mem, uint32_t addr, int* x, int* y, int* w,
+                               int* h) {
+  if (addr == 0) {
+    return 0;
+  }
+  *x = mango_load_i16_guest(mem, addr);
+  *y = mango_load_i16_guest(mem, addr + 2u);
+  *w = (int)(uint16_t)((uint16_t)mem[addr + 4u] | ((uint16_t)mem[addr + 5u] << 8));
+  *h = (int)(uint16_t)((uint16_t)mem[addr + 6u] | ((uint16_t)mem[addr + 7u] << 8));
+  return 1;
+}
+
+static int mango_sdl_soft_blit(MangoLoadedLibrary* lib, uint32_t src, uint32_t srcrect,
+                               uint32_t dst, uint32_t dstrect) {
+  uint32_t sfmt, dfmt, spix, dpix;
+  uint32_t sw, sh, dw, dh, spitch, dpitch;
+  uint8_t sbpp, dbpp;
+  int sx = 0, sy = 0, swid, shgt;
+  int dx = 0, dy = 0, dwid, dhgt;
+  int row;
+  if (!lib || !src || !dst) {
+    return -1;
+  }
+  if (!mango_guest_range_ok(lib, src, 60u) || !mango_guest_range_ok(lib, dst, 60u)) {
+    return -1;
+  }
+  sfmt = mango_load_u32_guest(lib->guest_mem, src + 4u);
+  dfmt = mango_load_u32_guest(lib->guest_mem, dst + 4u);
+  sw = mango_load_u32_guest(lib->guest_mem, src + 8u);
+  sh = mango_load_u32_guest(lib->guest_mem, src + 12u);
+  dw = mango_load_u32_guest(lib->guest_mem, dst + 8u);
+  dh = mango_load_u32_guest(lib->guest_mem, dst + 12u);
+  spitch = (uint32_t)lib->guest_mem[src + 16u] | ((uint32_t)lib->guest_mem[src + 17u] << 8);
+  dpitch = (uint32_t)lib->guest_mem[dst + 16u] | ((uint32_t)lib->guest_mem[dst + 17u] << 8);
+  spix = mango_load_u32_guest(lib->guest_mem, src + 20u);
+  dpix = mango_load_u32_guest(lib->guest_mem, dst + 20u);
+  if (!sfmt || !dfmt || !spix || !dpix || !mango_guest_range_ok(lib, sfmt, 8u) ||
+      !mango_guest_range_ok(lib, dfmt, 8u)) {
+    return -1;
+  }
+  sbpp = lib->guest_mem[sfmt + 5u];
+  dbpp = lib->guest_mem[dfmt + 5u];
+  if (sbpp == 0 || dbpp == 0 || sbpp != dbpp) {
+    return -1;
+  }
+  swid = (int)sw;
+  shgt = (int)sh;
+  if (!mango_sdl_read_rect(lib->guest_mem, srcrect, &sx, &sy, &swid, &shgt)) {
+    sx = sy = 0;
+    swid = (int)sw;
+    shgt = (int)sh;
+  }
+  dwid = swid;
+  dhgt = shgt;
+  if (!mango_sdl_read_rect(lib->guest_mem, dstrect, &dx, &dy, &dwid, &dhgt)) {
+    dx = dy = 0;
+  }
+  (void)dwid;
+  (void)dhgt;
+  if (sx < 0) { dx -= sx; swid += sx; sx = 0; }
+  if (sy < 0) { dy -= sy; shgt += sy; sy = 0; }
+  if (sx + swid > (int)sw) { swid = (int)sw - sx; }
+  if (sy + shgt > (int)sh) { shgt = (int)sh - sy; }
+  if (dx < 0) { sx -= dx; swid += dx; dx = 0; }
+  if (dy < 0) { sy -= dy; shgt += dy; dy = 0; }
+  if (dx + swid > (int)dw) { swid = (int)dw - dx; }
+  if (dy + shgt > (int)dh) { shgt = (int)dh - dy; }
+  if (swid <= 0 || shgt <= 0) {
+    return 0;
+  }
+  if (!mango_guest_range_ok(lib, spix, spitch * sh) ||
+      !mango_guest_range_ok(lib, dpix, dpitch * dh)) {
+    return -1;
+  }
+  for (row = 0; row < shgt; row++) {
+    uint8_t* srow =
+        lib->guest_mem + spix + (uint32_t)(sy + row) * spitch + (uint32_t)sx * sbpp;
+    uint8_t* drow =
+        lib->guest_mem + dpix + (uint32_t)(dy + row) * dpitch + (uint32_t)dx * dbpp;
+    memcpy(drow, srow, (size_t)swid * (size_t)sbpp);
+  }
+  g_blit_count++;
+  g_blit_bytes += (uint64_t)swid * (uint64_t)shgt * (uint64_t)sbpp;
+  if (dst == g_fb_surf || (dw >= 640u && dh >= 480u)) {
+    g_fb_surf = dst;
+    g_fb_lib = lib;
+  }
+  if (!g_frame_dumped && g_blit_count >= 300ull && g_fb_surf) {
+    mango_dump_framebuffer_pgm(g_fb_lib ? g_fb_lib : lib, g_fb_surf);
+  }
+  if (dstrect) {
+    mango_store_i16_guest(lib->guest_mem, dstrect, (int16_t)dx);
+    mango_store_i16_guest(lib->guest_mem, dstrect + 2u, (int16_t)dy);
+    lib->guest_mem[dstrect + 4u] = (uint8_t)(swid & 0xff);
+    lib->guest_mem[dstrect + 5u] = (uint8_t)((swid >> 8) & 0xff);
+    lib->guest_mem[dstrect + 6u] = (uint8_t)(shgt & 0xff);
+    lib->guest_mem[dstrect + 7u] = (uint8_t)((shgt >> 8) & 0xff);
+  }
+  return 0;
+}
+
+static int mango_sdl_soft_fill(MangoLoadedLibrary* lib, uint32_t dst, uint32_t dstrect,
+                               uint32_t color) {
+  uint32_t fmt, pix, w, h, pitch;
+  uint8_t bpp;
+  int x = 0, y = 0, rw, rh;
+  int row;
+  if (!lib || !dst || !mango_guest_range_ok(lib, dst, 60u)) {
+    return -1;
+  }
+  fmt = mango_load_u32_guest(lib->guest_mem, dst + 4u);
+  w = mango_load_u32_guest(lib->guest_mem, dst + 8u);
+  h = mango_load_u32_guest(lib->guest_mem, dst + 12u);
+  pitch = (uint32_t)lib->guest_mem[dst + 16u] | ((uint32_t)lib->guest_mem[dst + 17u] << 8);
+  pix = mango_load_u32_guest(lib->guest_mem, dst + 20u);
+  if (!fmt || !pix || !mango_guest_range_ok(lib, fmt, 8u)) {
+    return -1;
+  }
+  bpp = lib->guest_mem[fmt + 5u];
+  if (bpp == 0) {
+    return -1;
+  }
+  rw = (int)w;
+  rh = (int)h;
+  if (!mango_sdl_read_rect(lib->guest_mem, dstrect, &x, &y, &rw, &rh)) {
+    x = y = 0;
+    rw = (int)w;
+    rh = (int)h;
+  }
+  if (x < 0) { rw += x; x = 0; }
+  if (y < 0) { rh += y; y = 0; }
+  if (x + rw > (int)w) { rw = (int)w - x; }
+  if (y + rh > (int)h) { rh = (int)h - y; }
+  if (rw <= 0 || rh <= 0) {
+    return 0;
+  }
+  if (!mango_guest_range_ok(lib, pix, pitch * h)) {
+    return -1;
+  }
+  if (bpp == 1) {
+    uint8_t c = (uint8_t)(color & 0xffu);
+    for (row = 0; row < rh; row++) {
+      memset(lib->guest_mem + pix + (uint32_t)(y + row) * pitch + (uint32_t)x, c,
+             (size_t)rw);
+    }
+  } else if (bpp == 4) {
+    for (row = 0; row < rh; row++) {
+      uint32_t* rowp =
+          (uint32_t*)(lib->guest_mem + pix + (uint32_t)(y + row) * pitch + (uint32_t)x * 4u);
+      int col;
+      for (col = 0; col < rw; col++) {
+        rowp[col] = color;
+      }
+    }
+  } else {
+    return -1;
+  }
+  g_fill_count++;
+  if (dst == g_fb_surf || (w >= 640u && h >= 480u)) {
+    g_fb_surf = dst;
+    g_fb_lib = lib;
+  }
+  return 0;
+}
+
+static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf) {
+  uint32_t fmt, pix, w, h, pitch;
+  uint8_t bpp;
+  const char* out_path;
+  FILE* fp;
+  uint32_t y, i, nbytes, nonzero = 0;
+  if (g_frame_dumped || !lib || !surf) {
+    return;
+  }
+  if (!mango_guest_range_ok(lib, surf, 60u)) {
+    return;
+  }
+  fmt = mango_load_u32_guest(lib->guest_mem, surf + 4u);
+  w = mango_load_u32_guest(lib->guest_mem, surf + 8u);
+  h = mango_load_u32_guest(lib->guest_mem, surf + 12u);
+  pitch = (uint32_t)lib->guest_mem[surf + 16u] | ((uint32_t)lib->guest_mem[surf + 17u] << 8);
+  pix = mango_load_u32_guest(lib->guest_mem, surf + 20u);
+  if (!fmt || !pix || !mango_guest_range_ok(lib, fmt, 8u)) {
+    return;
+  }
+  bpp = lib->guest_mem[fmt + 5u];
+  if (bpp != 1 || w == 0 || h == 0) {
+    fprintf(stderr, "mango: frame dump skip (bpp=%u %ux%u)\n", (unsigned)bpp, (unsigned)w,
+            (unsigned)h);
+    return;
+  }
+  if (!mango_guest_range_ok(lib, pix, pitch * h)) {
+    return;
+  }
+  nbytes = w * h;
+  for (i = 0; i < nbytes; i++) {
+    uint32_t row = i / w;
+    uint32_t col = i % w;
+    if (lib->guest_mem[pix + row * pitch + col] != 0) {
+      nonzero++;
+    }
+  }
+  out_path = getenv("MANGO_FRAME_DUMP");
+  if (!out_path || !out_path[0]) {
+    out_path = "/workspace/mango/fixtures/meritous/frame-dungeon.pgm";
+  }
+  fp = fopen(out_path, "wb");
+  if (!fp) {
+    fprintf(stderr, "mango: frame dump fopen failed '%s'\n", out_path);
+    return;
+  }
+  fprintf(fp, "P5\n%u %u\n255\n", (unsigned)w, (unsigned)h);
+  for (y = 0; y < h; y++) {
+    fwrite(lib->guest_mem + pix + y * pitch, 1, w, fp);
+  }
+  fclose(fp);
+  g_frame_dumped = 1;
+  fprintf(stderr,
+          "mango: dumped framebuffer %ux%u pgm '%s' (%u nonzero, blits=%llu fills=%llu "
+          "bytes=%llu)\n",
+          (unsigned)w, (unsigned)h, out_path, (unsigned)nonzero,
+          (unsigned long long)g_blit_count, (unsigned long long)g_fill_count,
+          (unsigned long long)g_blit_bytes);
 }
 
 static int mango_is_meritous_sdl_image(const MangoLoadedLibrary* lib) {
@@ -3124,8 +3450,8 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   /* Gameplay draw path: tile walk + DrawCircle sqrt dominate after mapgen. */
   {
-    /* DrawLevel left live: one tile-walk frame is cheap with host UpperBlit
-     * no-op; proves a real gameplay draw path. Keep circle/entity/arc stubs. */
+    /* DrawLevel left live: host soft UpperBlit/FillRect paint the 8bpp
+     * framebuffer from tileset PNGs. Keep circle/entity/arc stubs. */
     static const uint32_t kBx[] = {
         0x11db4u, /* DrawEntities */
         0x16a88u, /* DrawPlayer */
