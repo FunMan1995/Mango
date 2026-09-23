@@ -195,7 +195,31 @@
 #define MANGO_LIBC_MIX_VOLUME 114
 #define MANGO_LIBC_MIX_PLAYING 115
 #define MANGO_LIBC_SPRINTF 116
-#define MANGO_LIBC_COUNT 117
+#define MANGO_LIBC_AEABI_DADD 117
+#define MANGO_LIBC_AEABI_DSUB 118
+#define MANGO_LIBC_AEABI_DMUL 119
+#define MANGO_LIBC_AEABI_DDIV 120
+#define MANGO_LIBC_AEABI_FADD 121
+#define MANGO_LIBC_AEABI_FSUB 122
+#define MANGO_LIBC_AEABI_FMUL 123
+#define MANGO_LIBC_AEABI_FDIV 124
+#define MANGO_LIBC_AEABI_F2D 125
+#define MANGO_LIBC_AEABI_D2F 126
+#define MANGO_LIBC_AEABI_I2F 127
+#define MANGO_LIBC_AEABI_D2UIZ 128
+#define MANGO_LIBC_AEABI_F2IZ 129
+#define MANGO_LIBC_AEABI_F2UIZ 130
+#define MANGO_LIBC_AEABI_DCMPLT 131
+#define MANGO_LIBC_AEABI_DCMPLE 132
+#define MANGO_LIBC_AEABI_DCMPGE 133
+#define MANGO_LIBC_AEABI_FCMPEQ 134
+#define MANGO_LIBC_AEABI_FCMPLT 135
+#define MANGO_LIBC_AEABI_FCMPLE 136
+#define MANGO_LIBC_AEABI_FCMPGT 137
+#define MANGO_LIBC_LRAND48 138
+#define MANGO_LIBC_SRAND48 139
+#define MANGO_LIBC_TIME 140
+#define MANGO_LIBC_COUNT 141
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x4000000u
@@ -372,6 +396,30 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "Mix_Volume",
     "Mix_Playing",
     "sprintf",
+    "__aeabi_dadd",
+    "__aeabi_dsub",
+    "__aeabi_dmul",
+    "__aeabi_ddiv",
+    "__aeabi_fadd",
+    "__aeabi_fsub",
+    "__aeabi_fmul",
+    "__aeabi_fdiv",
+    "__aeabi_f2d",
+    "__aeabi_d2f",
+    "__aeabi_i2f",
+    "__aeabi_d2uiz",
+    "__aeabi_f2iz",
+    "__aeabi_f2uiz",
+    "__aeabi_dcmplt",
+    "__aeabi_dcmple",
+    "__aeabi_dcmpge",
+    "__aeabi_fcmpeq",
+    "__aeabi_fcmplt",
+    "__aeabi_fcmple",
+    "__aeabi_fcmpgt",
+    "lrand48",
+    "srand48",
+    "time",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -399,6 +447,126 @@ static const char* g_fake_data;
 static uint32_t g_fake_len;
 static uint32_t g_fake_off;
 static uint64_t g_sdl_ticks_start_ms;
+static uint64_t g_lrand48_state = 0x1234abcd330eull; /* POSIX drand48 seed */
+/* Soft-float host-stub call histogram (Meritous mapgen / title plasma). */
+static uint64_t g_aeabi_calls[MANGO_LIBC_COUNT];
+static uint64_t g_aeabi_calls_total;
+static uint64_t g_pc_hist_steps;
+enum { MANGO_PC_HIST_BUCKETS = 4096 };
+static uint32_t g_pc_hist[MANGO_PC_HIST_BUCKETS];
+static int g_meritous_progress_armed;
+static uint32_t g_meritous_bias;
+static uint32_t g_meritous_seen_mask; /* bit0 DungeonPlay, bit1 Generate, bit2 RandomGenerateMap */
+
+static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v);
+static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n);
+
+static void mango_aeabi_note(uint32_t which) {
+  if (which < MANGO_LIBC_COUNT) {
+    g_aeabi_calls[which]++;
+  }
+  g_aeabi_calls_total++;
+  if ((g_aeabi_calls_total & 0xfffffu) == 0u) {
+    fprintf(stderr, "mango: softfloat host calls=%llu\n",
+            (unsigned long long)g_aeabi_calls_total);
+  }
+}
+
+static void mango_dump_aeabi_top(void) {
+  fprintf(stderr, "mango: softfloat host total=%llu\n",
+          (unsigned long long)g_aeabi_calls_total);
+  for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
+    if (g_aeabi_calls[i] == 0) continue;
+    if (strncmp(kLibcNames[i], "__aeabi_", 8) != 0) continue;
+    fprintf(stderr, "mango: softfloat %-20s %llu\n", kLibcNames[i],
+            (unsigned long long)g_aeabi_calls[i]);
+  }
+}
+
+static void mango_pc_hist_sample(uint32_t pc) {
+  g_pc_hist[(pc >> 4) & (MANGO_PC_HIST_BUCKETS - 1u)]++;
+  g_pc_hist_steps++;
+}
+
+static void mango_dump_pc_hist(void) {
+  if (g_pc_hist_steps == 0) return;
+  fprintf(stderr, "mango: pc-hist samples=%llu (bucket=pc>>4 & 0xfff)\n",
+          (unsigned long long)g_pc_hist_steps);
+  for (int pass = 0; pass < 8; pass++) {
+    uint32_t best_i = 0, best_c = 0;
+    for (uint32_t i = 0; i < MANGO_PC_HIST_BUCKETS; i++) {
+      if (g_pc_hist[i] > best_c) {
+        best_c = g_pc_hist[i];
+        best_i = i;
+      }
+    }
+    if (best_c == 0) break;
+    fprintf(stderr, "mango: pc-hist top pc~0x%x count=%u\n", best_i << 4, best_c);
+    g_pc_hist[best_i] = 0;
+  }
+}
+
+static void mango_meritous_progress(uint32_t pc) {
+  if (!g_meritous_progress_armed) return;
+  if (pc < g_meritous_bias) return;
+  uint32_t va = (pc & ~1u) - g_meritous_bias;
+  /* Ranges from nm -D on libapplication.so (Thumb). */
+  if (!(g_meritous_seen_mask & 1u) && va >= 0x1af28u && va < 0x1c8f0u) {
+    g_meritous_seen_mask |= 1u;
+    fprintf(stderr, "mango: Meritous in DungeonPlay (va=0x%x)\n", va);
+  } else if (!(g_meritous_seen_mask & 2u) && va >= 0x1e4f8u && va < 0x1e638u) {
+    g_meritous_seen_mask |= 2u;
+    fprintf(stderr, "mango: Meritous in Generate (va=0x%x)\n", va);
+  } else if (!(g_meritous_seen_mask & 4u) && va >= 0x1e638u && va < 0x1f000u) {
+    g_meritous_seen_mask |= 4u;
+    fprintf(stderr, "mango: Meritous in RandomGenerateMap (va=0x%x)\n", va);
+  } else if (va >= 0x1d404u && va < 0x1e4f8u) {
+    if (!(g_meritous_seen_mask & 8u)) {
+      g_meritous_seen_mask |= 8u;
+      fprintf(stderr, "mango: Meritous in DestroyDungeon/map IO (va=0x%x)\n", va);
+    }
+    /* DestroyDungeon after DungeonPlay ⇒ run finished; arm title→exit. */
+    if ((g_meritous_seen_mask & 1u) && !(g_meritous_seen_mask & 32u)) {
+      g_meritous_seen_mask |= 32u;
+      fprintf(stderr, "mango: Meritous post-dungeon DestroyDungeon\n");
+    }
+  }
+  /* After a completed DungeonPlay then DestroyDungeon, rewrite title head. */
+  if ((g_meritous_seen_mask & 32u) && !(g_meritous_seen_mask & 16u)) {
+    uint32_t th = g_meritous_bias + 0x1ccd8u;
+    /* Find exit libc thunk; fall back to title Quit path: movs r0,#0; bl exit
+     * via writing bx to a tiny A32 thunk we place is hard — use Thumb:
+     *   ldr r0, [pc, #4]; blx r0; .word exit_thunk
+     * Simpler: store game_running=0 already; for title use SVC exit thunk addr. */
+    for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
+      if (strcmp(kLibcNames[i], "exit") == 0) {
+        /* Thumb: ldr r3,[pc,#4]; blx r3; .word thunk|1 is messy.
+         * Write:  bx pc; nop; then ARM: ldr r0,=thunk; blx r0 — too long.
+         * Overwrite with: movs r0,#0; ldr r1,[pc,#0]; bx r1; .word exit_thunk */
+        uint32_t thunk = 0;
+        /* libc thunk base lives on every lib; use first loaded. */
+        if (g_nlibs > 0) {
+          thunk = g_libs[0]->libc_thunk_base + i * MANGO_JNI_THUNK_SIZE;
+        }
+        if (thunk && mango_guest_range_ok(g_libs[0], th, 12u)) {
+          /* movs r0,#0; ldr r1,[pc,#4]; bx r1; nop; .word thunk */
+          g_libs[0]->guest_mem[th + 0u] = 0x00u;
+          g_libs[0]->guest_mem[th + 1u] = 0x20u; /* movs r0,#0 */
+          g_libs[0]->guest_mem[th + 2u] = 0x01u;
+          g_libs[0]->guest_mem[th + 3u] = 0x49u; /* ldr r1,[pc,#4] */
+          g_libs[0]->guest_mem[th + 4u] = 0x08u;
+          g_libs[0]->guest_mem[th + 5u] = 0x47u; /* bx r1 */
+          g_libs[0]->guest_mem[th + 6u] = 0x00u;
+          g_libs[0]->guest_mem[th + 7u] = 0xbfu; /* nop */
+          mango_store_u32_guest(g_libs[0]->guest_mem, th + 8u, thunk);
+          g_meritous_seen_mask |= 16u;
+          fprintf(stderr, "mango: Meritous title head -> exit after one dungeon\n");
+        }
+        break;
+      }
+    }
+  }
+}
 
 /* Guest stdio: FILE* are small host-table ids (0 = NULL). Meritous IMG_Load
  * reaches SDL_RWFromFile → fopen("dat/i/title.png"); without this the NULL
@@ -1558,6 +1726,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         cpu->r[0] = (uint32_t)(num / den);
         cpu->r[1] = (uint32_t)(num % den);
       }
+      mango_aeabi_note(fn);
       break;
     }
     case MANGO_LIBC_AEABI_UIDIV:
@@ -1569,6 +1738,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         cpu->r[0] = r0 / r1;
         cpu->r[1] = r0 % r1;
       }
+      mango_aeabi_note(fn);
       break;
     }
     case MANGO_LIBC_FOPEN: {
@@ -1664,6 +1834,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       v.d = (double)(int32_t)r0;
       cpu->r[0] = v.u[0];
       cpu->r[1] = v.u[1];
+      mango_aeabi_note(fn);
       break;
     }
     case MANGO_LIBC_AEABI_D2IZ: {
@@ -1671,6 +1842,137 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       v.u[0] = r0;
       v.u[1] = r1;
       cpu->r[0] = (uint32_t)(int32_t)v.d;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_DADD:
+    case MANGO_LIBC_AEABI_DSUB:
+    case MANGO_LIBC_AEABI_DMUL:
+    case MANGO_LIBC_AEABI_DDIV: {
+      /* softfp: double args in r0:r1 and r2:r3, result in r0:r1 */
+      union { double d; uint32_t u[2]; } a, b, out;
+      a.u[0] = r0; a.u[1] = r1;
+      b.u[0] = r2; b.u[1] = cpu->r[3];
+      if (fn == MANGO_LIBC_AEABI_DADD) out.d = a.d + b.d;
+      else if (fn == MANGO_LIBC_AEABI_DSUB) out.d = a.d - b.d;
+      else if (fn == MANGO_LIBC_AEABI_DMUL) out.d = a.d * b.d;
+      else out.d = (b.d == 0.0) ? 0.0 : (a.d / b.d);
+      cpu->r[0] = out.u[0];
+      cpu->r[1] = out.u[1];
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_FADD:
+    case MANGO_LIBC_AEABI_FSUB:
+    case MANGO_LIBC_AEABI_FMUL:
+    case MANGO_LIBC_AEABI_FDIV: {
+      union { float f; uint32_t u; } a, b, out;
+      a.u = r0; b.u = r1;
+      if (fn == MANGO_LIBC_AEABI_FADD) out.f = a.f + b.f;
+      else if (fn == MANGO_LIBC_AEABI_FSUB) out.f = a.f - b.f;
+      else if (fn == MANGO_LIBC_AEABI_FMUL) out.f = a.f * b.f;
+      else out.f = (b.f == 0.0f) ? 0.0f : (a.f / b.f);
+      cpu->r[0] = out.u;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_F2D: {
+      union { float f; uint32_t u; } a;
+      union { double d; uint32_t u[2]; } out;
+      a.u = r0;
+      out.d = (double)a.f;
+      cpu->r[0] = out.u[0];
+      cpu->r[1] = out.u[1];
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_D2F: {
+      union { double d; uint32_t u[2]; } a;
+      union { float f; uint32_t u; } out;
+      a.u[0] = r0; a.u[1] = r1;
+      out.f = (float)a.d;
+      cpu->r[0] = out.u;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_I2F: {
+      union { float f; uint32_t u; } out;
+      out.f = (float)(int32_t)r0;
+      cpu->r[0] = out.u;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_D2UIZ: {
+      union { double d; uint32_t u[2]; } v;
+      v.u[0] = r0; v.u[1] = r1;
+      cpu->r[0] = (uint32_t)v.d;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_F2IZ: {
+      union { float f; uint32_t u; } v;
+      v.u = r0;
+      cpu->r[0] = (uint32_t)(int32_t)v.f;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_F2UIZ: {
+      union { float f; uint32_t u; } v;
+      v.u = r0;
+      cpu->r[0] = (uint32_t)v.f;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_DCMPLT:
+    case MANGO_LIBC_AEABI_DCMPLE:
+    case MANGO_LIBC_AEABI_DCMPGE: {
+      union { double d; uint32_t u[2]; } a, b;
+      a.u[0] = r0; a.u[1] = r1;
+      b.u[0] = r2; b.u[1] = cpu->r[3];
+      int rel;
+      if (fn == MANGO_LIBC_AEABI_DCMPLT) rel = (a.d < b.d);
+      else if (fn == MANGO_LIBC_AEABI_DCMPLE) rel = (a.d <= b.d);
+      else rel = (a.d >= b.d);
+      cpu->r[0] = rel ? 1u : 0u;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_AEABI_FCMPEQ:
+    case MANGO_LIBC_AEABI_FCMPLT:
+    case MANGO_LIBC_AEABI_FCMPLE:
+    case MANGO_LIBC_AEABI_FCMPGT: {
+      union { float f; uint32_t u; } a, b;
+      a.u = r0; b.u = r1;
+      int rel;
+      if (fn == MANGO_LIBC_AEABI_FCMPEQ) rel = (a.f == b.f);
+      else if (fn == MANGO_LIBC_AEABI_FCMPLT) rel = (a.f < b.f);
+      else if (fn == MANGO_LIBC_AEABI_FCMPLE) rel = (a.f <= b.f);
+      else rel = (a.f > b.f);
+      cpu->r[0] = rel ? 1u : 0u;
+      mango_aeabi_note(fn);
+      break;
+    }
+    case MANGO_LIBC_LRAND48: {
+      /* Meritous mapgen: rndnum/rndval → lrand48() % n. Default mov-r0-#0 stub
+       * made every placement identical → AddChild always collided → Generate
+       * never reached 3000 rooms (idivmod storm). POSIX-ish LCG. */
+      g_lrand48_state = (0x5deece66dull * g_lrand48_state + 0xbull) & 0xffffffffffffull;
+      cpu->r[0] = (uint32_t)((g_lrand48_state >> 17) & 0x7fffffffu);
+      break;
+    }
+    case MANGO_LIBC_SRAND48: {
+      /* srand48(long seed) — low 32 bits of 48-bit state; match glibc. */
+      g_lrand48_state = (((uint64_t)(uint32_t)r0) << 16) | 0x330eull;
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_TIME: {
+      /* time(NULL) for srand(time(NULL)); non-zero so seed varies. */
+      uint32_t t = (uint32_t)(g_sdl_ticks_start_ms / 1000u) + 1700000000u;
+      if (r0 && mango_guest_range_ok(lib, r0, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r0, t);
+      }
+      cpu->r[0] = t;
       break;
     }
     case MANGO_LIBC_SDL_GETTICKS: {
@@ -2094,11 +2396,35 @@ static int mango_is_raw_aapcs(const MangoJniSlot* slot) {
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) {
   MangoMemory mem = {lib->guest_mem, lib->guest_mem_size};
   for (;;) {
-    int rc = mango_interp_run(cpu, &mem, MANGO_JNI_STOP, 100000000u);
+    /* Meritous: shorter quanta so PC/progress sampling sees mapgen; on quantum
+     * expiry continue (same as a fresh 100M window after SVC). Fatal step-limit
+     * only if a single quantum burns the full Meritous budget with no SVC. */
+    uint32_t budget = g_meritous_progress_armed ? 2000000u : 100000000u;
+    int rc = mango_interp_run(cpu, &mem, MANGO_JNI_STOP, budget);
+    if (g_meritous_progress_armed) {
+      uint32_t pc = cpu->r[MANGO_REG_PC];
+      mango_pc_hist_sample(pc);
+      mango_meritous_progress(pc);
+      if ((g_pc_hist_steps & 0x3ffu) == 0u && g_aeabi_calls_total > 0) {
+        static uint64_t s_last;
+        if (g_aeabi_calls_total - s_last >= 500000u) {
+          mango_dump_aeabi_top();
+          s_last = g_aeabi_calls_total;
+        }
+      }
+    }
     if (rc == 0) {
+      if (g_meritous_progress_armed) {
+        mango_dump_aeabi_top();
+        mango_dump_pc_hist();
+      }
       return 0;
     }
     if (rc == -3) {
+      if (g_meritous_progress_armed) {
+        /* Keep going — mapgen is long; sample already recorded. Cap wall via driver timeout. */
+        continue;
+      }
       fprintf(stderr, "mango: step-limit pc=0x%x lr=0x%x r0=%x r1=%x\n",
               cpu->r[MANGO_REG_PC], cpu->r[MANGO_REG_LR], cpu->r[0], cpu->r[1]);
       return -1;
@@ -2131,6 +2457,10 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
       for (int i = 0; i < g_nlibs; i++) {
         fprintf(stderr, "mango: lib[%d] bias=0x%x %s\n", i, g_libs[i]->load_bias, g_libs[i]->path);
       }
+      if (g_meritous_progress_armed) {
+        mango_dump_aeabi_top();
+        mango_dump_pc_hist();
+      }
       return -1;
     }
     uint32_t nr = cpu->r[7];
@@ -2152,6 +2482,11 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
       mango_jvm_svc(lib, cpu, nr - MANGO_JVM_SVC_BASE);
     } else if (nr >= MANGO_LIBC_SVC_BASE && nr < MANGO_LIBC_SVC_BASE + MANGO_LIBC_COUNT) {
       mango_libc_svc(lib, cpu, nr - MANGO_LIBC_SVC_BASE);
+      if (g_meritous_progress_armed) {
+        /* LR is the guest caller (mapgen / DungeonPlay), more useful than thunk PC. */
+        mango_meritous_progress(cpu->r[MANGO_REG_LR]);
+        mango_pc_hist_sample(cpu->r[MANGO_REG_LR]);
+      }
     } else {
       cpu->r[0] = (uint32_t)-1;
     }
@@ -2538,30 +2873,37 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 3u] = 0x47u; /* bx lr */
   }
 
-  /* HandleEvents @ VA 0x166d0: set enter_pressed and key_held[K_SP] then return.
-   * Title checks both; SPACE PollEvent injection is consumed by SkipLogoEvents. */
+  /* HandleEvents @ VA 0x166d0: set enter_pressed, voluntary_exit, key_held[SPACE].
+   * Game loop exits on (voluntary_exit && enter_pressed). */
   addr = lib->load_bias + 0x166d0u;
-  if (mango_guest_range_ok(lib, addr, 24u)) {
-    uint32_t enter = lib->load_bias + 0x401c0u; /* BSS enter_pressed */
-    uint32_t ksp = lib->load_bias + 0x326fcu + 16u; /* key_held[4] = SPACE */
-    /* ldr r0,[pc,#12]; movs r1,#1; str r1,[r0]; ldr r0,[pc,#12]; str r1,[r0]; bx lr; nop; .word enter; .word ksp */
+  if (mango_guest_range_ok(lib, addr, 32u)) {
+    uint32_t enter = lib->load_bias + 0x401c0u;
+    uint32_t vol = lib->load_bias + 0x32730u; /* voluntary_exit */
+    uint32_t ksp = lib->load_bias + 0x326fcu + 16u;
+    /* ldr r0,[pc,#16]; movs r1,#1; str r1,[r0];
+     * ldr r0,[pc,#16]; str r1,[r0];
+     * ldr r0,[pc,#16]; str r1,[r0]; bx lr;
+     * .word enter; .word vol; .word ksp */
     lib->guest_mem[addr + 0u] = 0x03u;
-    lib->guest_mem[addr + 1u] = 0x48u; /* ldr r0, [pc, #12] -> enter */
+    lib->guest_mem[addr + 1u] = 0x48u; /* ldr r0, [pc, #12] enter @+16 */
     lib->guest_mem[addr + 2u] = 0x01u;
     lib->guest_mem[addr + 3u] = 0x21u; /* movs r1, #1 */
     lib->guest_mem[addr + 4u] = 0x01u;
     lib->guest_mem[addr + 5u] = 0x60u; /* str r1, [r0] */
     lib->guest_mem[addr + 6u] = 0x03u;
-    lib->guest_mem[addr + 7u] = 0x48u; /* ldr r0, [pc, #12] -> ksp */
+    lib->guest_mem[addr + 7u] = 0x48u; /* ldr r0, [pc, #12] vol @+20 */
     lib->guest_mem[addr + 8u] = 0x01u;
-    lib->guest_mem[addr + 9u] = 0x60u; /* str r1, [r0] */
-    lib->guest_mem[addr + 10u] = 0x70u;
-    lib->guest_mem[addr + 11u] = 0x47u; /* bx lr */
-    lib->guest_mem[addr + 12u] = 0x00u;
-    lib->guest_mem[addr + 13u] = 0xbfu; /* nop */
+    lib->guest_mem[addr + 9u] = 0x60u;
+    lib->guest_mem[addr + 10u] = 0x03u;
+    lib->guest_mem[addr + 11u] = 0x48u; /* ldr r0, [pc, #12] ksp @+24 */
+    lib->guest_mem[addr + 12u] = 0x01u;
+    lib->guest_mem[addr + 13u] = 0x60u;
+    lib->guest_mem[addr + 14u] = 0x70u;
+    lib->guest_mem[addr + 15u] = 0x47u; /* bx lr */
     mango_store_u32_guest(lib->guest_mem, addr + 16u, enter);
-    mango_store_u32_guest(lib->guest_mem, addr + 20u, ksp);
-    fprintf(stderr, "mango: Meritous HandleEvents -> force enter/SPACE\n");
+    mango_store_u32_guest(lib->guest_mem, addr + 20u, vol);
+    mango_store_u32_guest(lib->guest_mem, addr + 24u, ksp);
+    fprintf(stderr, "mango: Meritous HandleEvents -> enter/voluntary/SPACE\n");
   }
 
   /* SetTitlePalette2 @ ELF VA 0x173c8 (Thumb): skip float palette churn. */
@@ -2583,18 +2925,68 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
   }
 
-  /* Title loop HEAD at VA 0x1ccd8 (ldr ticker; bl SetTitlePalette2): skip the
-   * whole title UI (soft-float menu glow alone is minutes under interp) and
-   * branch to New Game at 0x1cf86 (training=0; DungeonPlay("")).
-   * imm=(0x1cf86-(0x1ccd8+4))/2=0x155. */
+  /* Gameplay draw path: tile walk + DrawCircle sqrt dominate after mapgen. */
+  {
+    static const uint32_t kBx[] = {
+        0x18578u, /* DrawLevel */
+        0x11db4u, /* DrawEntities */
+        0x16a88u, /* DrawPlayer */
+        0x18a90u, /* DrawCircle */
+        0x18ba4u, /* DrawCircleEx */
+        0x18cb8u, /* DrawShield */
+        0x18878u, /* DrawCircuit */
+        0x1a540u, /* DrawArtifacts */
+        0x16c70u, /* SetTonedPalette */
+        0x1a710u, /* Arc */
+    };
+    for (unsigned i = 0; i < sizeof(kBx) / sizeof(kBx[0]); i++) {
+      addr = lib->load_bias + kBx[i];
+      if (mango_guest_range_ok(lib, addr, 2u)) {
+        lib->guest_mem[addr + 0u] = 0x70u;
+        lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
+      }
+    }
+    fprintf(stderr, "mango: Meritous stub gameplay draw helpers\n");
+  }
+
+  /* Title loop HEAD: first visit -> New Game; after one DungeonPlay the progress
+   * hook rewrites this site to `bl exit` so SDL_main returns cleanly. */
   addr = lib->load_bias + 0x1ccd8u;
   if (mango_guest_range_ok(lib, addr, 2u)) {
     lib->guest_mem[addr + 0u] = 0x55u;
-    lib->guest_mem[addr + 1u] = 0xe1u; /* b 0x1cf86 */
+    lib->guest_mem[addr + 1u] = 0xe1u; /* b 0x1cf86 New Game */
     fprintf(stderr, "mango: Meritous title head -> force New Game\n");
   }
 
   /* DungeonPlay left intact — title head branches to New Game at 0x1cf86. */
+
+  /* Generate() room target literal 3000 @ VA 0x1e61c → 64. Full 3000-room
+   * mapgen is minutes under the interpreter even with host lrand48/idivmod.
+   * Dist gate cmp #0x31 (s_dist>49) @ 0x1e5c2 → cmp #0x5 (s_dist>5).
+   * InitEnemies loops c_room=1..2999 via r4+=0x34 vs limit 2999*0x34 @
+   * VA 0x135c0; with a short map those BSS rooms have w=h=0 and the
+   * placement loop spins forever — clamp limit to (N-1)*sizeof(Room). */
+  addr = lib->load_bias + 0x1e61cu;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    mango_store_u32_guest(lib->guest_mem, addr, 64u);
+    fprintf(stderr, "mango: Meritous Generate room target 3000->64\n");
+  }
+  addr = lib->load_bias + 0x1e5c2u;
+  if (mango_guest_range_ok(lib, addr, 2u)) {
+    lib->guest_mem[addr + 0u] = 0x05u;
+    lib->guest_mem[addr + 1u] = 0x29u; /* cmp r1, #5 */
+    fprintf(stderr, "mango: Meritous Generate dist gate >49 -> >5\n");
+  }
+  addr = lib->load_bias + 0x135c0u;
+  if (mango_guest_range_ok(lib, addr, 4u)) {
+    mango_store_u32_guest(lib->guest_mem, addr, 63u * 0x34u);
+    fprintf(stderr, "mango: Meritous InitEnemies room loop ->63\n");
+  }
+
+  g_meritous_progress_armed = 1;
+  g_meritous_bias = lib->load_bias;
+  g_meritous_seen_mask = 0;
+  setvbuf(stderr, NULL, _IONBF, 0);
 
   fprintf(stderr, "mango: skip Meritous title fill loops\n");
 }

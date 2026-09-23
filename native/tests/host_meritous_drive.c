@@ -90,6 +90,7 @@ static void* load_abs(const char* dir, const char* name) {
 }
 
 int main(int argc, char** argv) {
+  setvbuf(stderr, NULL, _IONBF, 0);
   if (argc != 2 || argv[1][0] == '-') { usage(argv[0]); return 2; }
   const char* libs = argv[1];
 
