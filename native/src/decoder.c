@@ -2129,10 +2129,38 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0ad: T32 STRB.W Rt,[Rn,Rm,LSL#imm2] T2 — size=00 L=0, register form
+   * bits[11:6]=0, any imm2 0..3 (mirror 0v STRH.W / 0u STR.W / 0m LDRB.W).
+   * Guest f804 b003 = strb.w fp,[r4,r3] imm2=0; also f804 b013 LSL#1 etc.
+   * Mutually exclusive with tip 0z STRB.W imm8 (bit11=1) and F880 imm12 (bit7=1).
+   * Reuse MANGO_OP_STR b=1 is_imm=0; execute already honors reg+shift via
+   * mango_eval_operand2. Reject Rt/Rn/Rm=PC. Do not open STRH.W imm8 / CLZ. */
+  if ((hw1 & 0xFFF0u) == 0xF800u && (hw2 & 0x0FC0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm2 = (hw2 >> 4) & 3u;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_STR;
+    out->rd = rt;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_amount = imm2;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    out->b = 1;
+    return 0;
+  }
+
   /* Q-OTTD-0i / 0u: T32 STR.W Rt,[Rn,Rm,LSL#imm2] T2 — size=10 L=0,
    * hw2 bits[11:6]=0 (register form), any imm2 0..3 (like 0m LDRB.W).
    * Guest f842 b006 = str.w fp,[r2,r6] imm2=0; tip 0i f840 4025 LSL#2.
-   * Distinct from 0s/0g (bit11=1 imm8). Reject PC. Do not open STRB/STRH-reg. */
+   * Distinct from 0s/0g (bit11=1 imm8). Reject PC. STRB-reg is 0ad; hold STRH imm8. */
   if ((hw1 & 0xFFF0u) == 0xF840u && (hw2 & 0x0FC0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
