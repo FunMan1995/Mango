@@ -149,6 +149,33 @@ static uint32_t mango_fp_recip_estimate_f32(uint32_t op, uint32_t* fpscr) {
   return (sign << 31) | (result_exp << 23) | result_frac;
 }
 
+/* Arm FPRecipStep for binary32 (AdvSIMD StandardFPSCR / Default NaN).
+ * result ≈ 2.0 - (op1 * op2); Inf×0 (or denorm under FZ) → exact +2.0. */
+static uint32_t mango_fp_recip_step_f32(uint32_t op1, uint32_t op2) {
+  uint32_t exp1 = (op1 >> 23) & 0xFFu;
+  uint32_t exp2 = (op2 >> 23) & 0xFFu;
+  uint32_t frac1 = op1 & 0x7FFFFFu;
+  uint32_t frac2 = op2 & 0x7FFFFFu;
+  int nan1 = (exp1 == 0xFFu && frac1 != 0u);
+  int nan2 = (exp2 == 0xFFu && frac2 != 0u);
+  if (nan1 || nan2) {
+    return MANGO_F32_DEFAULT_NAN;
+  }
+  int zero1 = (exp1 == 0u); /* ±0 / denorm (FZ) */
+  int zero2 = (exp2 == 0u);
+  int inf1 = (exp1 == 0xFFu && frac1 == 0u);
+  int inf2 = (exp2 == 0xFFu && frac2 == 0u);
+  if ((inf1 && zero2) || (zero1 && inf2)) {
+    return 0x40000000u; /* +2.0 */
+  }
+  float a, b, r;
+  uint32_t bits;
+  memcpy(&a, &op1, 4);
+  memcpy(&b, &op2, 4);
+  r = 2.0f - (a * b);
+  memcpy(&bits, &r, 4);
+  return bits;
+}
 
 /* T16 ADR and LDR-literal: (PC + 4) AND NOT 3. High-register ADD Rd, PC does not. */
 static uint32_t mango_thumb_align_pc(const MangoCpu* cpu, const MangoInsn* insn, uint32_t value) {
@@ -1252,6 +1279,35 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               v |= (uint64_t)concat[off + i * 8u + b] << (b * 8u);
             }
             mango_vfp_set_d(cpu, insn.rd + i, v);
+          }
+          break;
+        }
+
+        case MANGO_OP_VRECPS: {
+          /* Arm FPRecipStep.F32 per lane: 2.0 - (op1 * op2). */
+          uint32_t nd = insn.b ? 2u : 1u;
+          for (uint32_t di = 0; di < nd; di++) {
+            uint64_t a = mango_vfp_get_d(cpu, insn.rn + di);
+            uint64_t b = mango_vfp_get_d(cpu, insn.rm + di);
+            uint64_t dst = 0;
+            for (uint32_t lane = 0; lane < 2u; lane++) {
+              uint32_t op1 = (uint32_t)(a >> (lane * 32u));
+              uint32_t op2 = (uint32_t)(b >> (lane * 32u));
+              uint32_t ob = mango_fp_recip_step_f32(op1, op2);
+              dst |= (uint64_t)ob << (lane * 32u);
+            }
+            mango_vfp_set_d(cpu, insn.rd + di, dst);
+          }
+          break;
+        }
+
+        case MANGO_OP_VORR: {
+          /* Bitwise OR of Dn and Dm into Dd (Q uses two D regs). */
+          uint32_t nd = insn.b ? 2u : 1u;
+          for (uint32_t di = 0; di < nd; di++) {
+            uint64_t a = mango_vfp_get_d(cpu, insn.rn + di);
+            uint64_t b = mango_vfp_get_d(cpu, insn.rm + di);
+            mango_vfp_set_d(cpu, insn.rd + di, a | b);
           }
           break;
         }

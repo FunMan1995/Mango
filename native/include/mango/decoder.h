@@ -83,6 +83,8 @@ typedef enum MangoOp {
   MANGO_OP_SMMUL,
   MANGO_OP_VRECPE,
   MANGO_OP_VEXT,
+  MANGO_OP_VRECPS,
+  MANGO_OP_VORR,
 } MangoOp;
 
 typedef struct MangoInsn {

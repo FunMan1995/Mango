@@ -98,6 +98,41 @@ int mango_decode(uint32_t word, MangoInsn* out) {
         }
         return -1;
       }
+      /* Three-reg same length with o1=1 (bit4): VORR / VRECPS. */
+      if (((word >> 23) & 1u) == 0 && ((word >> 4) & 1u) == 1) {
+        uint32_t u = (word >> 24) & 1u;
+        uint32_t size = (word >> 20) & 3u;
+        uint32_t opc = (word >> 8) & 0xFu;
+        uint32_t q = (word >> 6) & 1u;
+        uint32_t d = (((word >> 22) & 1u) << 4) | ((word >> 12) & 0xFu);
+        uint32_t n = (((word >> 7) & 1u) << 4) | ((word >> 16) & 0xFu);
+        uint32_t m = (((word >> 5) & 1u) << 4) | (word & 0xFu);
+        if (q && ((d | n | m) & 1u)) {
+          return -1;
+        }
+        /* VORR (register): U=0, opc=0001, size!=11. */
+        if (u == 0u && opc == 0x1u && size != 3u) {
+          out->op = MANGO_OP_VORR;
+          out->cond = 0xE;
+          out->rd = d;
+          out->rn = n;
+          out->rm = m;
+          out->b = (int)q;
+          return 0;
+        }
+        /* VRECPS.F32: U=0, size=0sz with sz=0 (F32), opc=1111, o1=1. */
+        if (u == 0u && size == 0u && opc == 0xFu) {
+          out->op = MANGO_OP_VRECPS;
+          out->cond = 0xE;
+          out->rd = d;
+          out->rn = n;
+          out->rm = m;
+          out->b = (int)q;
+          out->imm = 4; /* F32 lane size in bytes */
+          return 0;
+        }
+        return -1;
+      }
       if (((word >> 23) & 1u) == 1 && ((word >> 19) & 7u) == 0 && ((word >> 7) & 1u) == 0 &&
           ((word >> 4) & 1u) == 1) {
         uint32_t imm8 =
