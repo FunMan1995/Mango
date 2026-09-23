@@ -4898,6 +4898,134 @@ static int test_t32_add_w_reg_reject(void) {
   return 0;
 }
 
+static int test_t32_mov_w_reg_lsr31(void) {
+  /* Q-OTTD-0r: mov.w sl,r0,lsr#31 = ea4f 7ad0.
+   * Rd = Rm >> 31; NZCV hold (S=0); pc+=4. */
+  static const uint16_t kProg[] = {0xEA4Fu, 0x7AD0u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xEA4Fu, 0x7AD0u, &di) != 0 || di.op != MANGO_OP_MOV || di.rd != 10 ||
+      di.rm != 0 || di.is_imm != 0 || di.sets_flags != 0 || di.shift_type != 1 ||
+      di.shift_amount != 31 || di.shift_by_reg != 0) {
+    fprintf(stderr,
+            "FAIL(t32_mov_w_reg_lsr31): decode op=%d rd=%u rm=%u is_imm=%d s=%d type=%u amt=%u "
+            "by_reg=%d (want MOV sl,r0 LSR#31)\n",
+            di.op, di.rd, di.rm, di.is_imm, di.sets_flags, di.shift_type, di.shift_amount,
+            di.shift_by_reg);
+    return 1;
+  }
+
+  struct {
+    uint32_t r0;
+    uint32_t want_sl;
+    const char* name;
+  } cases[] = {
+      {0xffffffffu, 1u, "all_ones"},
+      {0u, 0u, "zero"},
+      {0x12u, 0u, "drive_like"},
+      {0x80000000u, 1u, "msb"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = cases[i].r0;
+    cpu.r[10] = 0xdeadbeefu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+    if (rc != 0 || cpu.r[10] != cases[i].want_sl || cpu.r[0] != cases[i].r0 ||
+        cpu.cpsr != cpsr_before || cpu.r[15] != 4u) {
+      fprintf(stderr,
+              "FAIL(t32_mov_w_reg_lsr31 %s): rc=%d sl=0x%x want 0x%x r0=0x%x cpsr=0x%x pc=0x%x\n",
+              cases[i].name, rc, cpu.r[10], cases[i].want_sl, cpu.r[0], cpu.cpsr, cpu.r[15]);
+      return 1;
+    }
+  }
+  printf("ok: T32 MOV.W sl,r0,lsr#31 ea4f7ad0 (Q-OTTD-0r)\n");
+  return 0;
+}
+
+static int test_t32_mov_w_reg_lsl1_sib(void) {
+  /* Q-OTTD-0r sibling: mov.w r8,r7,lsl#1 = ea4f 0847. */
+  static const uint16_t kProg[] = {0xEA4Fu, 0x0847u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xEA4Fu, 0x0847u, &di) != 0 || di.op != MANGO_OP_MOV || di.rd != 8 ||
+      di.rm != 7 || di.is_imm != 0 || di.sets_flags != 0 || di.shift_type != 0 ||
+      di.shift_amount != 1) {
+    fprintf(stderr,
+            "FAIL(t32_mov_w_reg_lsl1): decode op=%d rd=%u rm=%u is_imm=%d s=%d type=%u amt=%u "
+            "(want MOV r8,r7 LSL#1)\n",
+            di.op, di.rd, di.rm, di.is_imm, di.sets_flags, di.shift_type, di.shift_amount);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[7] = 5u;
+  cpu.r[8] = 0u;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+  if (rc != 0 || cpu.r[8] != 0xau || cpu.r[7] != 5u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_lsl1): rc=%d r8=0x%x r7=0x%x cpsr=0x%x\n", rc, cpu.r[8],
+            cpu.r[7], cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 MOV.W r8,r7,lsl#1 ea4f0847 (Q-OTTD-0r)\n");
+  return 0;
+}
+
+static int test_t32_mov_w_reg_reject(void) {
+  /* MOVS ea5f, ORR ea41, MVN-reg ea6f stay uncover; Rd/Rm=PC reject.
+   * ADD.W eb0e and BIC f026 still tip. */
+  MangoInsn di;
+  if (mango_decode_t32(0xEA5Fu, 0x7AD0u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_reject): MOVS ea5f7ad0 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xEA41u, 0x70D2u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_reject): ORR ea4170d2 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xEA6Fu, 0x70D1u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_reject): MVN-reg ea6f70d1 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* ea4f 0f00 = MOV.W pc,r0 — Rd=PC */
+  if (mango_decode_t32(0xEA4Fu, 0x0F00u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_reject): Rd=PC ea4f0f00 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* ea4f 000f = MOV.W r0,pc — Rm=PC */
+  if (mango_decode_t32(0xEA4Fu, 0x000Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_reject): Rm=PC ea4f000f decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* ADD.W eb0e 0080 still tip */
+  if (mango_decode_t32(0xEB0Eu, 0x0080u, &di) != 0 || di.op != MANGO_OP_ADD ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_reject): ADD eb0e0080 regress op=%d amt=%u\n", di.op,
+            di.shift_amount);
+    return 1;
+  }
+  /* BIC 0q still tip */
+  if (mango_decode_t32(0xF026u, 0x0603u, &di) != 0 || di.op != MANGO_OP_BIC) {
+    fprintf(stderr, "FAIL(t32_mov_w_reg_reject): BIC f0260603 regress op=%d\n", di.op);
+    return 1;
+  }
+  printf("ok: T32 MOV.W reg reject MOVS/ORR/MVN/PC; ADD+BIC ok (Q-OTTD-0r)\n");
+  return 0;
+}
+
 static int test_t32_ldrb_w_reg_lsl3(void) {
   /* Q-OTTD-0m: ldrb.w r0,[r11,r2,lsl#3] = f81b 0032.
    * R0 = ZeroExtend8(Mem[R11+(R2<<3)]); Rn/Rm unchanged; NZCV hold; pc+=4. */
@@ -6507,6 +6635,9 @@ int main(void) {
   failures += test_t32_bic_w_modimm_reject();
   failures += test_t32_add_w_reg_lsl2();
   failures += test_t32_add_w_reg_reject();
+  failures += test_t32_mov_w_reg_lsr31();
+  failures += test_t32_mov_w_reg_lsl1_sib();
+  failures += test_t32_mov_w_reg_reject();
   failures += test_t32_ldrb_w_reg_lsl3();
   failures += test_t32_ldrb_w_reg_imm2_0();
   failures += test_t32_ldr_w_imm8_post();

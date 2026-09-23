@@ -1750,6 +1750,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0r: MOV.W Rd,Rm{,shift} register — ORR with Rn=15, S=0.
+   * Primary ea4f 7ad0 = mov.w sl,r0,lsr#31; sib ea4f 0847 lsl#1.
+   * Require Rn==15 so ORR Rn≠15 (ea41…) stays uncover. Do NOT open
+   * MOVS (EA5F), ORR Rn≠15, or MVN-reg (EA6F). Reject Rd/Rm=PC.
+   * Shift fields identical to ADD.W reg 0l. */
+  if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) == 0 &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0e: ADD.W Rd,Rn,#<const> modified-imm (S=0). Guest f50d 5108 =
    * add.w r1,sp,#0x2200 (ThumbExpandImm(0xD08)=0x2200). Plain ADDW #0xD08 is
    * f60d 5108 (already handled). SP as Rn allowed; PC as Rd/Rn rejected. */
