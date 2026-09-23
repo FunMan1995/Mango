@@ -224,7 +224,8 @@
 #define MANGO_LIBC_TIME 140
 #define MANGO_LIBC_SDL_SET_VIDEO_MODE 141
 #define MANGO_LIBC_SDL_SET_COLOR_KEY 142
-#define MANGO_LIBC_COUNT 143
+#define MANGO_LIBC_DRAW_TEXT 143
+#define MANGO_LIBC_COUNT 144
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x4000000u
@@ -427,6 +428,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "time",
     "SDL_SetVideoMode",
     "SDL_SetColorKey",
+    "draw_text",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -471,7 +473,11 @@ enum { MANGO_PC_HIST_BUCKETS = 4096 };
 static uint32_t g_pc_hist[MANGO_PC_HIST_BUCKETS];
 static int g_meritous_progress_armed;
 static uint32_t g_meritous_bias;
+static MangoLoadedLibrary* g_meritous_lib;
 static uint32_t g_meritous_seen_mask; /* bit0 DungeonPlay, bit1 Generate, bit2 RandomGenerateMap */
+static uint8_t g_meritous_font[8192];
+static int g_meritous_font_ready;
+static uint32_t g_meritous_draw_text_calls;
 
 static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v);
 static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n);
@@ -1313,6 +1319,8 @@ static int mango_guest_format(MangoLoadedLibrary* lib, char* out, size_t out_sz,
   return (int)o;
 }
 
+static void mango_meritous_host_draw_text(MangoLoadedLibrary* lib, uint32_t x0, uint32_t y0,
+                                          uint32_t str_addr, uint32_t color);
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
@@ -2272,6 +2280,16 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_SDL_SET_PALETTE:
     case MANGO_LIBC_SDL_SET_COLORS: {
       cpu->r[0] = 1; /* success */
+      break;
+    }
+    case MANGO_LIBC_DRAW_TEXT: {
+      uint32_t color = cpu->r[3];
+      mango_meritous_host_draw_text(lib, r0, r1, r2, color);
+      if (g_meritous_draw_text_calls == 1u) {
+        const char* s = mango_guest_cstr(lib, r2);
+        fprintf(stderr, "mango: draw_text host first '%s' @(%u,%u)\n",
+                s ? s : "", (unsigned)r0, (unsigned)r1);
+      }
       break;
     }
     case MANGO_LIBC_SDL_SET_COLOR_KEY: {
@@ -3367,6 +3385,99 @@ static int mango_sdl_soft_fill(MangoLoadedLibrary* lib, uint32_t dst, uint32_t d
   return 0;
 }
 
+
+static void mango_meritous_host_draw_text(MangoLoadedLibrary* lib, uint32_t x0, uint32_t y0,
+                                          uint32_t str_addr, uint32_t color) {
+  static uint8_t raw[8192];
+  uint32_t surf = g_fb_surf;
+  uint32_t fmt, pix, w, h, pitch;
+  uint8_t bpp, ink;
+  const char* s;
+  int x, y, start_x;
+  if (!lib || !str_addr || !surf) {
+    return;
+  }
+  if (!mango_guest_range_ok(lib, surf, 60u)) {
+    return;
+  }
+  if (!g_meritous_font_ready) {
+    char host_path[768];
+    FILE* fp;
+    size_t n;
+    unsigned gi, b;
+    if (!mango_host_resolve_path(lib, "dat/d/font.dat", host_path, sizeof(host_path))) {
+      return;
+    }
+    fp = fopen(host_path, "rb");
+    if (!fp) {
+      return;
+    }
+    n = fread(raw, 1, sizeof(raw), fp);
+    fclose(fp);
+    if (n < 8192u) {
+      return;
+    }
+    memset(g_meritous_font, 0, sizeof(g_meritous_font));
+    for (gi = 0; gi < 256u; gi++) {
+      const uint8_t* src = raw + gi * 32u;
+      uint8_t* dst = g_meritous_font + gi * 64u;
+      for (b = 0; b < 32u; b++) {
+        dst[(b % 4u) * 8u + (b / 4u)] = src[b];
+      }
+    }
+    g_meritous_font_ready = 1;
+    fprintf(stderr, "mango: Meritous host font.dat loaded for draw_text\n");
+  }
+  fmt = mango_load_u32_guest(lib->guest_mem, surf + 4u);
+  w = mango_load_u32_guest(lib->guest_mem, surf + 8u);
+  h = mango_load_u32_guest(lib->guest_mem, surf + 12u);
+  pitch = (uint32_t)lib->guest_mem[surf + 16u] | ((uint32_t)lib->guest_mem[surf + 17u] << 8);
+  pix = mango_load_u32_guest(lib->guest_mem, surf + 20u);
+  if (!fmt || !pix || !mango_guest_range_ok(lib, fmt, 8u)) {
+    return;
+  }
+  bpp = lib->guest_mem[fmt + 5u];
+  if (bpp != 1u || w == 0u || h == 0u || pitch < w ||
+      !mango_guest_range_ok(lib, pix, pitch * h)) {
+    return;
+  }
+  s = mango_guest_cstr(lib, str_addr);
+  if (!s) {
+    return;
+  }
+  ink = (uint8_t)(color & 0xffu);
+  if (ink == 0) {
+    ink = 0xffu;
+  }
+  x = (int)x0;
+  y = (int)y0;
+  start_x = x;
+  for (; *s; s++) {
+    unsigned char ch = (unsigned char)*s;
+    int row, col;
+    const uint8_t* glyph;
+    if (ch == '\n') {
+      y += 10;
+      x = start_x;
+      continue;
+    }
+    if (x >= 0 && y >= 0 && (uint32_t)(x + 8) <= w && (uint32_t)(y + 8) <= h) {
+      glyph = g_meritous_font + ((unsigned)ch) * 64u;
+      for (row = 0; row < 8; row++) {
+        uint8_t* dst = lib->guest_mem + pix + (uint32_t)(y + row) * pitch + (uint32_t)x;
+        for (col = 0; col < 8; col++) {
+          uint8_t a = glyph[(unsigned)col * 8u + (unsigned)row];
+          if (a != 0xffu && a >= 0x40u) {
+            dst[col] = ink;
+          }
+        }
+      }
+    }
+    x += 8;
+  }
+  g_meritous_draw_text_calls++;
+}
+
 static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf) {
   uint32_t fmt, pix, w, h, pitch;
   uint8_t bpp;
@@ -3528,17 +3639,30 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 0u] = 0x70u;
     lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
   }
-  /* VideoUpdate left live: SDL_Flip dumps the painted frame after DrawPlayer. */
-  /* draw_text @ ELF VA 0x17f4c: title string blit is slow under interp. */
+  /* VideoUpdate left live: SDL_UpdateRect dumps the painted frame after DrawPlayer. */
+  /* draw_text @ ELF VA 0x17f4c → host soft glyphs (font.dat); guest draw_char is slow/empty. */
   addr = lib->load_bias + 0x17f4cu;
-  if (mango_guest_range_ok(lib, addr, 4u)) {
-    lib->guest_mem[addr + 0u] = 0x70u;
-    lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
+  if (mango_guest_range_ok(lib, addr, 8u)) {
+    mango_store_u32_guest(lib->guest_mem, addr, 0x46c04778u); /* bx pc; nop */
+    mango_write_jni_thunk(lib->guest_mem, addr + 4u, MANGO_LIBC_SVC_BASE + MANGO_LIBC_DRAW_TEXT);
+    fprintf(stderr, "mango: Meritous draw_text -> host soft glyphs\n");
+  }
+  /* DrawLevel full-screen clear can race HUD; keep status band y<32. */
+  addr = lib->load_bias + 0x1859cu;
+  if (mango_guest_range_ok(lib, addr, 2u)) {
+    lib->guest_mem[addr + 0u] = 0x20u;
+    lib->guest_mem[addr + 1u] = 0x21u; /* movs r1, #0x20 (y=32) */
+  }
+  addr = lib->load_bias + 0x18592u;
+  if (mango_guest_range_ok(lib, addr, 2u)) {
+    lib->guest_mem[addr + 0u] = 0xe0u;
+    lib->guest_mem[addr + 1u] = 0x23u; /* movs r3, #0xe0; <<1 => h=448 */
+    fprintf(stderr, "mango: Meritous DrawLevel clear preserves HUD y<32\n");
   }
 
   /* Gameplay draw path: tile walk + DrawCircle sqrt dominate after mapgen. */
   {
-    /* DrawLevel + DrawPlayer + DrawEntities live (host soft blit + colorkey).
+    /* DrawLevel + DrawPlayer + DrawEntities live; draw_text host-thunked.
      * Keep circle/shield/arc stubs (sqrt / heavy soft-draw). */
     static const uint32_t kBx[] = {
         0x18a90u, /* DrawCircle */
@@ -3556,7 +3680,7 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
         lib->guest_mem[addr + 1u] = 0x47u; /* bx lr */
       }
     }
-    fprintf(stderr, "mango: Meritous live DrawPlayer/Entities; stub circle/shield\n");
+    fprintf(stderr, "mango: Meritous live DrawPlayer/Entities; host draw_text; stub circle/shield\n");
   }
 
   /* Title loop HEAD: first visit -> New Game; after one DungeonPlay the progress
@@ -3636,6 +3760,7 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   g_meritous_progress_armed = 1;
   g_meritous_bias = lib->load_bias;
+  g_meritous_lib = lib;
   g_meritous_seen_mask = 0;
   setvbuf(stderr, NULL, _IONBF, 0);
 
