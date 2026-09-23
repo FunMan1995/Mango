@@ -2107,7 +2107,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0e-strd: T32 STRD imm T1 exact guest shape — P=1 U=1 W=0 L=0.
    * e9c1 8902 = strd r8,r9,[r1,#8] (Rn unchanged). Reuse MANGO_OP_STRD /
-   * A32 pair execute (rd even, rd+1). Not W=1 (e9e1), LDRD, or post-index. */
+   * A32 pair execute (rd even, rd+1). Not W=1 (e9e1) or post-index. */
   if ((hw1 & 0xFFF0u) == 0xE9C0u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
@@ -2120,6 +2120,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       return -1;
     }
     out->op = MANGO_OP_STRD;
+    out->rn = rn;
+    out->rd = rt;
+    out->is_imm = 1;
+    out->imm = imm8 << 2;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0n: T32 LDRD imm T1 exact guest shape — P=1 U=1 W=0 L=1.
+   * e9d1 2302 = ldrd r2,r3,[r1,#8] (Rn unchanged). Sib e9d4 2302 same mask.
+   * Reuse MANGO_OP_LDRD / A32 pair execute. Not W=1 (e9f1) or post-index. */
+  if ((hw1 & 0xFFF0u) == 0xE9D0u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rt2 = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    if ((rt & 1u) != 0 || rt2 != rt + 1u) {
+      return -1; /* even pair only — matches A32 LDRD execute */
+    }
+    if (rn == MANGO_REG_PC || rt == MANGO_REG_PC || rt2 == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDRD;
     out->rn = rn;
     out->rd = rt;
     out->is_imm = 1;
