@@ -2068,6 +2068,38 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0z: T32 STRB.W Rt,[Rn,#±imm8]!? T4 — size=00 L=0, bit11=1 P/U/W.
+   * Guest f804 3b01 = strb.w r3,[r4],#1 (P=0 U=1 W=1). Also SDL uncover
+   * f809 0c04 (P=1 U=0 W=0), pre WB f804 3f01, neg offset f804 3c01.
+   * Mirror 0s STR.W imm8 (F840); reuse MANGO_OP_STR with b=1. Execute already
+   * honors p/u/w + byte. Distinct from F880 STRB imm12 (bit7=1) and F810 LDRB
+   * reg (bit11=0). Reject STRBT (P=0 W=0) and Rt/Rn=PC. Hold LDRH.W WB / LDRB
+   * imm8 T4 this bite. */
+  if ((hw1 & 0xFFF0u) == 0xF800u && (hw2 & 0x0800u) != 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw2 >> 10) & 1u);
+    int u = (int)((hw2 >> 9) & 1u);
+    int w = (int)((hw2 >> 8) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* STRBT */
+    }
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_STR;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm8; /* byte offset, not shifted */
+    out->p = p;
+    out->u = u;
+    out->w = w;
+    out->b = 1;
+    return 0;
+  }
+
   /* Q-OTTD-0i / 0u: T32 STR.W Rt,[Rn,Rm,LSL#imm2] T2 — size=10 L=0,
    * hw2 bits[11:6]=0 (register form), any imm2 0..3 (like 0m LDRB.W).
    * Guest f842 b006 = str.w fp,[r2,r6] imm2=0; tip 0i f840 4025 LSL#2.
