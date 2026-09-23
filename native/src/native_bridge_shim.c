@@ -3570,9 +3570,9 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
 
   /* DungeonPlay left intact — title head branches to New Game at 0x1cf86. */
 
-  /* Generate() → 1000 rooms (boss index 999 exists). InitEnemies walk raised
-   * to 450 (500+ cliffs on a pathological place-loop under interp). Type-5
-   * n_enemies 50→2. Dist gate >20 (vanilla >49). */
+  /* Generate() → 1000 rooms. Dist gate >20. InitEnemies: skip rooms with
+   * cr_w/cr_h < 2 (empty/tiny → infinite place / bad idivmod), force
+   * n_enemies=1 on the common path, type-5 50→2 at even VA, walk →999. */
   addr = lib->load_bias + 0x1e61cu;
   if (mango_guest_range_ok(lib, addr, 4u)) {
     mango_store_u32_guest(lib->guest_mem, addr, 1000u);
@@ -3584,7 +3584,45 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 1u] = 0x29u; /* cmp r1, #0x14 */
     fprintf(stderr, "mango: Meritous Generate dist gate >49 -> >20\n");
   }
-    addr = lib->load_bias + 0x1345du;
+  /* Skip empty/tiny rooms then force n_enemies=1. Even Thumb; 0x1343a..0x1344f. */
+  addr = lib->load_bias + 0x1343au;
+  if (mango_guest_range_ok(lib, addr, 22u)) {
+    static const uint8_t kSkipTiny[] = {
+        0x02u, 0x3bu, /* subs r3, #2 */
+        0xb7u, 0x1eu, /* subs r7, r6, #2 */
+        0x02u, 0x2bu, /* cmp r3, #2 */
+        0x70u, 0xdbu, /* blt 0x13524 (next room) */
+        0x02u, 0x2fu, /* cmp r7, #2 */
+        0x6eu, 0xdbu, /* blt 0x13524 */
+        0x5fu, 0x43u, /* muls r7, r3, r7 */
+        0x01u, 0x21u, /* movs r1, #1 */
+        0x03u, 0x91u, /* str r1, [sp, #0xc] */
+        0x00u, 0x00u, /* movs r0, r0 (nop; interp lacks Thumb2 bf00) */
+        0x00u, 0x00u, /* movs r0, r0 */
+    };
+    for (unsigned i = 0; i < sizeof(kSkipTiny); i++) {
+      lib->guest_mem[addr + i] = kSkipTiny[i];
+    }
+    fprintf(stderr, "mango: Meritous InitEnemies skip cr_w/h<2 + n_enemies=1\n");
+  }
+  /* IsSolid fail -> next room (was retry place forever on solid rooms). */
+  {
+    static const struct { uint32_t off; uint8_t b0, b1; } kGive[] = {
+        {0x134c2u, 0x2fu, 0xd1u}, /* bne 0x13524 */
+        {0x134e0u, 0x20u, 0xd1u},
+        {0x134fcu, 0x12u, 0xd1u},
+        {0x1350cu, 0x0au, 0xd1u},
+    };
+    for (unsigned i = 0; i < sizeof(kGive) / sizeof(kGive[0]); i++) {
+      addr = lib->load_bias + kGive[i].off;
+      if (mango_guest_range_ok(lib, addr, 2u)) {
+        lib->guest_mem[addr + 0u] = kGive[i].b0;
+        lib->guest_mem[addr + 1u] = kGive[i].b1;
+      }
+    }
+    fprintf(stderr, "mango: Meritous InitEnemies IsSolid fail -> next room\n");
+  }
+  addr = lib->load_bias + 0x1345cu;
   if (mango_guest_range_ok(lib, addr, 2u)) {
     lib->guest_mem[addr + 0u] = 0x02u;
     lib->guest_mem[addr + 1u] = 0x23u; /* movs r3, #2 (was #50 type-5) */
@@ -3592,11 +3630,11 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
   }
   addr = lib->load_bias + 0x135c0u;
   if (mango_guest_range_ok(lib, addr, 4u)) {
-    mango_store_u32_guest(lib->guest_mem, addr, 450u * 0x34u);
-    fprintf(stderr, "mango: Meritous InitEnemies room loop ->450 (of 1000)\n");
+    mango_store_u32_guest(lib->guest_mem, addr, 999u * 0x34u);
+    fprintf(stderr, "mango: Meritous InitEnemies room loop ->999 (of 1000)\n");
   }
 
-g_meritous_progress_armed = 1;
+  g_meritous_progress_armed = 1;
   g_meritous_bias = lib->load_bias;
   g_meritous_seen_mask = 0;
   setvbuf(stderr, NULL, _IONBF, 0);
