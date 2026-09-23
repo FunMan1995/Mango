@@ -4151,6 +4151,216 @@ static int test_t32_str_w_reg_lsl2(void) {
   return 0;
 }
 
+static int test_t32_str_w_reg_imm2_0(void) {
+  /* Q-OTTD-0u: str.w fp,[r2,r6] = f842 b006 (imm2=0).
+   * Store r11 at r2+r6; Rn/Rm/Rt hold; NZCV hold; pc+=4 via bx lr.
+   * Keep tip 0i f840 4025 (imm2=2); optional lsl#1/#3 + sib f842 8006. */
+  static const uint16_t kProg[] = {0xF842u, 0xB006u, 0x4770u};
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF842u, 0xB006u, &di) != 0 || di.op != MANGO_OP_STR || di.rd != 11 ||
+      di.rn != 2 || di.rm != 6 || di.is_imm != 0 || di.shift_type != 0 || di.shift_amount != 0 ||
+      di.p != 1 || di.u != 1 || di.w != 0 || di.b != 0) {
+    fprintf(stderr,
+            "FAIL(t32_str_w_imm0): decode op=%d rd=%u rn=%u rm=%u imm=%d st=%u sh=%u p=%d u=%d "
+            "w=%d b=%d (want STR r11,[r2,r6] sh=0)\n",
+            di.op, di.rd, di.rn, di.rm, di.is_imm, di.shift_type, di.shift_amount, di.p, di.u,
+            di.w, di.b);
+    return 1;
+  }
+
+  /* tip 0i still tip */
+  if (mango_decode_t32(0xF840u, 0x4025u, &di) != 0 || di.op != MANGO_OP_STR || di.is_imm != 0 ||
+      di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_str_w_imm0): 0i f8404025 should still decode STR reg LSL#2\n");
+    return 1;
+  }
+
+  uint32_t base = 64u;
+  u32_to_bytes_le(mem_buf + base + 0, 0x10011111u);
+  u32_to_bytes_le(mem_buf + base + 4, 0xDEADBEEFu);
+  u32_to_bytes_le(mem_buf + base + 8, 0x30033333u);
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[2] = base;
+  cpu.r[6] = 4u;
+  cpu.r[11] = 0xb00bbbbbu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(t32_str_w_imm0): run rc=%d\n", rc);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + base + 4) != 0xb00bbbbbu) {
+    fprintf(stderr, "FAIL(t32_str_w_imm0): mem[r2+r6]=0x%x want 0xb00bbbbb\n",
+            bytes_to_u32_le(mem_buf + base + 4));
+    return 1;
+  }
+  if (cpu.r[2] != base || cpu.r[6] != 4u || cpu.r[11] != 0xb00bbbbbu) {
+    fprintf(stderr, "FAIL(t32_str_w_imm0): Rn/Rm/Rt mutated r2=0x%x r6=0x%x r11=0x%x\n",
+            cpu.r[2], cpu.r[6], cpu.r[11]);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + base + 0) != 0x10011111u ||
+      bytes_to_u32_le(mem_buf + base + 8) != 0x30033333u) {
+    fprintf(stderr, "FAIL(t32_str_w_imm0): adjacent slots mutated\n");
+    return 1;
+  }
+  if (cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_str_w_imm0): cpsr changed 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 STR.W fp,[r2,r6] imm2=0 no WB (Q-OTTD-0u)\n");
+  return 0;
+}
+
+static int test_t32_str_w_reg_imm2_contrasts(void) {
+  /* Optional same-arm: imm2=1/2/3 + sib f842 8006; 0s/0g imm8 still tip. */
+  MangoInsn di;
+  uint8_t mem_buf[128];
+  uint32_t base = 64u;
+
+  /* f842 b016 = str.w fp,[r2,r6,lsl#1] → store at base+(4<<1)=base+8 */
+  {
+    static const uint16_t kProg[] = {0xF842u, 0xB016u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF842u, 0xB016u, &di) != 0 || di.op != MANGO_OP_STR ||
+        di.shift_amount != 1) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): f842b016 want STR sh=1\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 8, 0xDEADBEEFu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[2] = base;
+    cpu.r[6] = 4u;
+    cpu.r[11] = 0xb11bbbbbu;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 ||
+        bytes_to_u32_le(mem_buf + base + 8) != 0xb11bbbbbu || cpu.r[2] != base) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): lsl#1 mem=0x%x r2=0x%x\n",
+              bytes_to_u32_le(mem_buf + base + 8), cpu.r[2]);
+      return 1;
+    }
+  }
+
+  /* f842 b026 = str.w fp,[r2,r6,lsl#2] → base+(4<<2)=base+16 */
+  {
+    static const uint16_t kProg[] = {0xF842u, 0xB026u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF842u, 0xB026u, &di) != 0 || di.op != MANGO_OP_STR ||
+        di.shift_amount != 2) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): f842b026 want STR sh=2\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 16, 0xDEADBEEFu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[2] = base;
+    cpu.r[6] = 4u;
+    cpu.r[11] = 0xb22bbbbbu;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 ||
+        bytes_to_u32_le(mem_buf + base + 16) != 0xb22bbbbbu || cpu.r[2] != base) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): lsl#2 mem=0x%x r2=0x%x\n",
+              bytes_to_u32_le(mem_buf + base + 16), cpu.r[2]);
+      return 1;
+    }
+  }
+
+  /* f842 b036 = str.w fp,[r2,r6,lsl#3] → base+(4<<3)=base+32 */
+  {
+    static const uint16_t kProg[] = {0xF842u, 0xB036u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF842u, 0xB036u, &di) != 0 || di.op != MANGO_OP_STR ||
+        di.shift_amount != 3) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): f842b036 want STR sh=3\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 32, 0xDEADBEEFu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[2] = base;
+    cpu.r[6] = 4u;
+    cpu.r[11] = 0xb33bbbbbu;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 ||
+        bytes_to_u32_le(mem_buf + base + 32) != 0xb33bbbbbu || cpu.r[2] != base) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): lsl#3 mem=0x%x r2=0x%x\n",
+              bytes_to_u32_le(mem_buf + base + 32), cpu.r[2]);
+      return 1;
+    }
+  }
+
+  /* f842 8006 = str.w r8,[r2,r6] sib imm2=0 */
+  {
+    static const uint16_t kProg[] = {0xF842u, 0x8006u, 0x4770u};
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    if (mango_decode_t32(0xF842u, 0x8006u, &di) != 0 || di.op != MANGO_OP_STR || di.rd != 8 ||
+        di.shift_amount != 0) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): f8428006 want STR r8 sh=0\n");
+      return 1;
+    }
+    u32_to_bytes_le(mem_buf + base + 4, 0xDEADBEEFu);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[2] = base;
+    cpu.r[6] = 4u;
+    cpu.r[8] = 0x80088888u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    if (mango_interp_run(&cpu, &mem, 0xABCDu, 100) != 0 ||
+        bytes_to_u32_le(mem_buf + base + 4) != 0x80088888u) {
+      fprintf(stderr, "FAIL(t32_str_w_contrast): sib mem=0x%x\n",
+              bytes_to_u32_le(mem_buf + base + 4));
+      return 1;
+    }
+  }
+
+  /* 0s/0g imm8 form still tip (bit11=1) */
+  if (mango_decode_t32(0xF840u, 0x1F0Cu, &di) != 0 || di.op != MANGO_OP_STR || di.is_imm != 1 ||
+      di.w != 1) {
+    fprintf(stderr, "FAIL(t32_str_w_contrast): 0s f8401f0c should still decode STR imm8 WB\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF849u, 0x6C3Cu, &di) != 0 || di.op != MANGO_OP_STR || di.is_imm != 1 ||
+      di.u != 0 || di.w != 0) {
+    fprintf(stderr, "FAIL(t32_str_w_contrast): 0g f8496c3c should still decode STR U=0\n");
+    return 1;
+  }
+
+  /* Do not open STRH.W-reg / LDR.W-reg LSL#2 this bite */
+  if (mango_decode_t32(0xF820u, 0x6012u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_str_w_contrast): STRH.W-reg f8206012 should uncover\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF855u, 0x5021u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_str_w_contrast): LDR.W-reg f8555021 should uncover\n");
+    return 1;
+  }
+
+  printf("ok: T32 STR.W reg imm2=1/2/3 + sib; 0s/0g tip (Q-OTTD-0u)\n");
+  return 0;
+}
+
 static int test_t32_pop_w_pc_thumb(void) {
   /* Q-OTTD-0i-pop: pop.w {r4-r8,pc} = e8bd 81f0. Thumb return (PC odd → T=1). */
   static const uint16_t kProg[] = {0xE8BDu, 0x81F0u};
@@ -4279,12 +4489,12 @@ static int test_t32_pop_w_pc_arm(void) {
 }
 
 static int test_t32_str_pop_pc_reject(void) {
-  /* Optional negatives: STR imm2=0; LR+PC UNPRED; footnote LDR post-index. */
+  /* Optional negatives: LR+PC UNPRED. STR imm2=0 cleared by Q-OTTD-0u. */
   MangoInsn di;
-  /* f840 4005 = str.w r4,[r0,r5] LSL#0 — exact-imm2=2 bite must uncover */
-  if (mango_decode_t32(0xF840u, 0x4005u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_str_pop_pc_reject): STR imm2=0 f8404005 decoded as op=%d sh=%u\n",
-            di.op, di.shift_amount);
+  /* f840 4005 = str.w r4,[r0,r5] LSL#0 — now tip via 0u widen */
+  if (mango_decode_t32(0xF840u, 0x4005u, &di) != 0 || di.op != MANGO_OP_STR ||
+      di.is_imm != 0 || di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_str_pop_pc_reject): STR imm2=0 f8404005 should decode STR sh=0\n");
     return 1;
   }
   /* e8bd c010 = ldmia sp!,{r4,lr,pc} — P=1 M=1 UNPRED */
@@ -4294,7 +4504,7 @@ static int test_t32_str_pop_pc_reject(void) {
     return 1;
   }
   /* f85d 4b04 post-index cleared by Q-OTTD-0m — no longer reject here */
-  printf("ok: T32 STR imm2=0 / POP LR+PC reject (Q-OTTD-0i)\n");
+  printf("ok: T32 STR imm2=0 tip / POP LR+PC reject (Q-OTTD-0u)\n");
   return 0;
 }
 
@@ -6919,6 +7129,8 @@ int main(void) {
   failures += test_t16_cbz_b369();
   failures += test_t16_cbnz_b978();
   failures += test_t32_str_w_reg_lsl2();
+  failures += test_t32_str_w_reg_imm2_0();
+  failures += test_t32_str_w_reg_imm2_contrasts();
   failures += test_t32_pop_w_pc_thumb();
   failures += test_t32_pop_w_pc_arm();
   failures += test_t32_str_pop_pc_reject();

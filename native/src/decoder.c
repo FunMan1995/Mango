@@ -2062,15 +2062,15 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0i: T32 STR.W Rt,[Rn,Rm,LSL#2] T2 exact guest — size=10 L=0,
-   * hw2 bits[11:6]=0 (register form), imm2=2 only. Guest f840 4025 =
-   * str.w r4,[r0,r5,lsl#2]. Distinct from 0g-str (bit11=1 imm8). Reject PC.
-   * Do not open STRB/STRH-reg or all imm2 this bite. */
-  if ((hw1 & 0xFFF0u) == 0xF840u && (hw2 & 0x0FC0u) == 0 &&
-      ((hw2 >> 4) & 3u) == 2u) {
+  /* Q-OTTD-0i / 0u: T32 STR.W Rt,[Rn,Rm,LSL#imm2] T2 — size=10 L=0,
+   * hw2 bits[11:6]=0 (register form), any imm2 0..3 (like 0m LDRB.W).
+   * Guest f842 b006 = str.w fp,[r2,r6] imm2=0; tip 0i f840 4025 LSL#2.
+   * Distinct from 0s/0g (bit11=1 imm8). Reject PC. Do not open STRB/STRH-reg. */
+  if ((hw1 & 0xFFF0u) == 0xF840u && (hw2 & 0x0FC0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
+    uint32_t imm2 = (hw2 >> 4) & 3u;
     if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
       return -1;
     }
@@ -2080,7 +2080,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rm = rm;
     out->is_imm = 0;
     out->shift_type = 0; /* LSL */
-    out->shift_amount = 2;
+    out->shift_amount = imm2;
     out->p = 1;
     out->u = 1;
     out->w = 0;
