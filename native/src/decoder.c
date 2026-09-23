@@ -1671,6 +1671,34 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+
+  /* Q-OTTD-0e: ADD.W Rd,Rn,#<const> modified-imm (S=0). Guest f50d 5108 =
+   * add.w r1,sp,#0x2200 (ThumbExpandImm(0xD08)=0x2200). Plain ADDW #0xD08 is
+   * f60d 5108 (already handled). SP as Rn allowed; PC as Rd/Rn rejected. */
+  if ((hw1 & 0xFBE0u) == 0xF100u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_ADD;
+    out->rd = rd;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->sets_flags = 0;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
+
   /* MOVW: 11110 i 100100 imm4 / 0 imm3 Rd imm8 */
   if ((hw1 & 0xFBF0u) == 0xF240u && (hw2 & 0x8000u) == 0) {
     uint32_t i = (hw1 >> 10) & 1u;
@@ -1824,6 +1852,32 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       default:
         return -1;
     }
+  }
+
+
+  /* Q-OTTD-0e-strd: T32 STRD imm T1 exact guest shape — P=1 U=1 W=0 L=0.
+   * e9c1 8902 = strd r8,r9,[r1,#8] (Rn unchanged). Reuse MANGO_OP_STRD /
+   * A32 pair execute (rd even, rd+1). Not W=1 (e9e1), LDRD, or post-index. */
+  if ((hw1 & 0xFFF0u) == 0xE9C0u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rt2 = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    if ((rt & 1u) != 0 || rt2 != rt + 1u) {
+      return -1; /* even pair only — matches A32 STRD execute */
+    }
+    if (rn == MANGO_REG_PC || rt == MANGO_REG_PC || rt2 == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_STRD;
+    out->rn = rn;
+    out->rd = rt;
+    out->is_imm = 1;
+    out->imm = imm8 << 2;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    return 0;
   }
 
   /* Q-OTTD-0a: T32 STMDB / PUSH.W SP! — hw1 E92D form, Rn=SP, W=1, P(hw2)=0.

@@ -3016,6 +3016,138 @@ static int test_t32_mov_w_modimm_reject_s1(void) {
   return 0;
 }
 
+
+static int test_t32_add_w_modimm_sp(void) {
+  /* Q-OTTD-0e: add.w r1,sp,#0x2200 = f50d 5108.
+   * ThumbExpandImm(0xD08)=0x2200 — NOT plain ADDW #0xD08 (that is f60d 5108). */
+  static const uint16_t kProg[] = {0xF50Du, 0x5108u, 0x4770u};
+  uint8_t mem_buf[0x4000];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF50Du, 0x5108u, &di) != 0 || di.op != MANGO_OP_ADD || di.rd != 1 ||
+      di.rn != MANGO_REG_SP || di.is_imm != 1 || di.sets_flags != 0 || di.imm != 0x2200u) {
+    fprintf(stderr, "FAIL(t32_add_w_sp): decode op=%d rd=%u rn=%u imm=0x%x (want 0x2200) s=%d\n",
+            di.op, di.rd, di.rn, di.imm, di.sets_flags);
+    return 1;
+  }
+  if (di.imm == 0xD08u) {
+    fprintf(stderr, "FAIL(t32_add_w_sp): treated as plain #0xD08 — must be ThumbExpandImm→0x2200\n");
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  uint32_t pre_sp = 0x3000u;
+  cpu.r[MANGO_REG_SP] = pre_sp;
+  cpu.r[1] = 0u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(t32_add_w_sp): run rc=%d\n", rc);
+    return 1;
+  }
+  if (cpu.r[1] != pre_sp + 0x2200u) {
+    fprintf(stderr, "FAIL(t32_add_w_sp): r1=0x%x want 0x%x (sp+0x2200, not +0xD08)\n", cpu.r[1],
+            pre_sp + 0x2200u);
+    return 1;
+  }
+  if (cpu.r[1] == pre_sp + 0xD08u) {
+    fprintf(stderr, "FAIL(t32_add_w_sp): R1 delta was +0xD08 — wrong encoding path\n");
+    return 1;
+  }
+  if (cpu.r[MANGO_REG_SP] != pre_sp) {
+    fprintf(stderr, "FAIL(t32_add_w_sp): sp changed 0x%x -> 0x%x\n", pre_sp, cpu.r[MANGO_REG_SP]);
+    return 1;
+  }
+  if (cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_add_w_sp): cpsr changed 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 ADD.W r1,sp,#0x2200 modified-imm (Q-OTTD-0e)\n");
+  return 0;
+}
+
+static int test_t32_strd_imm_offset(void) {
+  /* Q-OTTD-0e-strd: strd r8,r9,[r1,#8] = e9c1 8902. W=0 → Rn unchanged. */
+  static const uint16_t kProg[] = {0xE9C1u, 0x8902u, 0x4770u};
+  uint8_t mem_buf[128];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xE9C1u, 0x8902u, &di) != 0 || di.op != MANGO_OP_STRD || di.rd != 8 ||
+      di.rn != 1 || di.is_imm != 1 || di.imm != 8u || di.p != 1 || di.u != 1 || di.w != 0) {
+    fprintf(stderr,
+            "FAIL(t32_strd): decode op=%d rd=%u rn=%u imm=%u p=%d u=%d w=%d (want STRD r8,[r1,#8] "
+            "W=0)\n",
+            di.op, di.rd, di.rn, di.imm, di.p, di.u, di.w);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  uint32_t base = 64u;
+  cpu.r[1] = base;
+  cpu.r[8] = 0x80088888u;
+  cpu.r[9] = 0x90099999u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(t32_strd): run rc=%d\n", rc);
+    return 1;
+  }
+  if (cpu.r[1] != base) {
+    fprintf(stderr, "FAIL(t32_strd): r1 writeback 0x%x -> 0x%x (W=0 must leave Rn)\n", base,
+            cpu.r[1]);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + base + 0) != 0u || bytes_to_u32_le(mem_buf + base + 4) != 0u) {
+    fprintf(stderr, "FAIL(t32_strd): words at [r1+0]/[r1+4] should stay 0\n");
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + base + 8) != 0x80088888u ||
+      bytes_to_u32_le(mem_buf + base + 12) != 0x90099999u) {
+    fprintf(stderr, "FAIL(t32_strd): mem[r1+8]=0x%x mem[r1+12]=0x%x want r8/r9\n",
+            bytes_to_u32_le(mem_buf + base + 8), bytes_to_u32_le(mem_buf + base + 12));
+    return 1;
+  }
+  if (cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_strd): cpsr changed 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 STRD r8,r9,[r1,#8] W=0 (Q-OTTD-0e-strd)\n");
+  return 0;
+}
+
+static int test_t32_add_strd_reject(void) {
+  /* Optional negatives: S=1 ADD uncover; W=1 STRD e9e1 uncover; ADDW untouched. */
+  MangoInsn di;
+  if (mango_decode_t32(0xF11Du, 0x5108u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_add_strd_reject): S=1 ADD decoded as op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xE9E1u, 0x8902u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_add_strd_reject): W=1 STRD e9e1 decoded as op=%d w=%d\n", di.op,
+            di.w);
+    return 1;
+  }
+  /* Existing plain ADDW f60d 5108 must remain ADD with imm=0xD08, not 0x2200. */
+  if (mango_decode_t32(0xF60Du, 0x5108u, &di) != 0 || di.op != MANGO_OP_ADD ||
+      di.imm != 0xD08u) {
+    fprintf(stderr, "FAIL(t32_add_strd_reject): ADDW f60d5108 op=%d imm=0x%x want 0xD08\n", di.op,
+            di.imm);
+    return 1;
+  }
+  printf("ok: T32 ADD reject S=1; STRD reject W=1; ADDW #0xD08 untouched (Q-OTTD-0e)\n");
+  return 0;
+}
+
 static int test_thumb_bx_pc_veneer(void) {
   /* Thumb BX PC into ARM PLT-style veneer: dest is addr+4, not r15. */
   uint8_t mem_buf[32];
@@ -4297,6 +4429,9 @@ int main(void) {
   failures += test_t32_mov_w_modimm_25();
   failures += test_t32_sub_w_modimm_sp();
   failures += test_t32_mov_w_modimm_reject_s1();
+  failures += test_t32_add_w_modimm_sp();
+  failures += test_t32_strd_imm_offset();
+  failures += test_t32_add_strd_reject();
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
   failures += test_vldr_s_from_stack();
