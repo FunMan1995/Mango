@@ -3291,6 +3291,163 @@ static int test_t32_mvn_ldr_reject(void) {
   return 0;
 }
 
+
+static int test_t32_ldrsh_w_imm12(void) {
+  /* Q-OTTD-0g: ldrsh.w r11,[sp,#0x34] = f9bd b034.
+   * Signed halfword: mem16=0xc0de → r11=0xffffc0de; SP unchanged. */
+  static const uint16_t kProg[] = {0xF9BDu, 0xB034u, 0x4770u};
+  uint8_t mem_buf[256];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF9BDu, 0xB034u, &di) != 0 || di.op != MANGO_OP_LDRSH ||
+      di.rd != 11 || di.rn != MANGO_REG_SP || di.is_imm != 1 || di.imm != 0x34u ||
+      di.p != 1 || di.u != 1 || di.w != 0) {
+    fprintf(stderr,
+            "FAIL(t32_ldrsh_w): decode op=%d rd=%u rn=%u imm=0x%x p=%d u=%d w=%d "
+            "(want LDRSH r11,[sp,#0x34])\n",
+            di.op, di.rd, di.rn, di.imm, di.p, di.u, di.w);
+    return 1;
+  }
+
+  uint32_t sp = 64u;
+  /* mem16[sp+0x34]=0xc0de; wrong-slot mem16[sp+0]=0x1234 */
+  mem_buf[sp + 0x34] = 0xde;
+  mem_buf[sp + 0x35] = 0xc0;
+  mem_buf[sp + 0] = 0x34;
+  mem_buf[sp + 1] = 0x12;
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[MANGO_REG_SP] = sp;
+  cpu.r[11] = 0xffffffffu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(t32_ldrsh_w): run rc=%d\n", rc);
+    return 1;
+  }
+  if (cpu.r[11] != 0xffffc0deu) {
+    fprintf(stderr, "FAIL(t32_ldrsh_w): r11=0x%x want 0xffffc0de (sign-extend 0xc0de)\n",
+            cpu.r[11]);
+    return 1;
+  }
+  if (cpu.r[MANGO_REG_SP] != sp) {
+    fprintf(stderr, "FAIL(t32_ldrsh_w): sp writeback 0x%x -> 0x%x\n", sp, cpu.r[MANGO_REG_SP]);
+    return 1;
+  }
+  if (cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_ldrsh_w): cpsr changed 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  /* sibling decode: f9bd a020 = ldrsh.w r10,[sp,#0x20] */
+  if (mango_decode_t32(0xF9BDu, 0xA020u, &di) != 0 || di.op != MANGO_OP_LDRSH || di.rd != 10 ||
+      di.imm != 0x20u) {
+    fprintf(stderr, "FAIL(t32_ldrsh_w): sibling f9bda020 decode fail op=%d rd=%u imm=0x%x\n",
+            di.op, di.rd, di.imm);
+    return 1;
+  }
+  printf("ok: T32 LDRSH.W r11,[sp,#0x34] sign-extend (Q-OTTD-0g)\n");
+  return 0;
+}
+
+static int test_t32_str_w_imm8_neg(void) {
+  /* Q-OTTD-0g-str: str.w r6,[r9,#-0x3c] = f849 6c3c.
+   * U=0 → store at r9-0x3c; W=0 → r9 unchanged; mem[r9] untouched. */
+  static const uint16_t kProg[] = {0xF849u, 0x6C3Cu, 0x4770u};
+  uint8_t mem_buf[256];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF849u, 0x6C3Cu, &di) != 0 || di.op != MANGO_OP_STR || di.rd != 6 ||
+      di.rn != 9 || di.is_imm != 1 || di.imm != 0x3Cu || di.p != 1 || di.u != 0 || di.w != 0 ||
+      di.b != 0) {
+    fprintf(stderr,
+            "FAIL(t32_str_w_neg): decode op=%d rd=%u rn=%u imm=0x%x p=%d u=%d w=%d b=%d "
+            "(want STR r6,[r9,#-0x3c] U=0)\n",
+            di.op, di.rd, di.rn, di.imm, di.p, di.u, di.w, di.b);
+    return 1;
+  }
+  if (di.u != 0) {
+    fprintf(stderr, "FAIL(t32_str_w_neg): u=%d — guest is U=0 (negative offset), not U=1\n", di.u);
+    return 1;
+  }
+
+  uint32_t r9 = 0x80u; /* interior so r9-0x3c is in-bounds */
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[9] = r9;
+  cpu.r[6] = 0x60066666u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(t32_str_w_neg): run rc=%d\n", rc);
+    return 1;
+  }
+  uint32_t got_neg = bytes_to_u32_le(mem_buf + (r9 - 0x3Cu));
+  if (got_neg != 0x60066666u) {
+    fprintf(stderr, "FAIL(t32_str_w_neg): mem[r9-0x3c]=0x%x want 0x60066666\n", got_neg);
+    return 1;
+  }
+  if (cpu.r[9] != r9) {
+    fprintf(stderr, "FAIL(t32_str_w_neg): r9 writeback 0x%x -> 0x%x (W=0)\n", r9, cpu.r[9]);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + r9) != 0) {
+    fprintf(stderr, "FAIL(t32_str_w_neg): mem[r9]=0x%x want 0 (positive slot untouched)\n",
+            bytes_to_u32_le(mem_buf + r9));
+    return 1;
+  }
+  /* positive imm12 form must NOT be this arm — still F880 */
+  if (mango_decode_t32(0xF8C9u, 0x603Cu, &di) != 0 || di.op != MANGO_OP_STR || di.u != 1 ||
+      di.imm != 0x3Cu) {
+    fprintf(stderr, "FAIL(t32_str_w_neg): imm12 f8c9603c should decode as STR U=1 imm=0x3c\n");
+    return 1;
+  }
+  if (cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_str_w_neg): cpsr changed 0x%x -> 0x%x\n", cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 STR.W r6,[r9,#-0x3c] U=0 no WB (Q-OTTD-0g-str)\n");
+  return 0;
+}
+
+static int test_t32_ldrsh_str_reject(void) {
+  /* Optional negatives: STR W=1 / U=1 forms; footnote LDR imm8; LDRSH PC. */
+  MangoInsn di;
+  /* STR W=1 pre-index: f849 6f3c = str.w r6,[r9,#60]! — P=1 U=1 W=1 */
+  if (mango_decode_t32(0xF849u, 0x6F3Cu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrsh_str_reject): STR W=1 f8496f3c decoded as op=%d u=%d w=%d\n",
+            di.op, di.u, di.w);
+    return 1;
+  }
+  /* STR post-index: f849 6b3c = str.w r6,[r9],#60 — P=0 U=1 W=1 */
+  if (mango_decode_t32(0xF849u, 0x6B3Cu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrsh_str_reject): STR post f8496b3c decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* Footnote LDR imm8: f85d 4b04 — still uncover (0f reject + this bite exact mask) */
+  if (mango_decode_t32(0xF85Du, 0x4B04u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrsh_str_reject): LDR f85d4b04 decoded as op=%d\n", di.op);
+    return 1;
+  }
+  /* LDRSH Rt=PC */
+  if (mango_decode_t32(0xF9BDu, 0xF034u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrsh_str_reject): LDRSH Rt=PC decoded as op=%d\n", di.op);
+    return 1;
+  }
+  printf("ok: T32 LDRSH/STR reject W=1/post/footnote/PC (Q-OTTD-0g)\n");
+  return 0;
+}
+
 static int test_thumb_bx_pc_veneer(void) {
   /* Thumb BX PC into ARM PLT-style veneer: dest is addr+4, not r15. */
   uint8_t mem_buf[32];
@@ -4578,6 +4735,9 @@ int main(void) {
   failures += test_t32_mvn_w_modimm();
   failures += test_t32_ldr_w_reg();
   failures += test_t32_mvn_ldr_reject();
+  failures += test_t32_ldrsh_w_imm12();
+  failures += test_t32_str_w_imm8_neg();
+  failures += test_t32_ldrsh_str_reject();
   failures += test_thumb_bx_pc_veneer();
   failures += test_arm_add_pc();
   failures += test_vldr_s_from_stack();

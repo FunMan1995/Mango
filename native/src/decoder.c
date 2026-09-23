@@ -1856,6 +1856,50 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0g: T32 LDRSH.W Rt,[Rn,#imm12] T1 — F9B0 class (signed halfword).
+   * Guest f9bd b034 = ldrsh.w r11,[sp,#0x34]; sibling f9bd a020.
+   * Tip F880 covers unsigned LDRH (F8B0), not F9B0. Reject Rt/Rn=PC. */
+  if ((hw1 & 0xFFF0u) == 0xF9B0u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm12 = hw2 & 0xFFFu;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDRSH;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm12;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0g-str: T32 STR.W Rt,[Rn,#-imm8] T4 exact guest — P=1 U=0 W=0.
+   * Guest f849 6c3c = str.w r6,[r9,#-0x3c] (NOT +0x3c; that is imm12 f8c9 603c).
+   * Mask (hw2 & 0x0F00)==0x0C00 → bit11=1, P=1, U=0, W=0. Reject Rt/Rn=PC.
+   * Do not open full P/U/W matrix / footnote f85d 4b04 this bite. */
+  if ((hw1 & 0xFFF0u) == 0xF840u && (hw2 & 0x0F00u) == 0x0C00u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_STR;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm8; /* byte offset, not shifted */
+    out->p = 1;
+    out->u = 0;
+    out->w = 0;
+    out->b = 0;
+    return 0;
+  }
+
   /* LDR/STR/LDRB/STRB/LDRH/STRH imm12: 11111 000 1 size L Rn / Rt imm12.
    * Rn=15 + LDR is the literal form (U in bit 7). */
   if ((hw1 & 0xFF80u) == 0xF880u) {
