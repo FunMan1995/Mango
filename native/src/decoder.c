@@ -2246,6 +2246,29 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0o: T32 UXTH.W Rd,Rm{,ROR#} — Rn=15 no accumulate.
+   * Guest fa1f fa81 = uxth.w r10,r1 (rot=0); sib fa1f fa8a = uxth.w r10,r10.
+   * Encoding (hw2): 1111 | Rd | 10 | rotate | Rm — rot in bits[5:4];
+   * bits[7:6] fixed 10. imm=((hw2>>4)&3)*8 (execute already RORs).
+   * Map → XTEND u=1 b=1 rn=15. Do NOT open UXTB.W/SXTH.W/SXTB.W
+   * (FA5F/FA0F/FA4F) or accumulate Rn≠15 this bite. Reject Rd/Rm=PC. */
+  if (hw1 == 0xFA1Fu && (hw2 & 0xF0C0u) == 0xF080u) {
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_XTEND;
+    out->rd = rd;
+    out->rm = rm;
+    out->rn = 15u; /* no accumulate */
+    out->imm = ((hw2 >> 4) & 3u) * 8u;
+    out->u = 1;
+    out->b = 1; /* halfword */
+    out->sets_flags = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0j-ubfx: T32 UBFX — guest f3c1 070a (lsb=0, widthm1=10 → width 11).
    * Reuse MANGO_OP_UBFX (imm=lsb, rs=widthm1). Not SBFX/BFI/BFC this bite. */
   if ((hw1 & 0xFFF0u) == 0xF3C0u && (hw2 & 0x8000u) == 0) {
