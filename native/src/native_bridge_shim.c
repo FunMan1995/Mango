@@ -3773,8 +3773,8 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
   /* DungeonPlay left intact — title head branches to New Game at 0x1cf86. */
 
   /* Generate() → 3000 rooms (vanilla). Dist gate >20. InitEnemies: full
-   * walk →3000 with place give-up (skip cr_w/h<2, n_enemies=1,
-   * IsSolid-fail→next room), type-5 50→2 at even VA — ~2.7s drive. */
+   * walk →3000 with place give-up (skip cr_w/h<2, n_enemies=5,
+   * IsSolid-fail→next room), type-5 50→2 at even VA — stop 4m density. */
   addr = lib->load_bias + 0x1e61cu;
   if (mango_guest_range_ok(lib, addr, 4u)) {
     mango_store_u32_guest(lib->guest_mem, addr, 3000u);
@@ -3786,7 +3786,8 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     lib->guest_mem[addr + 1u] = 0x29u; /* cmp r1, #0x14 */
     fprintf(stderr, "mango: Meritous Generate dist gate >49 -> >20\n");
   }
-  /* Skip empty/tiny rooms then force n_enemies=1. Even Thumb; 0x1343a..0x1344f. */
+  /* Skip empty/tiny rooms then force n_enemies=5. Even Thumb; 0x1343a..0x1344f.
+   * Keep IsSolid give-up; do not denser/4 or NOP-fallthrough retries. */
   addr = lib->load_bias + 0x1343au;
   if (mango_guest_range_ok(lib, addr, 22u)) {
     static const uint8_t kSkipTiny[] = {
@@ -3797,7 +3798,7 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
         0x02u, 0x2fu, /* cmp r7, #2 */
         0x6eu, 0xdbu, /* blt 0x13524 */
         0x5fu, 0x43u, /* muls r7, r3, r7 */
-        0x01u, 0x21u, /* movs r1, #1 */
+        0x05u, 0x21u, /* movs r1, #5 (was #1; stop 4m density) */
         0x03u, 0x91u, /* str r1, [sp, #0xc] */
         0x00u, 0x00u, /* movs r0, r0 (nop; interp lacks Thumb2 bf00) */
         0x00u, 0x00u, /* movs r0, r0 */
@@ -3805,7 +3806,7 @@ static void mango_patch_meritous_skip_plasma(MangoLoadedLibrary* lib) {
     for (unsigned i = 0; i < sizeof(kSkipTiny); i++) {
       lib->guest_mem[addr + i] = kSkipTiny[i];
     }
-    fprintf(stderr, "mango: Meritous InitEnemies skip cr_w/h<2 + n_enemies=1\n");
+    fprintf(stderr, "mango: Meritous InitEnemies skip cr_w/h<2 + n_enemies=5\n");
   }
   /* IsSolid fail -> next room (was retry place forever on solid rooms). */
   {
