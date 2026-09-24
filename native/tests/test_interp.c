@@ -9024,6 +9024,153 @@ static int test_t32_ldrh_w_reg_lsl1(void) {
   return 0;
 }
 
+static int test_t32_adc_w_reg(void) {
+  /* Q-OTTD-0bz: adc.w r1, r3, r7 = eb43 0107 (llvm-mc [43,eb,07,01]).
+   * r1 = r3 + r7 + C. S=0 leaves NZCV alone. lsl #2 is eb43 0187. */
+  struct {
+    uint16_t hw2;
+    uint32_t r3, r7, extra, want, shift;
+  } cases[] = {
+      {0x0107u, 5u, 3u, MANGO_CPSR_N | MANGO_CPSR_Z, 8u, 0u},
+      {0x0107u, 5u, 3u, MANGO_CPSR_C, 9u, 0u},
+      {0x0107u, 0xffffffffu, 0u, MANGO_CPSR_C, 0u, 0u},
+      {0x0187u, 1u, 3u, 0u, 13u, 2u},
+      {0x0187u, 1u, 3u, MANGO_CPSR_C, 14u, 2u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    uint8_t mem_buf[32];
+    uint16_t prog[3] = {0xEB43u, cases[c].hw2, 0x4770u};
+    MangoInsn di;
+    load_halfwords(mem_buf, sizeof(mem_buf), prog, 3);
+    if (mango_decode_t32(0xEB43u, cases[c].hw2, &di) != 0 || di.op != MANGO_OP_ADC || di.rd != 1 ||
+        di.rn != 3 || di.rm != 7 || di.is_imm != 0 || di.sets_flags != 0 || di.shift_type != 0 ||
+        di.shift_amount != cases[c].shift || di.shift_by_reg != 0) {
+      fprintf(stderr, "FAIL(t32_adc_w_reg#%u): decode op=%d sh=%u flags=%d\n", c, di.op,
+              di.shift_amount, di.sets_flags);
+      return 1;
+    }
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | cases[c].extra;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[3] = cases[c].r3;
+    cpu.r[7] = cases[c].r7;
+    cpu.r[1] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[1] != cases[c].want || cpu.r[3] != cases[c].r3 || cpu.r[7] != cases[c].r7 ||
+        cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_adc_w_reg#%u): rc=%d r1=%x want %x cpsr=%x want %x\n", c, rc,
+              cpu.r[1], cases[c].want, cpu.cpsr, cpsr_before);
+      return 1;
+    }
+  }
+
+  MangoInsn di;
+  if (mango_decode_t32(0xEB0Eu, 0x0080u, &di) != 0 || di.op != MANGO_OP_ADD) {
+    fprintf(stderr, "FAIL(t32_adc_w_reg): ADD.W eb0e0080 should stay ADD\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xEB53u, 0x0107u, &di) == 0 || mango_decode_t32(0xEB43u, 0x0F07u, &di) == 0 ||
+      mango_decode_t32(0xEB4Fu, 0x0107u, &di) == 0 || mango_decode_t32(0xEB43u, 0x010Fu, &di) == 0 ||
+      mango_decode_t32(0xEB43u, 0x8107u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_adc_w_reg): ADCS, PC, or register shift should stay closed\n");
+    return 1;
+  }
+  printf("ok: T32 ADC.W r1, r3, r7 (Q-OTTD-0bz)\n");
+  return 0;
+}
+
+static int test_t32_adc_w_imm(void) {
+  /* Q-OTTD-0ca: adc r3, r3, #0 = f143 0300. S=0 keeps the adds flags.
+   * adc r3, r3, #0xffffffff = f143 33ff (ThumbExpandImm 0x3ff). */
+  static const uint16_t kInc[] = {0x3201u, 0xF143u, 0x0300u, 0x4770u};
+  static const uint16_t kDec[] = {0xF112u, 0x32FFu, 0xF143u, 0x33FFu, 0x4770u};
+  uint8_t mem_buf[32];
+  MangoInsn di;
+
+  if (mango_decode_t32(0xF143u, 0x0300u, &di) != 0 || di.op != MANGO_OP_ADC || di.rd != 3 ||
+      di.rn != 3 || di.is_imm != 1 || di.sets_flags != 0 || di.imm != 0u) {
+    fprintf(stderr, "FAIL(t32_adc_w_imm): f1430300 op=%d imm=%u flags=%d\n", di.op, di.imm,
+            di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xF143u, 0x33FFu, &di) != 0 || di.op != MANGO_OP_ADC || di.imm != 0xffffffffu) {
+    fprintf(stderr, "FAIL(t32_adc_w_imm): f14333ff imm=%x\n", di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xF145u, 0x0100u, &di) != 0 || di.op != MANGO_OP_ADC || di.rd != 1 ||
+      di.rn != 5 || di.imm != 0u) {
+    fprintf(stderr, "FAIL(t32_adc_w_imm): f1450100 rd=%u rn=%u\n", di.rd, di.rn);
+    return 1;
+  }
+
+  /* 64-bit increment: r3:r2 = 0x1ffffffff + 1 → 0x200000000. adds sets Z|C. */
+  load_halfwords(mem_buf, sizeof(mem_buf), kInc, 4);
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N;
+    cpu.r[2] = 0xffffffffu;
+    cpu.r[3] = 1u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[2] != 0u || cpu.r[3] != 2u || nzcv != (MANGO_CPSR_Z | MANGO_CPSR_C)) {
+      fprintf(stderr, "FAIL(t32_adc_w_imm): inc rc=%d r3=%x r2=%x nzcv=%x\n", rc, cpu.r[3],
+              cpu.r[2], nzcv);
+      return 1;
+    }
+  }
+
+  /* 64-bit decrement of 0x100000000 → 0xffffffff. adds of the low 0 sets N. */
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kDec, 5);
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C;
+    cpu.r[2] = 0u;
+    cpu.r[3] = 1u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[2] != 0xffffffffu || cpu.r[3] != 0u || nzcv != MANGO_CPSR_N) {
+      fprintf(stderr, "FAIL(t32_adc_w_imm): dec0 rc=%d r3=%x r2=%x nzcv=%x\n", rc, cpu.r[3],
+              cpu.r[2], nzcv);
+      return 1;
+    }
+  }
+  /* 5:0 - 1 = 4:0. The low adds sets C and leaves Z clear; adc must not touch it. */
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[2] = 5u;
+    cpu.r[3] = 0u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[2] != 4u || cpu.r[3] != 0u || nzcv != MANGO_CPSR_C) {
+      fprintf(stderr, "FAIL(t32_adc_w_imm): dec5 rc=%d r3=%x r2=%x nzcv=%x\n", rc, cpu.r[3],
+              cpu.r[2], nzcv);
+      return 1;
+    }
+  }
+
+  if (mango_decode_t32(0xF153u, 0x0300u, &di) == 0 || mango_decode_t32(0xF143u, 0x0F00u, &di) == 0 ||
+      mango_decode_t32(0xF14Fu, 0x0300u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_adc_w_imm): ADCS or PC should stay closed\n");
+    return 1;
+  }
+  printf("ok: T32 ADC.W r3, r3, #0 (Q-OTTD-0ca)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -11360,6 +11507,8 @@ int main(void) {
   failures += test_t32_cmp_w_reg_lsl2();
   failures += test_t32_subs_w_reg_lsl4();
   failures += test_t32_ldrh_w_reg_lsl1();
+  failures += test_t32_adc_w_reg();
+  failures += test_t32_adc_w_imm();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
