@@ -24,6 +24,8 @@
 #ifndef ANDROID
 #include <png.h>
 #endif
+/* Soft libz (gzopen/gzread/gzgetc/gzclose/gzerror) for guest zlib PLT imports. */
+#include <zlib.h>
 
 #include "mango/cpu.h"
 #include "mango/decoder.h"
@@ -256,7 +258,18 @@
 #define MANGO_LIBC_STRCASECMP 158
 #define MANGO_LIBC_STRNCASECMP 159
 #define MANGO_LIBC_LSEEK 160
-#define MANGO_LIBC_COUNT 161
+/* Soft zlib + DroidZebra Q0 follow-ups (research/61). */
+#define MANGO_LIBC_GZOPEN 161
+#define MANGO_LIBC_GZREAD 162
+#define MANGO_LIBC_GZCLOSE 163
+#define MANGO_LIBC_GZERROR 164
+#define MANGO_LIBC_GZGETC 165
+#define MANGO_LIBC_SETJMP 166
+#define MANGO_LIBC_LONGJMP 167
+#define MANGO_LIBC_VSPRINTF 168
+#define MANGO_LIBC_UNLINK 169
+#define MANGO_LIBC_STRNCPY 170
+#define MANGO_LIBC_COUNT 171
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -488,6 +501,16 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "strcasecmp",
     "strncasecmp",
     "lseek",
+    "gzopen",
+    "gzread",
+    "gzclose",
+    "gzerror",
+    "gzgetc",
+    "setjmp",
+    "longjmp",
+    "vsprintf",
+    "unlink",
+    "strncpy",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -741,6 +764,41 @@ static void mango_file_release(uint32_t id) {
   if (g_files[id]) {
     fclose(g_files[id]);
     g_files[id] = NULL;
+  }
+}
+
+/* Guest gzFile id → host zlib gzFile (DroidZebra book/coeffs; Gears fonts). */
+#define MANGO_GZ_MAX 32
+static gzFile g_gzfiles[MANGO_GZ_MAX];
+
+static gzFile mango_gz_get(uint32_t id) {
+  if (id == 0 || id >= MANGO_GZ_MAX) {
+    return NULL;
+  }
+  return g_gzfiles[id];
+}
+
+static uint32_t mango_gz_intern(gzFile gf) {
+  if (gf == NULL) {
+    return 0;
+  }
+  for (uint32_t i = 1; i < MANGO_GZ_MAX; i++) {
+    if (g_gzfiles[i] == NULL) {
+      g_gzfiles[i] = gf;
+      return i;
+    }
+  }
+  gzclose(gf);
+  return 0;
+}
+
+static void mango_gz_release(uint32_t id) {
+  if (id == 0 || id >= MANGO_GZ_MAX) {
+    return;
+  }
+  if (g_gzfiles[id]) {
+    gzclose(g_gzfiles[id]);
+    g_gzfiles[id] = NULL;
   }
 }
 
@@ -2813,6 +2871,23 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       }
       break;
     }
+    case MANGO_LIBC_STRNCPY: {
+      /* strncpy(dst, src, n) — DroidZebra zeGlobalInit files_dir copy. */
+      const char* src = mango_guest_cstr(lib, r1);
+      uint32_t n = r2;
+      if (r0 == 0 || !src || n == 0 || !mango_guest_range_ok(lib, r0, n)) {
+        cpu->r[0] = 0;
+      } else {
+        size_t sl = strlen(src);
+        size_t copy = sl < n ? sl : n;
+        memcpy(lib->guest_mem + r0, src, copy);
+        if (copy < n) {
+          memset(lib->guest_mem + r0 + copy, 0, n - copy);
+        }
+        cpu->r[0] = r0;
+      }
+      break;
+    }
     case MANGO_LIBC_MEMMEM: {
       if (!mango_guest_range_ok(lib, r0, r1) || !mango_guest_range_ok(lib, r2, cpu->r[3])) {
         cpu->r[0] = 0;
@@ -4138,6 +4213,175 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         mango_store_u32_guest(lib->guest_mem, r0, obj);
       }
       cpu->r[0] = 0; /* SL_RESULT_SUCCESS */
+      break;
+    }
+    /* Soft zlib — guest gzFile id via mango_gz_* intern table (research/61). */
+    case MANGO_LIBC_GZOPEN: {
+      const char* path = mango_guest_cstr(lib, r0);
+      const char* mode = mango_guest_cstr(lib, r1);
+      char host_path[768];
+      gzFile gf = NULL;
+      host_path[0] = 0;
+      if (!path) {
+        cpu->r[0] = 0;
+        break;
+      }
+      if (mango_host_resolve_path(lib, path, host_path, sizeof(host_path))) {
+        gf = gzopen(host_path, mode ? mode : "rb");
+      }
+      if (!gf) {
+        /* Absolute guest paths (e.g. /data/data/.../files/coeffs2.bin) as-is. */
+        gf = gzopen(path, mode ? mode : "rb");
+        if (gf) {
+          snprintf(host_path, sizeof(host_path), "%s", path);
+        }
+      }
+      cpu->r[0] = mango_gz_intern(gf);
+      {
+        size_t plen = path ? strlen(path) : 0;
+        fprintf(stderr,
+                "mango: soft gzopen %s id=%u guest_r0=0x%x path_len=%zu path=\"%s\" host=\"%s\" mode=\"%s\"\n",
+                cpu->r[0] ? "ok" : "FAIL", (unsigned)cpu->r[0], (unsigned)r0, plen,
+                path ? path : "(null)", host_path[0] ? host_path : "", mode ? mode : "");
+      }
+      break;
+    }
+    case MANGO_LIBC_GZREAD: {
+      gzFile gf = mango_gz_get(r0);
+      if (!gf || r2 == 0 || !mango_guest_range_ok(lib, r1, r2)) {
+        cpu->r[0] = (uint32_t)-1;
+      } else {
+        int n = gzread(gf, lib->guest_mem + r1, (unsigned)r2);
+        cpu->r[0] = (uint32_t)n;
+      }
+      break;
+    }
+    case MANGO_LIBC_GZGETC: {
+      /* int gzgetc(gzFile) — EOF/error → -1 (DroidZebra init_coeffs magic). */
+      gzFile gf = mango_gz_get(r0);
+      if (!gf) {
+        cpu->r[0] = (uint32_t)-1;
+      } else {
+        int c = gzgetc(gf);
+        cpu->r[0] = (uint32_t)c;
+      }
+      break;
+    }
+    case MANGO_LIBC_GZCLOSE: {
+      mango_gz_release(r0);
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_GZERROR: {
+      /* Minimal: write errnum if provided; return NULL string ptr. */
+      gzFile gf = mango_gz_get(r0);
+      if (r1 && mango_guest_range_ok(lib, r1, 4u)) {
+        int err = 0;
+        if (gf) {
+          (void)gzerror(gf, &err);
+        }
+        mango_store_u32_guest(lib->guest_mem, r1, (uint32_t)err);
+      }
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_SETJMP: {
+      /* Bionic ARM: stm {r4-r11, sp, lr} into jmp_buf (10 words). */
+      if (!mango_guest_range_ok(lib, r0, 40u)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      mango_store_u32_guest(lib->guest_mem, r0 + 0u, cpu->r[4]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 4u, cpu->r[5]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 8u, cpu->r[6]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 12u, cpu->r[7]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 16u, cpu->r[8]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 20u, cpu->r[9]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 24u, cpu->r[10]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 28u, cpu->r[11]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 32u, cpu->r[MANGO_REG_SP]);
+      mango_store_u32_guest(lib->guest_mem, r0 + 36u, cpu->r[MANGO_REG_LR]);
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_LONGJMP: {
+      /* Restore setjmp regs; r0 = val (or 1 if 0). Thunk bx lr → saved LR. */
+      uint32_t val = r1 ? r1 : 1u;
+      if (!mango_guest_range_ok(lib, r0, 40u)) {
+        cpu->r[MANGO_REG_LR] = MANGO_JNI_STOP;
+        cpu->r[0] = val;
+        break;
+      }
+      cpu->r[4] = mango_load_u32_guest(lib->guest_mem, r0 + 0u);
+      cpu->r[5] = mango_load_u32_guest(lib->guest_mem, r0 + 4u);
+      cpu->r[6] = mango_load_u32_guest(lib->guest_mem, r0 + 8u);
+      cpu->r[7] = mango_load_u32_guest(lib->guest_mem, r0 + 12u);
+      cpu->r[8] = mango_load_u32_guest(lib->guest_mem, r0 + 16u);
+      cpu->r[9] = mango_load_u32_guest(lib->guest_mem, r0 + 20u);
+      cpu->r[10] = mango_load_u32_guest(lib->guest_mem, r0 + 24u);
+      cpu->r[11] = mango_load_u32_guest(lib->guest_mem, r0 + 28u);
+      cpu->r[MANGO_REG_SP] = mango_load_u32_guest(lib->guest_mem, r0 + 32u);
+      cpu->r[MANGO_REG_LR] = mango_load_u32_guest(lib->guest_mem, r0 + 36u);
+      cpu->r[0] = val;
+      break;
+    }
+    case MANGO_LIBC_VSPRINTF: {
+      /* vsprintf(buf, fmt, ap) — ARM va_list is a guest pointer to args. */
+      const char* fmt = mango_guest_cstr(lib, r1);
+      if (!fmt || !mango_guest_range_ok(lib, r0, 1u)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      char tmp[512];
+      MangoGuestVA va;
+      va.lib = lib;
+      va.nregs = 0;
+      va.sp = r2;
+      int wrote = mango_guest_format(lib, tmp, sizeof(tmp), fmt, &va);
+      if (wrote < 0) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      size_t n = (size_t)wrote;
+      uint32_t max = lib->guest_mem_size - r0;
+      if (n >= max) {
+        n = max ? max - 1u : 0u;
+      }
+      if (n > 0) {
+        memcpy(lib->guest_mem + r0, tmp, n);
+      }
+      if (r0 < lib->guest_mem_size) {
+        lib->guest_mem[r0 + (uint32_t)n] = 0;
+      }
+      {
+        static int s_vsp;
+        if (s_vsp < 6) {
+          fprintf(stderr, "mango: vsprintf -> '%s'\n", tmp);
+          s_vsp++;
+        }
+      }
+      cpu->r[0] = (uint32_t)wrote;
+      break;
+    }
+    case MANGO_LIBC_UNLINK: {
+      const char* path = mango_guest_cstr(lib, r0);
+      char host[768];
+      int rc;
+      if (!path) {
+        mango_set_guest_errno(lib, EFAULT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (!mango_host_map_path(lib, path, host, sizeof(host))) {
+        mango_set_guest_errno(lib, ENOENT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      rc = unlink(host);
+      if (rc != 0) {
+        mango_set_guest_errno(lib, errno);
+      }
+      cpu->r[0] = (uint32_t)rc;
       break;
     }
     default:

@@ -36,7 +36,7 @@ add_executable(mango_native_bridge_shim_tests
   tests/test_native_bridge_shim.c
 )
 target_include_directories(mango_native_bridge_shim_tests PRIVATE tests/fake_jni)
-target_link_libraries(mango_native_bridge_shim_tests PRIVATE mango_core m)
+target_link_libraries(mango_native_bridge_shim_tests PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_native_bridge_shim_tests PRIVATE PNG::PNG)
 endif()
@@ -48,7 +48,7 @@ if(ANDROID)
   add_library(mango_translator SHARED
     src/native_bridge_shim.c
   )
-  target_link_libraries(mango_translator PRIVATE mango_core m log)
+  target_link_libraries(mango_translator PRIVATE mango_core m z log)
   target_include_directories(mango_translator PRIVATE include)
 endif()
 
@@ -59,7 +59,7 @@ add_executable(mango_host_unity_drive
   tests/host_unity_drive.c
 )
 target_include_directories(mango_host_unity_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_unity_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_unity_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_unity_drive PRIVATE PNG::PNG)
 endif()
@@ -71,7 +71,7 @@ add_executable(mango_host_meritous_drive
   tests/host_meritous_drive.c
 )
 target_include_directories(mango_host_meritous_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_meritous_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_meritous_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_meritous_drive PRIVATE PNG::PNG)
 endif()
@@ -83,7 +83,7 @@ add_executable(mango_host_openttd_drive
   tests/host_openttd_drive.c
 )
 target_include_directories(mango_host_openttd_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_openttd_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_openttd_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_openttd_drive PRIVATE PNG::PNG)
 endif()
@@ -95,7 +95,7 @@ add_executable(mango_host_tuxrider_drive
   tests/host_tuxrider_drive.c
 )
 target_include_directories(mango_host_tuxrider_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_tuxrider_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_tuxrider_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_tuxrider_drive PRIVATE PNG::PNG)
 endif()
@@ -107,7 +107,7 @@ add_executable(mango_host_liquidwars_drive
   tests/host_liquidwars_drive.c
 )
 target_include_directories(mango_host_liquidwars_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_liquidwars_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_liquidwars_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_liquidwars_drive PRIVATE PNG::PNG)
 endif()
@@ -120,7 +120,7 @@ add_executable(mango_host_pacman_drive
   tests/host_pacman_drive.c
 )
 target_include_directories(mango_host_pacman_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_pacman_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_pacman_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_pacman_drive PRIVATE PNG::PNG)
 endif()
@@ -133,7 +133,7 @@ add_executable(mango_host_hyperrogue_drive
   tests/host_hyperrogue_drive.c
 )
 target_include_directories(mango_host_hyperrogue_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_hyperrogue_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_hyperrogue_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_hyperrogue_drive PRIVATE PNG::PNG)
 endif()
@@ -146,7 +146,19 @@ add_executable(mango_host_prboom_drive
   tests/host_prboom_drive.c
 )
 target_include_directories(mango_host_prboom_drive PRIVATE tests/fake_jni)
-target_link_libraries(mango_host_prboom_drive PRIVATE mango_core m)
+target_link_libraries(mango_host_prboom_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_prboom_drive PRIVATE PNG::PNG)
+endif()
+
+# Host-only DroidZebra drive helper for Test Lab (not a ctest). Loads
+# armeabi libdroidzebra.so (explicit Java_* zeGlobalInit/zePlay; no JNI_OnLoad).
+add_executable(mango_host_droidzebra_drive
+  src/native_bridge_shim.c
+  tests/host_droidzebra_drive.c
+)
+target_include_directories(mango_host_droidzebra_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_droidzebra_drive PRIVATE mango_core m z)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_droidzebra_drive PRIVATE PNG::PNG)
 endif()
