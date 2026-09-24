@@ -5436,10 +5436,16 @@ static int test_t32_ldrd_imm_offset_sib(void) {
 }
 
 static int test_t32_ldrd_reject(void) {
-  /* Negatives: W=1 LDRD e9f1 uncover; STRD e9c1 still works. */
+  /* e9f1 2302 = ldrd r2,r3,[r1,#8]! is Q-OTTD-0ci. STRD e9c1 still works.
+   * Post-index and writeback into a loaded register stay closed. */
   MangoInsn di;
-  if (mango_decode_t32(0xE9F1u, 0x2302u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_ldrd_reject): W=1 LDRD e9f1 decoded as op=%d w=%d\n", di.op, di.w);
+  if (mango_decode_t32(0xE9F1u, 0x2302u, &di) != 0 || di.op != MANGO_OP_LDRD || di.w != 1 ||
+      di.p != 1 || di.u != 1 || di.imm != 8u || di.rd != 2 || di.rn != 1) {
+    fprintf(stderr, "FAIL(t32_ldrd_reject): W=1 e9f1 op=%d w=%d imm=%u\n", di.op, di.w, di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xE8F1u, 0x2302u, &di) == 0 || mango_decode_t32(0xE9F2u, 0x2302u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrd_reject): post-index or Rn-in-pair should stay closed\n");
     return 1;
   }
   if (mango_decode_t32(0xE9C1u, 0x8902u, &di) != 0 || di.op != MANGO_OP_STRD || di.rd != 8 ||
@@ -5448,7 +5454,7 @@ static int test_t32_ldrd_reject(void) {
             di.op, di.rd, di.rn, di.imm, di.w);
     return 1;
   }
-  printf("ok: T32 LDRD reject W=1 e9f1; STRD e9c1 still ok (Q-OTTD-0n)\n");
+  printf("ok: T32 LDRD W=1 e9f1; post-index closed; STRD e9c1 still ok (Q-OTTD-0ci)\n");
   return 0;
 }
 
@@ -9523,6 +9529,43 @@ static int test_t32_ldrd_neg16(void) {
   return 0;
 }
 
+static int test_t32_ldrd_pre_wb_256(void) {
+  /* Q-OTTD-0ci: ldrd r8, r9, [r5, #256]! = e9f5 8940
+   * (llvm-mc [f5,e9,40,89]). Load at r5+256, then r5 becomes that address. */
+  static const uint16_t kProg[] = {0xE9F5u, 0x8940u, 0x4770u};
+  uint8_t mem_buf[512];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xE9F5u, 0x8940u, &di) != 0 || di.op != MANGO_OP_LDRD || di.rd != 8 ||
+      di.rn != 5 || di.imm != 256u || di.p != 1 || di.u != 1 || di.w != 1) {
+    fprintf(stderr, "FAIL(t32_ldrd_wb): decode op=%d rd=%u imm=%u w=%d\n", di.op, di.rd, di.imm,
+            di.w);
+    return 1;
+  }
+  uint32_t base = 32u;
+  u32_to_bytes_le(mem_buf + base + 256u, 0x11111111u);
+  u32_to_bytes_le(mem_buf + base + 260u, 0x22222222u);
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[5] = base;
+  cpu.r[8] = 0xffffffffu;
+  cpu.r[9] = 0xffffffffu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[8] != 0x11111111u || cpu.r[9] != 0x22222222u || cpu.r[5] != base + 256u ||
+      cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_ldrd_wb): rc=%d r8=%x r9=%x r5=%x cpsr=%x\n", rc, cpu.r[8], cpu.r[9],
+            cpu.r[5], cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 LDRD r8, r9, [r5, #256]! (Q-OTTD-0ci)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -11873,6 +11916,7 @@ int main(void) {
   failures += test_t32_uxtab();
   failures += test_t32_adds_w_reg();
   failures += test_t32_ldrd_neg16();
+  failures += test_t32_ldrd_pre_wb_256();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
