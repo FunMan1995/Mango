@@ -1704,6 +1704,33 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0ao: EOR.W Rd,Rn,#<const> modified-imm (S=0).
+   * OpenTTD f083 0301 = eor.w r3,r3,#1 (llvm-mc). EORS (S=1) stays closed.
+   * Reject Rd/Rn=PC. */
+  if ((hw1 & 0xFBE0u) == 0xF080u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_EOR;
+    out->rd = rd;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->sets_flags = 0;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0d: SUB.W Rd,Rn,#<const> modified-imm (S=0). Guest f5ad 5d08 =
    * sub.w sp,sp,#0x2200 (ThumbExpandImm(0xD08)=0x2200). Plain SUBW #0xD08 is
    * f6ad 5d08 (already handled). SP as Rd/Rn allowed; PC rejected. */
