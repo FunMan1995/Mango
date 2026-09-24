@@ -255,7 +255,8 @@
 #define MANGO_LIBC_SL_CREATE_ENGINE 157
 #define MANGO_LIBC_STRCASECMP 158
 #define MANGO_LIBC_STRNCASECMP 159
-#define MANGO_LIBC_COUNT 160
+#define MANGO_LIBC_LSEEK 160
+#define MANGO_LIBC_COUNT 161
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -486,6 +487,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "slCreateEngine",
     "strcasecmp",
     "strncasecmp",
+    "lseek",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -509,9 +511,19 @@ static const char kCpuInfo[] =
 static const char kCpuList[] = "0-7\n";
 static const uint32_t kAuxv[] = {16u, (1u << 6) | (1u << 12) | (1u << 13) | (1u << 16) | (1u << 17),
                                  0u, 0u};
-static const char* g_fake_data;
-static uint32_t g_fake_len;
-static uint32_t g_fake_off;
+/* PrBoom Q1 (research/56): guest POSIX fd table. Soft open used to be
+ * cpuinfo/auxv-only (guest fd 100); real wad paths got r0=-1 so lumpinfo
+ * stayed NULL. Map guest fd (BASE+slot) → fake buffer OR host int fd. */
+enum { MANGO_GFD_MAX = 64, MANGO_GFD_BASE = 100 };
+enum { MANGO_GFD_FREE = 0, MANGO_GFD_FAKE = 1, MANGO_GFD_HOST = 2 };
+typedef struct {
+  int kind;
+  int host_fd;
+  const char* fake_data;
+  uint32_t fake_len;
+  uint32_t fake_off;
+} MangoGfd;
+static MangoGfd g_gfd[MANGO_GFD_MAX];
 static uint64_t g_sdl_ticks_start_ms;
 static uint32_t g_fb_surf;
 static MangoLoadedLibrary* g_fb_lib;
@@ -730,6 +742,40 @@ static void mango_file_release(uint32_t id) {
     fclose(g_files[id]);
     g_files[id] = NULL;
   }
+}
+
+static MangoGfd* mango_gfd_lookup(uint32_t guest_fd) {
+  if (guest_fd < (uint32_t)MANGO_GFD_BASE) {
+    return NULL;
+  }
+  uint32_t i = guest_fd - (uint32_t)MANGO_GFD_BASE;
+  if (i >= (uint32_t)MANGO_GFD_MAX || g_gfd[i].kind == MANGO_GFD_FREE) {
+    return NULL;
+  }
+  return &g_gfd[i];
+}
+
+static uint32_t mango_gfd_alloc(void) {
+  for (uint32_t i = 0; i < (uint32_t)MANGO_GFD_MAX; i++) {
+    if (g_gfd[i].kind == MANGO_GFD_FREE) {
+      return (uint32_t)MANGO_GFD_BASE + i;
+    }
+  }
+  return (uint32_t)-1;
+}
+
+static void mango_gfd_clear(MangoGfd* s) {
+  if (!s) {
+    return;
+  }
+  if (s->kind == MANGO_GFD_HOST && s->host_fd >= 0) {
+    close(s->host_fd);
+  }
+  s->kind = MANGO_GFD_FREE;
+  s->host_fd = -1;
+  s->fake_data = NULL;
+  s->fake_len = 0;
+  s->fake_off = 0;
 }
 
 /* Android AAsset* backed by $MANGO_ASSET_ROOT (Pacman Q0 research/47). Guest
@@ -1512,6 +1558,14 @@ static FILE* mango_host_fopen(MangoLoadedLibrary* lib, const char* path, const c
       return fp;
     }
   }
+  root = getenv("MANGO_PRBOOM_DATA");
+  if (root && root[0]) {
+    snprintf(cand, sizeof(cand), "%s/%s", root, path);
+    fp = fopen(cand, mode);
+    if (fp) {
+      return fp;
+    }
+  }
   return NULL;
 }
 
@@ -1546,6 +1600,15 @@ static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path,
       return 1;
     }
   }
+  /* PrBoom Q1: drive sets ASSET_ROOT from PRBOOM_DATA; still honor PRBOOM_DATA
+   * alone so soft open finds IWAD/prboom.wad if only that env is set. */
+  root = getenv("MANGO_PRBOOM_DATA");
+  if (root && root[0]) {
+    snprintf(out, outsz, "%s/%s", root, path);
+    if (access(out, R_OK) == 0) {
+      return 1;
+    }
+  }
   return 0;
 }
 
@@ -1574,6 +1637,13 @@ static int mango_host_map_path(MangoLoadedLibrary* lib, const char* path, char* 
     }
   }
   root = getenv("MANGO_ASSET_ROOT");
+  if (root && root[0]) {
+    snprintf(out, outsz, "%s/%s", root, path);
+    if (access(out, F_OK) == 0) {
+      return 1;
+    }
+  }
+  root = getenv("MANGO_PRBOOM_DATA");
   if (root && root[0]) {
     snprintf(out, outsz, "%s/%s", root, path);
     if (access(out, F_OK) == 0) {
@@ -2927,46 +2997,169 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_PTHREAD_CREATE:
       cpu->r[0] = 11; /* EAGAIN: do not start a guest thread */
       break;
+    /* PrBoom Q1 (research/56): real soft open/read/close/lseek via guest fd
+     * table. Keep cpuinfo/present/possible/auxv fake specials on same hook. */
     case MANGO_LIBC_OPEN: {
       const char* path = mango_guest_cstr(lib, r0);
-      g_fake_data = NULL;
-      g_fake_len = 0;
-      g_fake_off = 0;
-      if (path && strstr(path, "cpuinfo") != NULL) {
-        g_fake_data = kCpuInfo;
-        g_fake_len = (uint32_t)sizeof(kCpuInfo) - 1u;
-      } else if (path && (strstr(path, "cpu/present") != NULL || strstr(path, "cpu/possible") != NULL)) {
-        g_fake_data = kCpuList;
-        g_fake_len = (uint32_t)sizeof(kCpuList) - 1u;
-      } else if (path && strstr(path, "auxv") != NULL) {
-        g_fake_data = (const char*)kAuxv;
-        g_fake_len = (uint32_t)sizeof(kAuxv);
+      int flags = (int)r1;
+      uint32_t gfd;
+      MangoGfd* slot;
+      const char* fake = NULL;
+      uint32_t fake_len = 0;
+      char host_path[768];
+      int hfd;
+      if (!path) {
+        mango_set_guest_errno(lib, EFAULT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
       }
-      cpu->r[0] = g_fake_data ? 100u : (uint32_t)-1;
+      if (strstr(path, "cpuinfo") != NULL) {
+        fake = kCpuInfo;
+        fake_len = (uint32_t)sizeof(kCpuInfo) - 1u;
+      } else if (strstr(path, "cpu/present") != NULL || strstr(path, "cpu/possible") != NULL) {
+        fake = kCpuList;
+        fake_len = (uint32_t)sizeof(kCpuList) - 1u;
+      } else if (strstr(path, "auxv") != NULL) {
+        fake = (const char*)kAuxv;
+        fake_len = (uint32_t)sizeof(kAuxv);
+      }
+      gfd = mango_gfd_alloc();
+      if (gfd == (uint32_t)-1) {
+        mango_set_guest_errno(lib, EMFILE);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      slot = &g_gfd[gfd - (uint32_t)MANGO_GFD_BASE];
+      if (fake) {
+        slot->kind = MANGO_GFD_FAKE;
+        slot->host_fd = -1;
+        slot->fake_data = fake;
+        slot->fake_len = fake_len;
+        slot->fake_off = 0;
+        cpu->r[0] = gfd;
+        break;
+      }
+      if (!mango_host_resolve_path(lib, path, host_path, sizeof(host_path))) {
+        /* Unresolved: still try as-is so absolute paths / relative cwd work. */
+        snprintf(host_path, sizeof(host_path), "%s", path);
+      }
+      if (flags & O_CREAT) {
+        hfd = open(host_path, flags, (mode_t)r2);
+      } else {
+        hfd = open(host_path, flags);
+      }
+      if (hfd < 0) {
+        mango_set_guest_errno(lib, errno);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      slot->kind = MANGO_GFD_HOST;
+      slot->host_fd = hfd;
+      slot->fake_data = NULL;
+      slot->fake_len = 0;
+      slot->fake_off = 0;
+      if (strstr(path, "freedoom") != NULL || strstr(path, "prboom.wad") != NULL ||
+          strstr(host_path, "freedoom") != NULL || strstr(host_path, "prboom.wad") != NULL) {
+        fprintf(stderr, "mango: soft open ok guest_fd=%u path=%s host=%s\n", (unsigned)gfd,
+                path, host_path);
+      }
+      cpu->r[0] = gfd;
       break;
     }
-    case MANGO_LIBC_READ:
-      if (r0 == 100 && g_fake_data != NULL) {
-        if (g_fake_off >= g_fake_len) {
+    case MANGO_LIBC_READ: {
+      MangoGfd* slot = mango_gfd_lookup(r0);
+      if (!slot) {
+        mango_set_guest_errno(lib, EBADF);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (r2 != 0 && !mango_guest_range_ok(lib, r1, r2)) {
+        mango_set_guest_errno(lib, EFAULT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (slot->kind == MANGO_GFD_FAKE) {
+        if (slot->fake_off >= slot->fake_len || r2 == 0) {
           cpu->r[0] = 0;
-        } else if (!mango_guest_range_ok(lib, r1, r2)) {
-          cpu->r[0] = (uint32_t)-1;
         } else {
-          uint32_t n = g_fake_len - g_fake_off;
+          uint32_t n = slot->fake_len - slot->fake_off;
           if (n > r2) {
             n = r2;
           }
-          memcpy(lib->guest_mem + r1, g_fake_data + g_fake_off, n);
-          g_fake_off += n;
+          memcpy(lib->guest_mem + r1, slot->fake_data + slot->fake_off, n);
+          slot->fake_off += n;
           cpu->r[0] = n;
         }
+      } else if (slot->kind == MANGO_GFD_HOST) {
+        ssize_t n = read(slot->host_fd, lib->guest_mem + r1, (size_t)r2);
+        if (n < 0) {
+          mango_set_guest_errno(lib, errno);
+          cpu->r[0] = (uint32_t)-1;
+        } else {
+          cpu->r[0] = (uint32_t)n;
+        }
       } else {
+        mango_set_guest_errno(lib, EBADF);
         cpu->r[0] = (uint32_t)-1;
       }
       break;
-    case MANGO_LIBC_CLOSE:
+    }
+    case MANGO_LIBC_CLOSE: {
+      MangoGfd* slot = mango_gfd_lookup(r0);
+      if (!slot) {
+        /* Tolerate close of unknown fd (old stub always returned 0). */
+        cpu->r[0] = 0;
+        break;
+      }
+      mango_gfd_clear(slot);
       cpu->r[0] = 0;
       break;
+    }
+    case MANGO_LIBC_LSEEK: {
+      MangoGfd* slot = mango_gfd_lookup(r0);
+      int32_t off = (int32_t)r1;
+      int whence = (int)r2;
+      if (!slot) {
+        mango_set_guest_errno(lib, EBADF);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (slot->kind == MANGO_GFD_FAKE) {
+        int64_t base;
+        int64_t neu;
+        if (whence == SEEK_SET) {
+          base = 0;
+        } else if (whence == SEEK_CUR) {
+          base = (int64_t)slot->fake_off;
+        } else if (whence == SEEK_END) {
+          base = (int64_t)slot->fake_len;
+        } else {
+          mango_set_guest_errno(lib, EINVAL);
+          cpu->r[0] = (uint32_t)-1;
+          break;
+        }
+        neu = base + (int64_t)off;
+        if (neu < 0 || neu > (int64_t)slot->fake_len) {
+          mango_set_guest_errno(lib, EINVAL);
+          cpu->r[0] = (uint32_t)-1;
+          break;
+        }
+        slot->fake_off = (uint32_t)neu;
+        cpu->r[0] = (uint32_t)neu;
+      } else if (slot->kind == MANGO_GFD_HOST) {
+        off_t neu = lseek(slot->host_fd, (off_t)off, whence);
+        if (neu == (off_t)-1) {
+          mango_set_guest_errno(lib, errno);
+          cpu->r[0] = (uint32_t)-1;
+        } else {
+          cpu->r[0] = (uint32_t)neu;
+        }
+      } else {
+        mango_set_guest_errno(lib, EBADF);
+        cpu->r[0] = (uint32_t)-1;
+      }
+      break;
+    }
     case MANGO_LIBC_WRITE:
       /* Discard sink: report full count so write-all loops advance. Unresolved
        * write used to hit the mov-r0-#0 stub and spin forever (libmono). */
