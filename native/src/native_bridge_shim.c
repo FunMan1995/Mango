@@ -291,7 +291,10 @@
 #define MANGO_LIBC_STRTOUL 180
 /* IniLoadFile reads obg/cfg lines with fgets. A zero stub skips every line. */
 #define MANGO_LIBC_FGETS 181
-#define MANGO_LIBC_COUNT 182
+/* SDL_SetError copies the format with strlcpy. A zero stub left the key
+ * empty, so __android_log_print showed "ERROR: " and the guest exited. */
+#define MANGO_LIBC_STRLCPY 182
+#define MANGO_LIBC_COUNT 183
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -546,6 +549,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "strstr",
     "strtoul",
     "fgets",
+    "strlcpy",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -3292,6 +3296,29 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         break;
       }
       cpu->r[0] = fgets((char*)(lib->guest_mem + r0), n, fp) != NULL ? r0 : 0;
+      break;
+    }
+    case MANGO_LIBC_STRLCPY: {
+      /* strlcpy(dst, src, size). Copies at most size-1 bytes, always
+       * writes a NUL when size > 0, and returns strlen(src). */
+      const char* src = mango_guest_cstr(lib, r1);
+      uint32_t n = r2;
+      size_t sl;
+      if (r0 == 0 || src == NULL) {
+        cpu->r[0] = 0;
+        break;
+      }
+      sl = strlen(src);
+      if (n > 0) {
+        size_t copy = sl < (size_t)(n - 1u) ? sl : (size_t)(n - 1u);
+        if (!mango_guest_range_ok(lib, r0, (uint32_t)copy + 1u)) {
+          cpu->r[0] = 0;
+          break;
+        }
+        memcpy(lib->guest_mem + r0, src, copy);
+        lib->guest_mem[r0 + copy] = 0;
+      }
+      cpu->r[0] = (uint32_t)sl;
       break;
     }
     case MANGO_LIBC_DLOPEN: {
