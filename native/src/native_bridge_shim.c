@@ -289,7 +289,9 @@
 #define MANGO_LIBC_STRSTR 179
 /* Tar header sizes are ASCII octal. A zero stub made every file length 0. */
 #define MANGO_LIBC_STRTOUL 180
-#define MANGO_LIBC_COUNT 181
+/* IniLoadFile reads obg/cfg lines with fgets. A zero stub skips every line. */
+#define MANGO_LIBC_FGETS 181
+#define MANGO_LIBC_COUNT 182
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -543,6 +545,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "strrchr",
     "strstr",
     "strtoul",
+    "fgets",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -3278,6 +3281,17 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         mango_store_u32_guest(lib->guest_mem, r1, gend);
       }
       cpu->r[0] = (uint32_t)v;
+      break;
+    }
+    case MANGO_LIBC_FGETS: {
+      /* fgets(buf, size, fp) — r0, r1, r2. Returns the buffer, or NULL. */
+      FILE* fp = mango_file_get(r2);
+      int n = (int)r1;
+      if (fp == NULL || n <= 1 || !mango_guest_range_ok(lib, r0, (uint32_t)n)) {
+        cpu->r[0] = 0;
+        break;
+      }
+      cpu->r[0] = fgets((char*)(lib->guest_mem + r0), n, fp) != NULL ? r0 : 0;
       break;
     }
     case MANGO_LIBC_DLOPEN: {
