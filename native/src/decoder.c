@@ -2024,25 +2024,36 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0m-ldr: T32 LDR.W Rt,[Rn],#imm8 T4 exact guest — P=0 U=1 W=1 post-index.
-   * Guest f855 2b04 = ldr.w r2,[r5],#4; footnote f85d 4b04 = ldr.w r4,[sp],#4.
-   * Mask (hw2 & 0x0F00)==0x0B00 → bit11=1, P=0, U=1, W=1. Mutually exclusive with
-   * 0f (bits[11:6]==0). Reject Rt/Rn=PC. Do not open full P/U/W / reg imm2!=0. */
-  if ((hw1 & 0xFFF0u) == 0xF850u && (hw2 & 0x0F00u) == 0x0B00u) {
+  /* Q-OTTD-0m-ldr / 0ag: T32 LDR.W Rt,[Rn,#±imm8]!? T4 — bit11=1 full P/U/W.
+   * Post (0m) f855 2b04 = ldr.w r2,[r5],#4 and f85d 4b04 = ldr.w r4,[sp],#4.
+   * Pre (0ag) OpenTTD f85a 3f04 = ldr.w r3,[r10,#4]! (P=1 U=1 W=1). Also
+   * covers U=0 no-WB. Mirror 0s STR.W imm8 (F840). Mutually exclusive with
+   * 0f reg form (bits[11:6]==0). Reject LDRT (P=0 W=0), Rt/Rn=PC, and
+   * writeback into Rt. */
+  if ((hw1 & 0xFFF0u) == 0xF850u && (hw2 & 0x0800u) != 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
     uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw2 >> 10) & 1u);
+    int u = (int)((hw2 >> 9) & 1u);
+    int w = (int)((hw2 >> 8) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* LDRT */
+    }
     if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
       return -1;
+    }
+    if (w && rt == rn) {
+      return -1; /* WB into Rt UNPRED */
     }
     out->op = MANGO_OP_LDR;
     out->rd = rt;
     out->rn = rn;
     out->is_imm = 1;
     out->imm = imm8;
-    out->p = 0;
-    out->u = 1;
-    out->w = 1;
+    out->p = p;
+    out->u = u;
+    out->w = w;
     out->b = 0;
     return 0;
   }
@@ -2589,6 +2600,26 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rn = rn;
     out->imm = lsb;
     out->rs = widthm1;
+    return 0;
+  }
+
+  /* Q-OTTD-0af: T32 CLZ Rd,Rm (DDI0597). OpenTTD SDL_main stop
+   * pc=0x26f430 word 0xf080fab0 = clz r0,r0 (llvm-mc [0xb0,0xfa,0x80,0xf0]).
+   * hw1 1111 1010 1011 Rm, hw2 1111 Rd 1000 Rm. Both Rm fields must match.
+   * Reuse MANGO_OP_CLZ (flags untouched). Reject Rd/Rm=PC. Not REV/RBIT
+   * (those are FA9x). */
+  if ((hw1 & 0xFFF0u) == 0xFAB0u && (hw2 & 0xF0F0u) == 0xF080u) {
+    uint32_t rm = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    if ((hw2 & 0xFu) != rm) {
+      return -1; /* Rm copies disagree: UNPREDICTABLE */
+    }
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_CLZ;
+    out->rd = rd;
+    out->rm = rm;
     return 0;
   }
 
