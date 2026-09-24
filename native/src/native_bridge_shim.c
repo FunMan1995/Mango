@@ -4268,7 +4268,15 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     }
     case MANGO_LIBC_SDL_SET_VIDEO_MODE: {
       uint32_t w = r0, h = r1, bpp = r2;
+      uint32_t req_bpp = bpp;
       uint32_t surf;
+      /* OpenTTD calls SDL_SetVideoMode(0, 0, 32) while the Android window
+       * size is still 0. The host drive has no Java window. 640x480 is the
+       * desktop default and lets CreateMainSurface continue. */
+      if (w == 0u && h == 0u) {
+        w = 640u;
+        h = 480u;
+      }
       if (bpp != 8u && bpp != 32u) {
         bpp = 8u;
       }
@@ -4278,6 +4286,15 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         g_fb_lib = lib;
         fprintf(stderr, "mango: SDL_SetVideoMode %ux%u %ubpp -> surf=0x%x\n",
                 (unsigned)w, (unsigned)h, (unsigned)bpp, (unsigned)surf);
+      } else {
+        static int s_svm_fail;
+        if (s_svm_fail < 4) {
+          fprintf(stderr,
+                  "mango: SDL_SetVideoMode FAIL %ux%u req_bpp=%u use_bpp=%u heap=%u/%u\n",
+                  (unsigned)w, (unsigned)h, (unsigned)req_bpp, (unsigned)bpp,
+                  (unsigned)lib->heap_used, (unsigned)MANGO_HEAP_SIZE);
+          s_svm_fail++;
+        }
       }
       cpu->r[0] = surf;
       break;

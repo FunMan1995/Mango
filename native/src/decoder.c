@@ -1922,6 +1922,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0bk: AND.W Rd,Rn,Rm{,shift} register, S=0.
+   * MD5 ea0b 0303 = and.w r3,r11,r3 (llvm-mc [0b,ea,03,03]);
+   * next in the same round is ea08 030b = and.w r3,r8,r11.
+   * ANDS (EA1x) stays closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA00u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_AND;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0ay: EOR.W Rd,Rn,Rm{,shift} register, S=0.
    * OpenTTD ea82 0304 = eor.w r3,r2,r4 (llvm-mc [82,ea,04,03]).
    * EORS (EA9x) stays closed. Reject Rd/Rn/Rm=PC. */
@@ -2920,7 +2945,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0bd: T32 SMULL RdLo,RdHi,Rn,Rm. OpenTTD fb8c 8900 =
    * smull r8,r9,r12,r0 (llvm-mc [8c,fb,00,89]). RdLo→rd, RdHi→rn,
-   * Rn→rm, Rm→rs. UMULL/SMLAL/UMLAL stay closed. */
+   * Rn→rm, Rm→rs. SMLAL/UMLAL stay closed. UMULL is 0bj (FBA0). */
   if ((hw1 & 0xFFF0u) == 0xFB80u && (hw2 & 0x00F0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rdlo = (hw2 >> 12) & 0xFu;
@@ -2931,6 +2956,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       return -1;
     }
     out->op = MANGO_OP_SMULL;
+    out->rd = rdlo;
+    out->rn = rdhi;
+    out->rm = rn;
+    out->rs = rm;
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bj: T32 UMULL RdLo,RdHi,Rn,Rm. OpenTTD fba4 4505 =
+   * umull r4,r5,r4,r5 (llvm-mc [a4,fb,05,45]); next is fba2 2306
+   * umull r2,r3,r2,r6. Same lanes as SMULL. Unsigned product.
+   * UMLAL (FBE0) and SMLAL (FBC0) stay closed. */
+  if ((hw1 & 0xFFF0u) == 0xFBA0u && (hw2 & 0x00F0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rdlo = (hw2 >> 12) & 0xFu;
+    uint32_t rdhi = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rdlo == MANGO_REG_PC || rdhi == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC ||
+        rdlo == rdhi) {
+      return -1;
+    }
+    out->op = MANGO_OP_UMULL;
     out->rd = rdlo;
     out->rn = rdhi;
     out->rm = rn;

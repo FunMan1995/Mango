@@ -3032,6 +3032,61 @@ static int test_t32_smull(void) {
   return 0;
 }
 
+static int test_t32_umull(void) {
+  /* Q-OTTD-0bj: umull r4,r5,r4,r5 = fba4 4505. r5:r4 = (uint64)r4 * r5.
+   * Sources overlap the dest pair; read them first. Sibling fba2 2306
+   * is umull r2,r3,r2,r6. UMLAL fbe4 stays closed. */
+  static const uint16_t kProg[] = {0xFBA4u, 0x4505u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xFBA4u, 0x4505u, &di) != 0 || di.op != MANGO_OP_UMULL || di.rd != 4 ||
+      di.rn != 5 || di.rm != 4 || di.rs != 5 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_umull): decode op=%d rd=%u rn=%u rm=%u rs=%u\n", di.op, di.rd, di.rn,
+            di.rm, di.rs);
+    return 1;
+  }
+  if (mango_decode_t32(0xFBA4u, 0x4405u, &di) == 0 || mango_decode_t32(0xFBE4u, 0x4505u, &di) == 0 ||
+      mango_decode_t32(0xFBC4u, 0x4505u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_umull): RdLo==RdHi, UMLAL, or SMLAL decoded\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xFBA2u, 0x2306u, &di) != 0 || di.op != MANGO_OP_UMULL || di.rd != 2 ||
+      di.rn != 3 || di.rm != 2 || di.rs != 6) {
+    fprintf(stderr, "FAIL(t32_umull sib): op=%d rd=%u rn=%u rm=%u rs=%u\n", di.op, di.rd, di.rn,
+            di.rm, di.rs);
+    return 1;
+  }
+
+  struct {
+    uint32_t n, m, lo, hi;
+  } cases[] = {
+      {5u, 7u, 35u, 0u},
+      {0xffffffffu, 0xffffffffu, 1u, 0xfffffffeu},
+      {0x10000u, 0x10000u, 0u, 1u},
+      {0u, 0x88888889u, 0u, 0u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[4] = cases[c].n;
+    cpu.r[5] = cases[c].m;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[4] != cases[c].lo || cpu.r[5] != cases[c].hi || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_umull#%u): rc=%d lo=%x hi=%x cpsr %x->%x\n", c, rc, cpu.r[4],
+              cpu.r[5], cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 UMULL r4,r5,r4,r5 (Q-OTTD-0bj)\n");
+  return 0;
+}
+
 static int test_t32_smulbb(void) {
   /* Q-OTTD-0bi: smulbb r0,r2,r0 = fb12 f000. r0 = (int16)r2 * (int16)r0.
    * High halves ignored. Flags hold. SMLABB stays closed. */
@@ -3271,6 +3326,61 @@ static int test_t32_eor_w_reg(void) {
     }
   }
   printf("ok: T32 EOR.W r3,r2,r4 (Q-OTTD-0ay)\n");
+  return 0;
+}
+
+static int test_t32_and_w_reg(void) {
+  /* Q-OTTD-0bk: and.w r3,r11,r3 = ea0b 0303. r3 = r11 & r3. Rd overlaps Rm.
+   * Flags hold. ANDS (ea1b) stays closed. lsl #4 is ea0b 1303. */
+  static const uint16_t kProg[] = {0xEA0Bu, 0x0303u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xEA0Bu, 0x0303u, &di) != 0 || di.op != MANGO_OP_AND || di.rd != 3 ||
+      di.rn != 11 || di.rm != 3 || di.is_imm != 0 || di.sets_flags != 0 || di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_and_reg): decode op=%d rd=%u rn=%u rm=%u s=%d amt=%u\n", di.op, di.rd,
+            di.rn, di.rm, di.sets_flags, di.shift_amount);
+    return 1;
+  }
+  if (mango_decode_t32(0xEA1Bu, 0x0303u, &di) == 0 || mango_decode_t32(0xEA0Fu, 0x0303u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_and_reg): ANDS or Rn=PC decoded\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xEA08u, 0x030Bu, &di) != 0 || di.op != MANGO_OP_AND || di.rn != 8 ||
+      di.rm != 11) {
+    fprintf(stderr, "FAIL(t32_and_reg sib): op=%d rn=%u rm=%u\n", di.op, di.rn, di.rm);
+    return 1;
+  }
+  if (mango_decode_t32(0xEA0Bu, 0x1303u, &di) != 0 || di.shift_amount != 4 || di.shift_type != 0) {
+    fprintf(stderr, "FAIL(t32_and_reg lsl): amt=%u type=%u\n", di.shift_amount, di.shift_type);
+    return 1;
+  }
+
+  struct {
+    uint32_t rn, rm, want;
+  } cases[] = {
+      {0xffffffffu, 0x0f0f0f0fu, 0x0f0f0f0fu},
+      {0xff00u, 0x0ff0u, 0x0f00u},
+      {0u, 0xffffffffu, 0u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[11] = cases[c].rn;
+    cpu.r[3] = cases[c].rm;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[3] != cases[c].want || cpu.r[11] != cases[c].rn ||
+        cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_and_reg#%u): rc=%d r3=%x want %x cpsr %x->%x\n", c, rc, cpu.r[3],
+              cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 AND.W r3,r11,r3 (Q-OTTD-0bk)\n");
   return 0;
 }
 
@@ -8350,9 +8460,14 @@ static int test_t32_and_w_modimm_reject(void) {
     fprintf(stderr, "FAIL(t32_and_w_reject): BIC f027071f want BIC r7,r7,#31\n");
     return 1;
   }
-  /* AND register ea03 0301 stays uncover */
-  if (mango_decode_t32(0xEA03u, 0x0301u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_and_w_reject): AND-reg ea030301 decoded as op=%d\n", di.op);
+  /* Q-OTTD-0bk: AND register ea03 0301 = and.w r3,r3,r1. ANDS register stays closed. */
+  if (mango_decode_t32(0xEA03u, 0x0301u, &di) != 0 || di.op != MANGO_OP_AND || di.rd != 3 ||
+      di.rn != 3 || di.rm != 1 || di.is_imm != 0 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_and_w_reject): AND-reg ea030301 op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xEA13u, 0x0301u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_and_w_reject): ANDS-reg ea130301 decoded as op=%d\n", di.op);
     return 1;
   }
   /* Q-OTTD-0af: T32 CLZ fab0 f080 now tip */
@@ -8430,10 +8545,11 @@ static int test_t32_add_w_reg_lsl2(void) {
 }
 
 static int test_t32_add_w_reg_reject(void) {
-  /* AND.W ea0e0080 stays uncover; PC Rd/Rn/Rm reject; S=1 uncover. */
+  /* Q-OTTD-0bk: ea0e 0080 = and.w r0,lr,r0. ADD Rd/Rn/Rm=PC and ADDS stay closed. */
   MangoInsn di;
-  if (mango_decode_t32(0xEA0Eu, 0x0080u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_add_w_reg_reject): AND ea0e0080 decoded as op=%d\n", di.op);
+  if (mango_decode_t32(0xEA0Eu, 0x0080u, &di) != 0 || di.op != MANGO_OP_AND || di.rd != 0 ||
+      di.rn != 14 || di.rm != 0 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_add_w_reg_reject): AND ea0e0080 op=%d\n", di.op);
     return 1;
   }
   /* eb0e 0f80 = ADD.W pc,lr,r0,lsl#2 — Rd=PC */
@@ -8456,7 +8572,7 @@ static int test_t32_add_w_reg_reject(void) {
     fprintf(stderr, "FAIL(t32_add_w_reg_reject): S=1 eb1e0080 decoded as op=%d\n", di.op);
     return 1;
   }
-  printf("ok: T32 ADD.W reg reject AND/PC/S=1 (Q-OTTD-0l-add)\n");
+  printf("ok: T32 ADD.W reg reject PC/S=1; AND reg is 0bk (Q-OTTD-0l-add)\n");
   return 0;
 }
 
@@ -10412,11 +10528,13 @@ int main(void) {
   failures += test_t32_mul_ra15();
   failures += test_t32_mla();
   failures += test_t32_smull();
+  failures += test_t32_umull();
   failures += test_t32_smulbb();
   failures += test_t32_sub_w_reg_asr31();
   failures += test_t32_orrs_w_reg();
   failures += test_t32_orr_w_reg_lsl6();
   failures += test_t32_eor_w_reg();
+  failures += test_t32_and_w_reg();
   failures += test_t32_lsl_w_reg();
   failures += test_t32_asr_w_reg();
   failures += test_t32_pop_w_ldmia_sp();
