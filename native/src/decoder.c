@@ -2036,7 +2036,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0r: MOV.W Rd,Rm{,shift} register — ORR with Rn=15, S=0.
    * Primary ea4f 7ad0 = mov.w sl,r0,lsr#31; sib ea4f 0847 lsl#1.
-   * Rn==15 only. ORR Rn≠15 is Q-OTTD-0aw. Do NOT open MOVS (EA5F).
+   * Rn==15 only. ORR Rn≠15 is Q-OTTD-0aw. MOVS is Q-OTTD-0cg.
    * MVN register is Q-OTTD-0bl (EA6F). Reject Rd/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) == 0 &&
       (hw2 & 0x8000u) == 0) {
@@ -2052,6 +2052,30 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rm = rm;
     out->is_imm = 0;
     out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0cg: MOVS.W Rd,Rm{,shift} — ORR with Rn=15, S=1.
+   * sq_newclosure ea5f 0c43 = lsls.w r12, r3, #1
+   * (llvm-mc [5f,ea,43,0c]). NZ from the result, C from the
+   * shifter, V unchanged. ORRS Rn≠15 is 0bf. Reject Rd/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) != 0 &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 1;
     out->shift_type = (hw2 >> 4) & 3u;
     out->shift_amount = (imm3 << 2) | imm2;
     out->shift_by_reg = 0;
@@ -2110,7 +2134,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0aw / 0bf: ORR.W / ORRS.W Rd,Rn,Rm{,shift}, Rn≠15.
    * ea41 1383 = orr.w r3,r1,r3,lsl #6. SDL ea5b 0b07 = orrs.w r11,r11,r7.
-   * S is hw1 bit 4. Rn=15 stays MOV.W (S=0) / MOVS stays closed.
+   * S is hw1 bit 4. Rn=15 S=0 is MOV.W. Rn=15 S=1 is MOVS (0cg).
    * Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) != 0xFu && (hw2 & 0x8000u) == 0) {
     uint32_t rn = hw1 & 0xFu;
