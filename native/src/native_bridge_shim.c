@@ -287,7 +287,9 @@
 #define MANGO_LIBC_STRCHR 177
 #define MANGO_LIBC_STRRCHR 178
 #define MANGO_LIBC_STRSTR 179
-#define MANGO_LIBC_COUNT 180
+/* Tar header sizes are ASCII octal. A zero stub made every file length 0. */
+#define MANGO_LIBC_STRTOUL 180
+#define MANGO_LIBC_COUNT 181
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -540,6 +542,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "strchr",
     "strrchr",
     "strstr",
+    "strtoul",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -3258,6 +3261,23 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_STRTOL: {
       const char* s = mango_guest_cstr(lib, r0);
       cpu->r[0] = s ? (uint32_t)strtol(s, NULL, (int)r2) : 0;
+      break;
+    }
+    case MANGO_LIBC_STRTOUL: {
+      const char* s = mango_guest_cstr(lib, r0);
+      char* ep = NULL;
+      unsigned long v = 0;
+      if (s != NULL) {
+        v = strtoul(s, &ep, (int)r2);
+      }
+      if (r1 != 0 && mango_guest_range_ok(lib, r1, 4u)) {
+        uint32_t gend = 0;
+        if (s != NULL && ep != NULL) {
+          gend = r0 + (uint32_t)(ep - s);
+        }
+        mango_store_u32_guest(lib->guest_mem, r1, gend);
+      }
+      cpu->r[0] = (uint32_t)v;
       break;
     }
     case MANGO_LIBC_DLOPEN: {
