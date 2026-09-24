@@ -3397,7 +3397,7 @@ static int test_t32_smlabb(void) {
 
 static int test_t32_sub_w_reg_asr31(void) {
   /* Q-OTTD-0be: sub.w r12,r9,r12,asr #31 = eba9 7cec.
-   * r12 = r9 - (r12 ASR #31). Flags hold. SUBS stays closed. */
+   * r12 = r9 - (r12 ASR #31). Flags hold. Register SUBS is Q-OTTD-0bx. */
   static const uint16_t kProg[] = {0xEBA9u, 0x7CECu, 0x4770u};
   uint8_t mem_buf[32];
   load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
@@ -3410,8 +3410,14 @@ static int test_t32_sub_w_reg_asr31(void) {
             di.shift_type, di.shift_amount, di.sets_flags);
     return 1;
   }
-  if (mango_decode_t32(0xEBB9u, 0x7CECu, &di) == 0 || mango_decode_t32(0xEBAFu, 0x7CECu, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_sub_reg): SUBS or Rn=PC decoded\n");
+  if (mango_decode_t32(0xEBB9u, 0x7CECu, &di) != 0 || di.op != MANGO_OP_SUB || di.sets_flags != 1 ||
+      di.rd != 12 || di.shift_type != 2 || di.shift_amount != 31) {
+    fprintf(stderr, "FAIL(t32_sub_reg): SUBS sibling op=%d s=%d amt=%u\n", di.op, di.sets_flags,
+            di.shift_amount);
+    return 1;
+  }
+  if (mango_decode_t32(0xEBAFu, 0x7CECu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_sub_reg): Rn=PC decoded\n");
     return 1;
   }
 
@@ -8869,6 +8875,88 @@ static int test_t32_bics_w_imm2(void) {
   return 0;
 }
 
+static int test_t32_cmp_w_reg_lsl2(void) {
+  /* Q-OTTD-0bw: cmp.w r0, r3, lsl #2 = ebb0 0f83. Flags from r0 - (r3<<2).
+   * Registers stay put. The SUBS sibling ebb2 0183 is Q-OTTD-0bx. */
+  static const uint16_t kProg[] = {0xEBB0u, 0x0F83u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xEBB0u, 0x0F83u, &di) != 0 || di.op != MANGO_OP_CMP || di.rn != 0 ||
+      di.rm != 3 || di.is_imm != 0 || di.sets_flags != 1 || di.shift_type != 0 ||
+      di.shift_amount != 2u) {
+    fprintf(stderr, "FAIL(t32_cmp_w_lsl2): decode op=%d rn=%u rm=%u sh=%u amt=%u\n", di.op, di.rn,
+            di.rm, di.shift_type, di.shift_amount);
+    return 1;
+  }
+  if (mango_decode_t32(0xEBB2u, 0x0183u, &di) != 0 || di.op != MANGO_OP_SUB || di.sets_flags != 1 ||
+      di.rd != 1 || di.rn != 2 || di.rm != 3 || di.shift_amount != 2u) {
+    fprintf(stderr, "FAIL(t32_cmp_w_lsl2): SUBS sibling op=%d rd=%u s=%d\n", di.op, di.rd,
+            di.sets_flags);
+    return 1;
+  }
+
+  struct {
+    uint32_t r0, r3, nzcv;
+  } cases[] = {
+      {8u, 2u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {7u, 2u, MANGO_CPSR_N},
+      {20u, 3u, MANGO_CPSR_C},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_V;
+    cpu.r[0] = cases[c].r0;
+    cpu.r[3] = cases[c].r3;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[0] != cases[c].r0 || cpu.r[3] != cases[c].r3 || nzcv != cases[c].nzcv ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr, "FAIL(t32_cmp_w_lsl2#%u): rc=%d r0=%x r3=%x nzcv=%x want %x\n", c, rc,
+              cpu.r[0], cpu.r[3], nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+  printf("ok: T32 CMP.W r0, r3, lsl #2 (Q-OTTD-0bw)\n");
+  return 0;
+}
+
+static int test_t32_subs_w_reg_lsl4(void) {
+  /* Q-OTTD-0bx: subs.w r2, r3, r2, lsl #4 = ebb3 1202.
+   * r2 = r3 - (old r2 << 4). NZCV from the subtract. */
+  static const uint16_t kProg[] = {0xEBB3u, 0x1202u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t r3, r2, want, nzcv;
+  } cases[] = {
+      {20u, 1u, 4u, MANGO_CPSR_C},
+      {16u, 1u, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {10u, 1u, 0xfffffffau, MANGO_CPSR_N},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[3] = cases[c].r3;
+    cpu.r[2] = cases[c].r2;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[2] != cases[c].want || cpu.r[3] != cases[c].r3 || nzcv != cases[c].nzcv) {
+      fprintf(stderr, "FAIL(t32_subs_w_lsl4#%u): rc=%d r2=%x want %x r3=%x nzcv=%x want %x\n", c, rc,
+              cpu.r[2], cases[c].want, cpu.r[3], nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+  printf("ok: T32 SUBS.W r2, r3, r2, lsl #4 (Q-OTTD-0bx)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -11202,6 +11290,8 @@ int main(void) {
   failures += test_t32_bic_w_modimm_15();
   failures += test_t32_bic_w_modimm_reject();
   failures += test_t32_bics_w_imm2();
+  failures += test_t32_cmp_w_reg_lsl2();
+  failures += test_t32_subs_w_reg_lsl4();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();

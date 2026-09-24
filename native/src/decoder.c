@@ -1851,7 +1851,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0be: SUB.W Rd,Rn,Rm{,shift} register, S=0.
    * OpenTTD eba9 7cec = sub.w r12,r9,r12,asr #31 (llvm-mc [a9,eb,ec,7c]).
-   * SUBS (EBBx) stays closed. Reject Rd/Rn/Rm=PC. */
+   * CMP.W register (Rd=15) is Q-OTTD-0bw. SUBS register is Q-OTTD-0bx.
+   * Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEBA0u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -1870,6 +1871,34 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->shift_type = (hw2 >> 4) & 3u;
     out->shift_amount = (imm3 << 2) | imm2;
     out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bw / 0bx: SUBS.W register. Rd=15 is CMP.W.
+   * ebb0 0f83 = cmp.w r0, r3, lsl #2. ebb3 1202 = subs.w r2, r3, r2, lsl #4
+   * (llvm-mc [b3,eb,02,12]). Reject Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEBA0u && (hw1 & 0x10u) != 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 1;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    if (rd == MANGO_REG_PC) {
+      out->op = MANGO_OP_CMP;
+      return 0;
+    }
+    out->op = MANGO_OP_SUB;
+    out->rd = rd;
     return 0;
   }
 
