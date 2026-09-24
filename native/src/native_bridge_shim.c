@@ -5100,6 +5100,17 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
       if (pc + 4u <= mem.size) {
         w = mango_load_u32_guest(mem.bytes, pc);
       }
+      /* OpenTTD static init calls through a NULL BreakIterator. The
+       * vtable load at guest VA 0 returns the ELF magic in r3, then
+       * ldr r3,[r3,#imm]; blx r3 faults. Skip that pair (r0 stays 0). */
+      if ((cpu->cpsr & MANGO_CPSR_T) != 0 && cpu->r[0] == 0 && cpu->r[3] == 0x464c457fu &&
+          (w >> 16) == 0x4798u && (w & 0xF83Fu) == 0x681Bu &&
+          strstr(lib->path, "libapplication.so") != NULL) {
+        fprintf(stderr, "mango: OpenTTD skip null vcall va=0x%x\n", pc - lib->load_bias);
+        cpu->r[0] = 0;
+        cpu->r[MANGO_REG_PC] = pc + 4u;
+        continue;
+      }
       MangoInsn ins;
       int dec;
       if (cpu->cpsr & MANGO_CPSR_T) {
