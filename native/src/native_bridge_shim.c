@@ -294,7 +294,11 @@
 /* SDL_SetError copies the format with strlcpy. A zero stub left the key
  * empty, so __android_log_print showed "ERROR: " and the guest exited. */
 #define MANGO_LIBC_STRLCPY 182
-#define MANGO_LIBC_COUNT 183
+/* __verbose_terminate_handler prints the exception name with fputs. */
+#define MANGO_LIBC_FPUTS 183
+#define MANGO_LIBC_COUNT 184
+/* bionic struct __sFILE is 84 bytes in this NDK. stderr is &__sF[2]. */
+#define MANGO_SF_FILE 84u
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -352,6 +356,7 @@ typedef struct MangoLoadedLibrary {
   uint32_t tolower_tab_addr; /* pointer cell → _tolower_tab_ */
   uint32_t toupper_tab_addr; /* pointer cell → _toupper_tab_ */
   uint32_t environ_addr;     /* pointer cell → char** environ (NULL-terminated) */
+  uint32_t sf_addr;          /* bionic __sF[3]; stderr is sf_addr + 2*84 */
   uint32_t load_bias;
   uint32_t stub_addr;
   void* host_vm;
@@ -550,6 +555,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "strtoul",
     "fgets",
     "strlcpy",
+    "fputs",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -804,6 +810,27 @@ static void mango_file_release(uint32_t id) {
     fclose(g_files[id]);
     g_files[id] = NULL;
   }
+}
+
+/* fopen ids are 1..63. libstdc++ passes &__sF[0..2] (stdin/stdout/stderr). */
+static FILE* mango_host_file(const MangoLoadedLibrary* lib, uint32_t fp) {
+  FILE* host = mango_file_get(fp);
+  if (host != NULL) {
+    return host;
+  }
+  if (lib->sf_addr != 0 && fp >= lib->sf_addr) {
+    uint32_t off = fp - lib->sf_addr;
+    if (off == 0u) {
+      return stdin;
+    }
+    if (off == MANGO_SF_FILE) {
+      return stdout;
+    }
+    if (off == 2u * MANGO_SF_FILE) {
+      return stderr;
+    }
+  }
+  return NULL;
 }
 
 /* Guest gzFile id → host zlib gzFile (DroidZebra book/coeffs; Gears fonts). */
@@ -2515,6 +2542,7 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
     lib->tolower_tab_addr = first->tolower_tab_addr;
     lib->toupper_tab_addr = first->toupper_tab_addr;
     lib->environ_addr = first->environ_addr;
+    lib->sf_addr = first->sf_addr;
     lib->stack_top = first->stack_top;
     lib->host_vm = first->host_vm;
     return 0;
@@ -2532,6 +2560,12 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
   mango_store_u32_guest(mem, heap + 8u, 4096u); /* bionic __page_size */
   mango_init_ctype_tables(lib); /* bump heap_used for _ctype_ / case tabs */
   mango_init_opensles(lib); /* Pacman Q2 soft OpenSLES IIDs + vtables */
+  /* Three bionic FILE slots. Guest stderr is sf_addr + 168. */
+  if (lib->heap_used + 3u * MANGO_SF_FILE <= MANGO_HEAP_SIZE) {
+    lib->sf_addr = lib->heap_base + lib->heap_used;
+    memset(lib->guest_mem + lib->sf_addr, 0, 3u * MANGO_SF_FILE);
+    lib->heap_used += 3u * MANGO_SF_FILE;
+  }
   lib->stack_top = need - 16u;
   lib->host_vm = NULL;
   mango_store_u32_guest(mem, base, vm_table);
@@ -2586,6 +2620,9 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
   }
   if (strcmp(name, "environ") == 0) {
     return lib->environ_addr;
+  }
+  if (strcmp(name, "__sF") == 0) {
+    return lib->sf_addr;
   }
   if (strcmp(name, "eglGetError") == 0) {
     name = "eglGetError";
@@ -3319,6 +3356,19 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         lib->guest_mem[r0 + copy] = 0;
       }
       cpu->r[0] = (uint32_t)sl;
+      break;
+    }
+    case MANGO_LIBC_FPUTS: {
+      /* fputs(s, fp). The terminate handler prints the exception name here. */
+      const char* s = mango_guest_cstr(lib, r0);
+      FILE* fp = mango_host_file(lib, r1);
+      int n;
+      if (s == NULL || fp == NULL) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      n = fputs(s, fp);
+      cpu->r[0] = (n < 0) ? (uint32_t)-1 : (uint32_t)n;
       break;
     }
     case MANGO_LIBC_DLOPEN: {
@@ -4066,7 +4116,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_FWRITE: {
-      FILE* fp = mango_file_get(cpu->r[3]);
+      FILE* fp = mango_host_file(lib, cpu->r[3]);
       uint64_t bytes = (uint64_t)r1 * (uint64_t)r2;
       if (!fp || r1 == 0 || r2 == 0 || bytes > 0xffffffffu ||
           !mango_guest_range_ok(lib, r0, (uint32_t)bytes)) {
