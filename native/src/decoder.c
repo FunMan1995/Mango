@@ -3321,7 +3321,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0bd: T32 SMULL RdLo,RdHi,Rn,Rm. OpenTTD fb8c 8900 =
    * smull r8,r9,r12,r0 (llvm-mc [8c,fb,00,89]). RdLo→rd, RdHi→rn,
-   * Rn→rm, Rm→rs. SMLAL/UMLAL stay closed. UMULL is 0bj (FBA0). */
+   * Rn→rm, Rm→rs. UMLAL is Q-OTTD-0ck. SMLAL stays closed. UMULL is 0bj. */
   if ((hw1 & 0xFFF0u) == 0xFB80u && (hw2 & 0x00F0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rdlo = (hw2 >> 12) & 0xFu;
@@ -3343,7 +3343,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0bj: T32 UMULL RdLo,RdHi,Rn,Rm. OpenTTD fba4 4505 =
    * umull r4,r5,r4,r5 (llvm-mc [a4,fb,05,45]); next is fba2 2306
    * umull r2,r3,r2,r6. Same lanes as SMULL. Unsigned product.
-   * UMLAL (FBE0) and SMLAL (FBC0) stay closed. */
+   * UMLAL is Q-OTTD-0ck. SMLAL (FBC0) stays closed. */
   if ((hw1 & 0xFFF0u) == 0xFBA0u && (hw2 & 0x00F0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rdlo = (hw2 >> 12) & 0xFu;
@@ -3354,6 +3354,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       return -1;
     }
     out->op = MANGO_OP_UMULL;
+    out->rd = rdlo;
+    out->rn = rdhi;
+    out->rm = rn;
+    out->rs = rm;
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0ck: T32 UMLAL RdLo,RdHi,Rn,Rm.
+   * BuildProto fbe3 0108 = umlal r0, r1, r3, r8
+   * (llvm-mc [e3,fb,08,01]). Unsigned product plus the old
+   * RdHi:RdLo. Same lanes as UMULL. SMLAL stays closed. */
+  if ((hw1 & 0xFFF0u) == 0xFBE0u && (hw2 & 0x00F0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rdlo = (hw2 >> 12) & 0xFu;
+    uint32_t rdhi = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rdlo == MANGO_REG_PC || rdhi == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC ||
+        rdlo == rdhi) {
+      return -1;
+    }
+    out->op = MANGO_OP_UMLAL;
     out->rd = rdlo;
     out->rn = rdhi;
     out->rm = rn;

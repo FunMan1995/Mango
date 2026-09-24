@@ -3236,7 +3236,7 @@ static int test_t32_smull(void) {
 static int test_t32_umull(void) {
   /* Q-OTTD-0bj: umull r4,r5,r4,r5 = fba4 4505. r5:r4 = (uint64)r4 * r5.
    * Sources overlap the dest pair; read them first. Sibling fba2 2306
-   * is umull r2,r3,r2,r6. UMLAL fbe4 stays closed. */
+   * is umull r2,r3,r2,r6. UMLAL fbe4 is Q-OTTD-0ck. SMLAL stays closed. */
   static const uint16_t kProg[] = {0xFBA4u, 0x4505u, 0x4770u};
   uint8_t mem_buf[32];
   load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
@@ -3248,9 +3248,13 @@ static int test_t32_umull(void) {
             di.rm, di.rs);
     return 1;
   }
-  if (mango_decode_t32(0xFBA4u, 0x4405u, &di) == 0 || mango_decode_t32(0xFBE4u, 0x4505u, &di) == 0 ||
-      mango_decode_t32(0xFBC4u, 0x4505u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_umull): RdLo==RdHi, UMLAL, or SMLAL decoded\n");
+  if (mango_decode_t32(0xFBE4u, 0x4505u, &di) != 0 || di.op != MANGO_OP_UMLAL || di.rd != 4 ||
+      di.rn != 5 || di.rm != 4 || di.rs != 5) {
+    fprintf(stderr, "FAIL(t32_umull): UMLAL fbe44505 op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xFBA4u, 0x4405u, &di) == 0 || mango_decode_t32(0xFBC4u, 0x4505u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_umull): RdLo==RdHi or SMLAL decoded\n");
     return 1;
   }
   if (mango_decode_t32(0xFBA2u, 0x2306u, &di) != 0 || di.op != MANGO_OP_UMULL || di.rd != 2 ||
@@ -9608,6 +9612,53 @@ static int test_t32_ldrd_post_32(void) {
   return 0;
 }
 
+static int test_t32_umlal(void) {
+  /* Q-OTTD-0ck: umlal r0, r1, r3, r8 = fbe3 0108 (llvm-mc [e3,fb,08,01]).
+   * r1:r0 += (uint64)r3 * r8. Flags hold. */
+  static const uint16_t kProg[] = {0xFBE3u, 0x0108u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t lo, hi, n, m, want_lo, want_hi;
+  } cases[] = {
+      {5u, 0u, 3u, 4u, 17u, 0u},
+      {0xffffffffu, 0u, 2u, 2u, 3u, 1u},
+      {1u, 1u, 1u, 1u, 2u, 1u},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xFBE3u, 0x0108u, &di) != 0 || di.op != MANGO_OP_UMLAL || di.rd != 0 ||
+      di.rn != 1 || di.rm != 3 || di.rs != 8 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_umlal): decode op=%d rd=%u rn=%u rm=%u rs=%u\n", di.op, di.rd, di.rn,
+            di.rm, di.rs);
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = cases[c].lo;
+    cpu.r[1] = cases[c].hi;
+    cpu.r[3] = cases[c].n;
+    cpu.r[8] = cases[c].m;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[0] != cases[c].want_lo || cpu.r[1] != cases[c].want_hi ||
+        cpu.r[3] != cases[c].n || cpu.r[8] != cases[c].m || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_umlal#%u): rc=%d lo=%x hi=%x cpsr=%x\n", c, rc, cpu.r[0], cpu.r[1],
+              cpu.cpsr);
+      return 1;
+    }
+  }
+  if (mango_decode_t32(0xFBC3u, 0x0108u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_umlal): SMLAL should stay closed\n");
+    return 1;
+  }
+  printf("ok: T32 UMLAL r0, r1, r3, r8 (Q-OTTD-0ck)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -11960,6 +12011,7 @@ int main(void) {
   failures += test_t32_ldrd_neg16();
   failures += test_t32_ldrd_pre_wb_256();
   failures += test_t32_ldrd_post_32();
+  failures += test_t32_umlal();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
