@@ -2406,8 +2406,9 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * Post (0m) f855 2b04 = ldr.w r2,[r5],#4 and f85d 4b04 = ldr.w r4,[sp],#4.
    * Pre (0ag) OpenTTD f85a 3f04 = ldr.w r3,[r10,#4]! (P=1 U=1 W=1). Also
    * covers U=0 no-WB. Mirror 0s STR.W imm8 (F840). Mutually exclusive with
-   * 0f reg form (bits[11:6]==0). Reject LDRT (P=0 W=0), Rt/Rn=PC, and
-   * writeback into Rt. */
+   * 0f reg form (bits[11:6]==0). Font::getFontTable f85d fb04 =
+   * ldr pc, [sp], #4 (Q-OTTD-0br); execute already interworks on bit 0.
+   * Reject LDRT (P=0 W=0), Rn=PC, and writeback into Rt. */
   if ((hw1 & 0xFFF0u) == 0xF850u && (hw2 & 0x0800u) != 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
@@ -2418,7 +2419,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     if (p == 0 && w == 0) {
       return -1; /* LDRT */
     }
-    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+    if (rn == MANGO_REG_PC) {
       return -1;
     }
     if (w && rt == rn) {
@@ -3031,7 +3032,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0b / 0av: T32 MUL (Ra=15) and MLA (Ra≠15), op2=0000, S=0.
    * mul.w r1,r1,r4 = fb01 f104. OpenTTD fb01 3102 = mla r1,r1,r2,r3
-   * (Rd = Rn*Rm + Ra). MLS (op2=0001) stays closed. */
+   * (Rd = Rn*Rm + Ra). MLS (op2=0001) is Q-OTTD-0bq. */
   if ((hw1 & 0xFFF0u) == 0xFB00u && (hw2 & 0x00F0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t ra = (hw2 >> 12) & 0xFu;
@@ -3045,6 +3046,26 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rm = rn; /* multiplicand Rn → interp rm lane */
     out->rs = rm; /* multiplicand Rm → interp rs lane */
     out->rn = (ra == 0xFu) ? 0u : ra;
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bq: T32 MLS Rd,Rn,Rm,Ra. ResizeWindow fb09 6610 =
+   * mls r6,r9,r0,r6 (llvm-mc [09,fb,10,66]). Rd = Ra - Rn*Rm.
+   * op2=0001. Ra=15 is not MLS. Reject Rd/Rn/Rm/Ra=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFB00u && (hw2 & 0x00F0u) == 0x0010u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t ra = (hw2 >> 12) & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC || ra == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MLS;
+    out->rd = rd;
+    out->rm = rn;
+    out->rs = rm;
+    out->rn = ra;
     out->sets_flags = 0;
     return 0;
   }

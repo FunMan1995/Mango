@@ -2945,8 +2945,10 @@ static int test_t32_mla(void) {
             di.rm, di.rs, di.rn, di.sets_flags);
     return 1;
   }
-  if (mango_decode_t32(0xFB01u, 0x3112u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_mla): MLS decoded\n");
+  /* fb01 3112 = mls r1,r1,r2,r3 */
+  if (mango_decode_t32(0xFB01u, 0x3112u, &di) != 0 || di.op != MANGO_OP_MLS || di.rd != 1 ||
+      di.rm != 1 || di.rs != 2 || di.rn != 3) {
+    fprintf(stderr, "FAIL(t32_mla): MLS op=%d rd=%u rn=%u\n", di.op, di.rd, di.rn);
     return 1;
   }
 
@@ -2975,6 +2977,107 @@ static int test_t32_mla(void) {
     }
   }
   printf("ok: T32 MLA r1,r1,r2,r3 (Q-OTTD-0av)\n");
+  return 0;
+}
+
+static int test_t32_mls(void) {
+  /* Q-OTTD-0bq: mls r6,r9,r0,r6 = fb09 6610. r6 = r6 - r9*r0.
+   * Rd overlaps Ra. Flags and the multiplicands hold. */
+  static const uint16_t kProg[] = {0xFB09u, 0x6610u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xFB09u, 0x6610u, &di) != 0 || di.op != MANGO_OP_MLS || di.rd != 6 ||
+      di.rm != 9 || di.rs != 0 || di.rn != 6 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_mls): decode op=%d rd=%u rm=%u rs=%u rn=%u s=%d\n", di.op, di.rd,
+            di.rm, di.rs, di.rn, di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xFB09u, 0xF610u, &di) == 0 || mango_decode_t32(0xFB09u, 0x6F10u, &di) == 0 ||
+      mango_decode_t32(0xFB0Fu, 0x6610u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_mls): Ra=15, Rd=PC, or Rn=PC decoded\n");
+    return 1;
+  }
+
+  struct {
+    uint32_t n, m, acc, want;
+  } cases[] = {
+      {3u, 5u, 20u, 5u},
+      {3u, 5u, 0u, 0xfffffff1u},
+      {0u, 0xffffffffu, 7u, 7u},
+      {0xffffffffu, 2u, 1u, 3u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[9] = cases[c].n;
+    cpu.r[0] = cases[c].m;
+    cpu.r[6] = cases[c].acc;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[6] != cases[c].want || cpu.r[9] != cases[c].n || cpu.r[0] != cases[c].m ||
+        cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_mls#%u): rc=%d r6=%x want %x cpsr %x->%x\n", c, rc, cpu.r[6],
+              cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 MLS r6,r9,r0,r6 (Q-OTTD-0bq)\n");
+  return 0;
+}
+
+static int test_t32_ldr_w_pc_post(void) {
+  /* Q-OTTD-0br: f85d fb04 = ldr pc, [sp], #4. LoadWritePC from bit 0,
+   * then SP += 4. LDRT and Rn=PC stay closed. */
+  static const uint16_t kProg[] = {0xF85Du, 0xFB04u};
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+  MangoInsn di;
+  if (mango_decode_t32(0xF85Du, 0xFB04u, &di) != 0 || di.op != MANGO_OP_LDR || di.rd != 15 ||
+      di.rn != 13 || di.is_imm != 1 || di.imm != 4u || di.p != 0 || di.u != 1 || di.w != 1) {
+    fprintf(stderr, "FAIL(t32_ldr_pc): decode op=%d rd=%u rn=%u imm=%u p=%d u=%d w=%d\n", di.op,
+            di.rd, di.rn, di.imm, di.p, di.u, di.w);
+    return 1;
+  }
+  if (mango_decode_t32(0xF85Fu, 0xFB04u, &di) == 0 || mango_decode_t32(0xF85Du, 0xFA04u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldr_pc): Rn=PC or LDRT decoded\n");
+    return 1;
+  }
+
+  uint32_t sp = 0x40u;
+  uint32_t target = 0x100u;
+  u32_to_bytes_le(mem_buf + sp, target | 1u);
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[MANGO_REG_SP] = sp;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, target, 10);
+  if (rc != 0 || cpu.r[MANGO_REG_PC] != target || cpu.r[MANGO_REG_SP] != sp + 4u ||
+      cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_ldr_pc): rc=%d pc=%x sp=%x cpsr %x->%x\n", rc, cpu.r[MANGO_REG_PC],
+            cpu.r[MANGO_REG_SP], cpsr_before, cpu.cpsr);
+    return 1;
+  }
+
+  uint32_t arm_target = 0x180u;
+  u32_to_bytes_le(mem_buf + sp, arm_target);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z;
+  cpu.r[MANGO_REG_SP] = sp;
+  rc = mango_interp_run(&cpu, &mem, arm_target, 10);
+  if (rc != 0 || cpu.r[MANGO_REG_PC] != arm_target || (cpu.cpsr & MANGO_CPSR_T) != 0 ||
+      cpu.r[MANGO_REG_SP] != sp + 4u) {
+    fprintf(stderr, "FAIL(t32_ldr_pc arm): rc=%d pc=%x sp=%x cpsr=%x\n", rc, cpu.r[MANGO_REG_PC],
+            cpu.r[MANGO_REG_SP], cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 LDR pc, [sp], #4 (Q-OTTD-0br)\n");
   return 0;
 }
 
@@ -10788,6 +10891,8 @@ int main(void) {
   failures += test_t32_push_w_stmdb_sp();
   failures += test_t32_mul_ra15();
   failures += test_t32_mla();
+  failures += test_t32_mls();
+  failures += test_t32_ldr_w_pc_post();
   failures += test_t32_smull();
   failures += test_t32_umull();
   failures += test_t32_smulbb();

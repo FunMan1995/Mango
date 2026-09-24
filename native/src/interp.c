@@ -758,10 +758,13 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_MUL:
-        case MANGO_OP_MLA: {
+        case MANGO_OP_MLA:
+        case MANGO_OP_MLS: {
           uint32_t result = mango_read_reg(cpu, addr, insn.rm) * mango_read_reg(cpu, addr, insn.rs);
           if (insn.op == MANGO_OP_MLA) {
             result += mango_read_reg(cpu, addr, insn.rn);
+          } else if (insn.op == MANGO_OP_MLS) {
+            result = mango_read_reg(cpu, addr, insn.rn) - result;
           }
           mango_write_rd(cpu, insn.rd, result, stop_addr, &next_addr);
           if (insn.sets_flags) {
