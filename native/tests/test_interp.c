@@ -8205,6 +8205,62 @@ static int test_vmov_f32_scalar_imm(void) {
   return 0;
 }
 
+/* Heriswap Q0 (research/70): A8.8.343 VMOV.F32 #imm with nonzero imm4L. */
+static int test_vmov_f32_scalar_imm_nonzero_imm4l(void) {
+  MangoInsn insn;
+  memset(&insn, 0, sizeof(insn));
+  /* Stop word: vmov.f32 s21, #3.0 (imm8=0x08 → 0x40400000). */
+  if (mango_decode(0xEEF0AA08u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 5 ||
+      insn.rd != 21u || insn.b != 0 || insn.imm != 0x40400000u) {
+    fprintf(stderr,
+            "FAIL(vmov_f32_imm4l #3.0): decode op=%d u=%d rd=%u b=%d imm=0x%x\n",
+            (int)insn.op, insn.u, insn.rd, insn.b, insn.imm);
+    return 1;
+  }
+  /* Regress prior #0.5 path (imm4L==0 still accepted). */
+  memset(&insn, 0, sizeof(insn));
+  if (mango_decode(0xEEB60A00u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 5 ||
+      insn.rd != 0u || insn.b != 0 || insn.imm != 0x3F000000u) {
+    fprintf(stderr,
+            "FAIL(vmov_f32_imm4l #0.5 regress): decode op=%d u=%d rd=%u b=%d imm=0x%x\n",
+            (int)insn.op, insn.u, insn.rd, insn.b, insn.imm);
+    return 1;
+  }
+  /* Second nonzero-imm4L: vmov.f32 s21, #2.25 (imm8=0x02 → 0x40100000). */
+  memset(&insn, 0, sizeof(insn));
+  if (mango_decode(0xEEF0AA02u, &insn) != 0 || insn.op != MANGO_OP_VMOV || insn.u != 5 ||
+      insn.rd != 21u || insn.b != 0 || insn.imm != 0x40100000u) {
+    fprintf(stderr,
+            "FAIL(vmov_f32_imm4l #2.25): decode op=%d u=%d rd=%u b=%d imm=0x%x\n",
+            (int)insn.op, insn.u, insn.rd, insn.b, insn.imm);
+    return 1;
+  }
+
+  uint8_t mem_buf[32];
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+  static const uint32_t k3[] = {0xEEF0AA08u, 0xE12FFF1Eu};
+  load_words(mem_buf, sizeof(mem_buf), k3, 2);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x7007u;
+  int rc = mango_interp_run(&cpu, &mem, 0x7007u, 100);
+  if (rc != 0 || cpu.s[21] != 0x40400000u) {
+    fprintf(stderr, "FAIL(vmov_f32_imm4l exec #3.0): rc=%d s21=0x%x\n", rc, cpu.s[21]);
+    return 1;
+  }
+  static const uint32_t k225[] = {0xEEF0AA02u, 0xE12FFF1Eu};
+  load_words(mem_buf, sizeof(mem_buf), k225, 2);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x7007u;
+  rc = mango_interp_run(&cpu, &mem, 0x7007u, 100);
+  if (rc != 0 || cpu.s[21] != 0x40100000u) {
+    fprintf(stderr, "FAIL(vmov_f32_imm4l exec #2.25): rc=%d s21=0x%x\n", rc, cpu.s[21]);
+    return 1;
+  }
+  printf("ok: VMOV.F32 s21, #3.0 (0xeef0aa08) and #2.25 (0xeef0aa02)\n");
+  return 0;
+}
+
 
 static int test_ofdp_native_render_vmul_vcmp(void) {
   /* OFDP nativeRender scale loop fragment: s4 = (float)r0 * 0.5; VCMPE; VMRS.
@@ -8948,6 +9004,7 @@ int main(void) {
   failures += test_vmov_f32_imm_and_smmul();
   failures += test_vmov_f32_ss();
   failures += test_vmov_f32_scalar_imm();
+  failures += test_vmov_f32_scalar_imm_nonzero_imm4l();
   failures += test_ofdp_native_render_vmul_vcmp();
   failures += test_vcmp_fpscr_nzcv();
   failures += test_neon_ctor_vmov_vmvn_vrecpe_vext();

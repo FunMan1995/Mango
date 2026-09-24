@@ -594,10 +594,11 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       out->b = dbl;
       return 0;
     }
-    /* VMOV.F32 Sd,#imm / VMOV.F64 Dd,#imm (A8.8.343): bits23=1,21-20=11, bits3-0=0. */
+    /* VMOV.F32 Sd,#imm / VMOV.F64 Dd,#imm (A8.8.343): bits23=1,21-20=11, bits[7:4]==0;
+     * imm4L is bits[3:0] (do NOT require low nibble zero). */
     /* Mask clears D (bit22) and imm/Vd fields; cp already 0xA/0xB in this block. */
-    if ((word & 0x0FB00E0Fu) == 0x0EB00A00u) {
-      uint32_t imm8 = (((word >> 16) & 0xFu) << 4) | ((word >> 4) & 0xFu);
+    if ((word & 0x0FB00EF0u) == 0x0EB00A00u) {
+      uint32_t imm8 = (((word >> 16) & 0xFu) << 4) | (word & 0xFu);
       uint64_t pat;
       if (dbl) {
         /* F64 modified immediate: sign:~expbit:expbit*8:imm6:zeros(48). */
