@@ -4043,10 +4043,15 @@ static int test_t32_ldmdb(void) {
     fprintf(stderr, "FAIL(t32_ldmdb): writeback e934 w=%d p=%d u=%d\n", di.w, di.p, di.u);
     return 1;
   }
+  /* e924 0006 = stmdb r4!, {r1, r2} is Q-OTTD-0bt */
+  if (mango_decode_t32(0xE924u, 0x0006u, &di) != 0 || di.op != MANGO_OP_STM || di.w != 1 ||
+      di.p != 1 || di.u != 0) {
+    fprintf(stderr, "FAIL(t32_ldmdb): STMDB e924 op=%d w=%d\n", di.op, di.w);
+    return 1;
+  }
   if (mango_decode_t32(0xE914u, 0x0000u, &di) == 0 || mango_decode_t32(0xE91Fu, 0x0006u, &di) == 0 ||
-      mango_decode_t32(0xE914u, 0x8006u, &di) == 0 || mango_decode_t32(0xE924u, 0x0006u, &di) == 0 ||
-      mango_decode_t32(0xE934u, 0x0016u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_ldmdb): empty, PC, STMDB, or WB-into-Rn decoded\n");
+      mango_decode_t32(0xE914u, 0x8006u, &di) == 0 || mango_decode_t32(0xE934u, 0x0016u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldmdb): empty, PC, or WB-into-Rn decoded\n");
     return 1;
   }
 
@@ -4082,6 +4087,51 @@ static int test_t32_ldmdb(void) {
     return 1;
   }
   printf("ok: T32 LDMDB r4, {r1, r2} (Q-OTTD-0bo)\n");
+  return 0;
+}
+
+static int test_t32_stmdb(void) {
+  /* Q-OTTD-0bt: stmdb r3, {r1, r2} = e903 0006. r1 at [r3-8], r2 at
+   * [r3-4], r3 unchanged. e923 0006 writeback leaves r3 = r3-8. */
+  static const uint16_t kProg[] = {0xE903u, 0x0006u};
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+  MangoInsn di;
+  if (mango_decode_t32(0xE903u, 0x0006u, &di) != 0 || di.op != MANGO_OP_STM || di.rn != 3 ||
+      di.reglist != 0x6u || di.p != 1 || di.u != 0 || di.w != 0) {
+    fprintf(stderr, "FAIL(t32_stmdb): decode op=%d rn=%u list=0x%x p=%d u=%d w=%d\n", di.op, di.rn,
+            di.reglist, di.p, di.u, di.w);
+    return 1;
+  }
+  if (mango_decode_t32(0xE923u, 0x0006u, &di) != 0 || di.w != 1) {
+    fprintf(stderr, "FAIL(t32_stmdb): writeback w=%d\n", di.w);
+    return 1;
+  }
+  if (mango_decode_t32(0xE903u, 0x0000u, &di) == 0 || mango_decode_t32(0xE90Fu, 0x0006u, &di) == 0 ||
+      mango_decode_t32(0xE903u, 0x8006u, &di) == 0 || mango_decode_t32(0xE923u, 0x000Eu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_stmdb): empty, PC, or WB-into-Rn decoded\n");
+    return 1;
+  }
+
+  uint32_t base = 0x40u;
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[3] = base;
+  cpu.r[1] = 0x11111111u;
+  cpu.r[2] = 0x22222222u;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 10);
+  if (rc != 0 || cpu.r[3] != base || cpu.cpsr != cpsr_before ||
+      bytes_to_u32_le(mem_buf + base - 8u) != 0x11111111u ||
+      bytes_to_u32_le(mem_buf + base - 4u) != 0x22222222u) {
+    fprintf(stderr, "FAIL(t32_stmdb): rc=%d r3=%x m=%x %x\n", rc, cpu.r[3],
+            bytes_to_u32_le(mem_buf + base - 8u), bytes_to_u32_le(mem_buf + base - 4u));
+    return 1;
+  }
+  printf("ok: T32 STMDB r3, {r1, r2} (Q-OTTD-0bt)\n");
   return 0;
 }
 
@@ -10972,6 +11022,7 @@ int main(void) {
   failures += test_t32_pop_w_ldmia_sp_reject();
   failures += test_t32_ldmia_lr_wb();
   failures += test_t32_ldmdb();
+  failures += test_t32_stmdb();
   failures += test_t32_stmia_r12_wb();
   failures += test_t32_ldrsb_w_imm12();
   failures += test_t32_adds_w_imm0();

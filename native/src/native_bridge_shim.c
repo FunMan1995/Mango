@@ -297,7 +297,9 @@
 #define MANGO_SL_CREATE_AUDIO_PLAYER 2
 #define MANGO_SL_COUNT 3
 
-#define MANGO_AS_SIZE 0x4000000u
+/* 96 MiB: libraries use the low 32 MiB, the heap is 16 MiB, and a
+ * file-backed mmap of icudt52l.dat is about 23 MiB past the heap. */
+#define MANGO_AS_SIZE 0x6000000u
 #define MANGO_LIB_CAP 0x2000000u
 #define MANGO_MAX_LIBS 16
 
@@ -1840,8 +1842,10 @@ static void mango_store_bionic_stat(uint8_t* mem, uint32_t addr, const struct st
     memcpy(mem + addr + 32, &v, 8);
   }
   {
+    /* armeabi-v7a st_size is 8-aligned at 48. ICU's uprv_mapFile ldrd's
+     * that slot; a size at 44 made the mapped length the high half (0). */
     int64_t v = (int64_t)st->st_size;
-    memcpy(mem + addr + 44, &v, 8);
+    memcpy(mem + addr + 48, &v, 8);
   }
   {
     uint32_t v = (uint32_t)st->st_blksize;
@@ -2089,6 +2093,35 @@ static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n) {
   memset(lib->guest_mem + a, 0, n);
   lib->heap_used += n;
   return a;
+}
+
+/* File-backed mmap lives after the heap reservation. Anonymous GC maps
+ * stay in the heap (see MANGO_LIBC_MMAP). */
+static uint32_t g_filemap_next;
+
+static uint32_t mango_file_mmap(MangoLoadedLibrary* lib, int host_fd, uint32_t length,
+                                uint32_t offset) {
+  uint32_t base, addr, page = 4096u;
+  ssize_t n;
+  if (!lib || host_fd < 0 || length == 0 || length > 32u * 1024u * 1024u) {
+    return 0;
+  }
+  base = lib->heap_base + MANGO_HEAP_SIZE + MANGO_STACK_SIZE;
+  base = (base + page - 1u) & ~(page - 1u);
+  if (g_filemap_next < base) {
+    g_filemap_next = base;
+  }
+  addr = g_filemap_next;
+  if ((uint64_t)addr + length > lib->guest_mem_size) {
+    return 0;
+  }
+  memset(lib->guest_mem + addr, 0, length);
+  n = pread(host_fd, lib->guest_mem + addr, length, (off_t)offset);
+  if (n < 0) {
+    return 0;
+  }
+  g_filemap_next = (addr + length + page - 1u) & ~(page - 1u);
+  return addr;
 }
 
 /* Page-aligned anonymous mapping for Boehm GC GET_MEM (mmap). */
@@ -3825,8 +3858,28 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     case MANGO_LIBC_MMAP: {
       /* Anon guest pages for Boehm GC GET_MEM. Reject absurd lengths (seen
-       * 0xe3a00000 when GC_page_size was an ARM 'mov r0,#0' opcode). */
+       * 0xe3a00000 when GC_page_size was an ARM 'mov r0,#0' opcode).
+       * A host fd on the stack (mmap's 5th arg) copies that file instead.
+       * Bionic MAP_ANONYMOUS is 0x20. */
       uint32_t a = 0;
+      int flags = (int)cpu->r[3];
+      uint32_t sp = cpu->r[MANGO_REG_SP];
+      if ((flags & 0x20) == 0 && mango_guest_range_ok(lib, sp, 8u)) {
+        uint32_t gfd = mango_load_u32_guest(lib->guest_mem, sp);
+        uint32_t off = mango_load_u32_guest(lib->guest_mem, sp + 4u);
+        MangoGfd* slot = mango_gfd_lookup(gfd);
+        if (slot && slot->kind == MANGO_GFD_HOST && slot->host_fd >= 0) {
+          static int s_fm;
+          a = mango_file_mmap(lib, slot->host_fd, r1, off);
+          if (s_fm < 4) {
+            fprintf(stderr, "mango: mmap file fd=%u len=%u off=%u -> %#x\n", (unsigned)gfd,
+                    (unsigned)r1, (unsigned)off, (unsigned)a);
+            s_fm++;
+          }
+          cpu->r[0] = a ? a : (uint32_t)-1;
+          break;
+        }
+      }
       if (r1 != 0 && r1 <= (MANGO_HEAP_SIZE / 2u)) {
         a = mango_guest_alloc_pages(lib, r1);
       }

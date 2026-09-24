@@ -2990,7 +2990,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0bo: T32 LDMDB Rn{!} without PC. NWidget e914 0006 =
    * ldmdb r4, {r1, r2} (llvm-mc [14,e9,06,00]). p=1 u=0. W is hw1 bit 5;
-   * e934 0006 is ldmdb r4!, {r1, r2}. STMDB (E920, L=0) stays closed.
+   * e934 0006 is ldmdb r4!, {r1, r2}. STMDB is Q-OTTD-0bt.
    * Reject empty list, Rn=PC, PC in the list, and writeback with a
    * non-SP Rn also in the list. */
   if ((hw1 & 0xFFD0u) == 0xE910u && (hw2 & 0x8000u) == 0) {
@@ -3004,6 +3004,32 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       return -1;
     }
     out->op = MANGO_OP_LDM;
+    out->rn = rn;
+    out->reglist = reglist;
+    out->p = 1;
+    out->u = 0;
+    out->w = w;
+    return 0;
+  }
+
+  /* Q-OTTD-0bt: T32 STMDB Rn{!} without PC. Guest e903 0006 =
+   * stmdb r3, {r1, r2} (llvm-mc). p=1 u=0. Lowest reg at the lowest
+   * address. Reject empty list, Rn=PC, PC in the list, and writeback
+   * with a non-SP Rn also in the list. */
+  if ((hw1 & 0xFFD0u) == 0xE900u && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t reglist = hw2 & 0x7FFFu;
+    int w = (hw1 & 0x0020u) != 0;
+    if (rn == MANGO_REG_PC || reglist == 0) {
+      return -1;
+    }
+    if (w && (reglist & (1u << rn)) && rn != MANGO_REG_SP) {
+      return -1;
+    }
+    if (reglist & (1u << MANGO_REG_PC)) {
+      return -1;
+    }
+    out->op = MANGO_OP_STM;
     out->rn = rn;
     out->reglist = reglist;
     out->p = 1;
