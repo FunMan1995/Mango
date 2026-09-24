@@ -1955,11 +1955,12 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0cc: SBCS.W Rd,Rn,Rm{,shift} register (op=0110, S=1).
-   * SQTable::SQTable eb73 0105 = sbcs.w r1, r3, r5
-   * (llvm-mc). r1 = r3 - r5 - NOT(C). SBC register (S=0) stays
-   * closed. Reject Rd/Rn/Rm=PC and a register shift. */
-  if ((hw1 & 0xFFE0u) == 0xEB60u && (hw1 & 0x10u) != 0 && (hw2 & 0x8000u) == 0) {
+  /* Q-OTTD-0cc / 0cf: SBC.W Rd,Rn,Rm{,shift} register (op=0110).
+   * SQTable eb73 0105 = sbcs.w r1, r3, r5 (S=1). The following
+   * hole eb65 0b03 = sbc.w r11, r5, r3 (S=0, llvm-mc [65,eb,03,0b]).
+   * Result is Rn - shifted Rm - NOT(C). S=0 leaves NZCV.
+   * Reject Rd/Rn/Rm=PC and a register shift. */
+  if ((hw1 & 0xFFE0u) == 0xEB60u && (hw2 & 0x8000u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -1973,7 +1974,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rn = rn;
     out->rm = rm;
     out->is_imm = 0;
-    out->sets_flags = 1;
+    out->sets_flags = (hw1 & 0x10u) != 0;
     out->shift_type = (hw2 >> 4) & 3u;
     out->shift_amount = (imm3 << 2) | imm2;
     out->shift_by_reg = 0;
