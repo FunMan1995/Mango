@@ -3111,17 +3111,21 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0n / 0ce / 0ci: T32 LDRD imm, P=1, either direction.
-   * e9d1 2302 = ldrd r2,r3,[r1,#8]. e955 ab04 = ldrd r10,r11,[r5,#-16].
-   * SQFuncState e9f5 8940 = ldrd r8,r9,[r5,#256]! (llvm-mc [f5,e9,40,89]).
-   * W=1 writes the address back to Rn. Post-index (P=0) stays closed.
-   * W=1 with Rn equal to Rt or Rt2 is UNPREDICTABLE. */
-  if ((hw1 & 0xFF50u) == 0xE950u) {
+  /* Q-OTTD-0n / 0ce / 0ci / 0cj: T32 LDRD immediate.
+   * e9d1 2302 = ldrd r2,r3,[r1,#8]. e9f5 8940 = ldrd r8,r9,[r5,#256]!.
+   * CommaExpr e8f5 2308 = ldrd r2,r3,[r5],#32 (llvm-mc [f5,e8,08,23]).
+   * P=0 loads at the old Rn, then W=1 adds the offset. P=0 W=0 is
+   * undefined. W=1 with Rn equal to Rt or Rt2 is UNPREDICTABLE. */
+  if ((hw1 & 0xFE50u) == 0xE850u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
     uint32_t rt2 = (hw2 >> 8) & 0xFu;
     uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw1 >> 8) & 1u);
     int w = (int)((hw1 >> 5) & 1u);
+    if (p == 0 && w == 0) {
+      return -1;
+    }
     if ((rt & 1u) != 0 || rt2 != rt + 1u) {
       return -1; /* even pair only — matches A32 LDRD execute */
     }
@@ -3136,7 +3140,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rd = rt;
     out->is_imm = 1;
     out->imm = imm8 << 2;
-    out->p = 1;
+    out->p = p;
     out->u = (int)((hw1 >> 7) & 1u);
     out->w = w;
     return 0;
