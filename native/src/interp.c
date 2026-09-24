@@ -1662,11 +1662,14 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_TBB: {
-          /* PC for the branch is addr+4. Rn=PC reads Align(that, 4).
+          /* PC for the branch is addr+4. Rn=PC uses that address as the
+           * table base, which is the first byte after a 32-bit Thumb
+           * instruction. SDL's tbb at 0x32e2a is only halfword-aligned, so
+           * Align(PC,4) would read the instruction's own second halfword.
            * Stay in Thumb: the offset is a halfword count, not an
            * interworking address. */
           uint32_t pc = addr + 4u;
-          uint32_t base = insn.rn == MANGO_REG_PC ? (pc & ~3u) : cpu->r[insn.rn];
+          uint32_t base = insn.rn == MANGO_REG_PC ? pc : cpu->r[insn.rn];
           uint32_t idx = cpu->r[insn.rm];
           uint32_t halfwords;
           if (insn.b) {

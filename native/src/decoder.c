@@ -1849,6 +1849,30 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0be: SUB.W Rd,Rn,Rm{,shift} register, S=0.
+   * OpenTTD eba9 7cec = sub.w r12,r9,r12,asr #31 (llvm-mc [a9,eb,ec,7c]).
+   * SUBS (EBBx) stays closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEBA0u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_SUB;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0r: MOV.W Rd,Rm{,shift} register — ORR with Rn=15, S=0.
    * Primary ea4f 7ad0 = mov.w sl,r0,lsr#31; sib ea4f 0847 lsl#1.
    * Rn==15 only. ORR Rn≠15 is Q-OTTD-0aw. Do NOT open MOVS (EA5F)
@@ -1873,11 +1897,11 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0aw: ORR.W Rd,Rn,Rm{,shift} register, S=0, Rn≠15.
-   * OpenTTD ea41 1383 = orr.w r3,r1,r3,lsl #6 (llvm-mc [41,ea,83,13]).
-   * Rn=15 stays MOV.W. ORRS (EA5x) stays closed. Reject Rd/Rn/Rm=PC. */
-  if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) != 0xFu && (hw1 & 0x10u) == 0 &&
-      (hw2 & 0x8000u) == 0) {
+  /* Q-OTTD-0aw / 0bf: ORR.W / ORRS.W Rd,Rn,Rm{,shift}, Rn≠15.
+   * ea41 1383 = orr.w r3,r1,r3,lsl #6. SDL ea5b 0b07 = orrs.w r11,r11,r7.
+   * S is hw1 bit 4. Rn=15 stays MOV.W (S=0) / MOVS stays closed.
+   * Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) != 0xFu && (hw2 & 0x8000u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -1891,7 +1915,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rn = rn;
     out->rm = rm;
     out->is_imm = 0;
-    out->sets_flags = 0;
+    out->sets_flags = (int)((hw1 >> 4) & 1u);
     out->shift_type = (hw2 >> 4) & 3u;
     out->shift_amount = (imm3 << 2) | imm2;
     out->shift_by_reg = 0;
@@ -2033,7 +2057,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * (llvm-mc [df,e8,02,f0]). e8df f016 = tbh [pc, r6, lsl #1]
    * (llvm-mc [df,e8,16,f0]) in the deque push switch.
    * hw1 E8D0|Rn, hw2 F000|(H<<4)|Rm. BranchWritePC(PC + 2*table).
-   * Rn=PC uses Align(PC,4) for both TBB and TBH. Rm=PC rejected. */
+   * Rn=PC uses the address of the next byte (addr+4) for both TBB and
+   * TBH. Rm=PC rejected. */
   if ((hw1 & 0xFFF0u) == 0xE8D0u && (hw2 & 0xFFE0u) == 0xF000u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -2889,6 +2914,27 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rm = rn; /* multiplicand Rn → interp rm lane */
     out->rs = rm; /* multiplicand Rm → interp rs lane */
     out->rn = (ra == 0xFu) ? 0u : ra;
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bd: T32 SMULL RdLo,RdHi,Rn,Rm. OpenTTD fb8c 8900 =
+   * smull r8,r9,r12,r0 (llvm-mc [8c,fb,00,89]). RdLo→rd, RdHi→rn,
+   * Rn→rm, Rm→rs. UMULL/SMLAL/UMLAL stay closed. */
+  if ((hw1 & 0xFFF0u) == 0xFB80u && (hw2 & 0x00F0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rdlo = (hw2 >> 12) & 0xFu;
+    uint32_t rdhi = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rdlo == MANGO_REG_PC || rdhi == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC ||
+        rdlo == rdhi) {
+      return -1;
+    }
+    out->op = MANGO_OP_SMULL;
+    out->rd = rdlo;
+    out->rn = rdhi;
+    out->rm = rn;
+    out->rs = rm;
     out->sets_flags = 0;
     return 0;
   }

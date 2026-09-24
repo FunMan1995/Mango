@@ -2978,6 +2978,155 @@ static int test_t32_mla(void) {
   return 0;
 }
 
+static int test_t32_smull(void) {
+  /* Q-OTTD-0bd: smull r8,r9,r12,r0 = fb8c 8900. r9:r8 = r12 * r0, signed.
+   * Flags hold. Sibling fb87 8900 is smull r8,r9,r7,r0. */
+  static const uint16_t kProg[] = {0xFB8Cu, 0x8900u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xFB8Cu, 0x8900u, &di) != 0 || di.op != MANGO_OP_SMULL || di.rd != 8 ||
+      di.rn != 9 || di.rm != 12 || di.rs != 0 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_smull): decode op=%d rd=%u rn=%u rm=%u rs=%u\n", di.op, di.rd, di.rn,
+            di.rm, di.rs);
+    return 1;
+  }
+  if (mango_decode_t32(0xFB8Cu, 0x8800u, &di) == 0 || mango_decode_t32(0xFB9Cu, 0x8900u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_smull): RdLo==RdHi or UMULL decoded\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xFB87u, 0x8900u, &di) != 0 || di.op != MANGO_OP_SMULL || di.rm != 7) {
+    fprintf(stderr, "FAIL(t32_smull sib): op=%d rm=%u\n", di.op, di.rm);
+    return 1;
+  }
+
+  struct {
+    uint32_t n, m, lo, hi;
+  } cases[] = {
+      {5u, 7u, 35u, 0u},
+      {0xfffffffeu, 3u, 0xfffffffau, 0xffffffffu},
+      {0x10000u, 0x10000u, 0u, 1u},
+      {6u, 0x2aaaaaabu, 2u, 1u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[12] = cases[c].n;
+    cpu.r[0] = cases[c].m;
+    cpu.r[8] = 0x111u;
+    cpu.r[9] = 0x222u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[8] != cases[c].lo || cpu.r[9] != cases[c].hi || cpu.r[12] != cases[c].n ||
+        cpu.r[0] != cases[c].m || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_smull#%u): rc=%d lo=%x hi=%x cpsr %x->%x\n", c, rc, cpu.r[8],
+              cpu.r[9], cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 SMULL r8,r9,r12,r0 (Q-OTTD-0bd)\n");
+  return 0;
+}
+
+static int test_t32_sub_w_reg_asr31(void) {
+  /* Q-OTTD-0be: sub.w r12,r9,r12,asr #31 = eba9 7cec.
+   * r12 = r9 - (r12 ASR #31). Flags hold. SUBS stays closed. */
+  static const uint16_t kProg[] = {0xEBA9u, 0x7CECu, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xEBA9u, 0x7CECu, &di) != 0 || di.op != MANGO_OP_SUB || di.rd != 12 ||
+      di.rn != 9 || di.rm != 12 || di.is_imm != 0 || di.sets_flags != 0 || di.shift_type != 2 ||
+      di.shift_amount != 31) {
+    fprintf(stderr, "FAIL(t32_sub_reg): decode op=%d rd=%u ty=%u amt=%u s=%d\n", di.op, di.rd,
+            di.shift_type, di.shift_amount, di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xEBB9u, 0x7CECu, &di) == 0 || mango_decode_t32(0xEBAFu, 0x7CECu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_sub_reg): SUBS or Rn=PC decoded\n");
+    return 1;
+  }
+
+  struct {
+    uint32_t rn, rm, want;
+  } cases[] = {
+      {5u, 0u, 5u},
+      {5u, 1u, 5u},
+      {5u, 0x80000000u, 6u},
+      {0u, 0xffffffffu, 1u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[9] = cases[c].rn;
+    cpu.r[12] = cases[c].rm;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[12] != cases[c].want || cpu.r[9] != cases[c].rn ||
+        cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_sub_reg#%u): rc=%d r12=%x want %x cpsr %x->%x\n", c, rc, cpu.r[12],
+              cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 SUB.W r12,r9,r12,asr #31 (Q-OTTD-0be)\n");
+  return 0;
+}
+
+static int test_t32_orrs_w_reg(void) {
+  /* Q-OTTD-0bf: orrs.w r11,r11,r7 = ea5b 0b07. r11 |= r7. NZ from the
+   * result; C and V hold. */
+  static const uint16_t kProg[] = {0xEA5Bu, 0x0B07u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xEA5Bu, 0x0B07u, &di) != 0 || di.op != MANGO_OP_ORR || di.rd != 11 ||
+      di.rn != 11 || di.rm != 7 || di.sets_flags != 1 || di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_orrs): decode op=%d rd=%u s=%d amt=%u\n", di.op, di.rd, di.sets_flags,
+            di.shift_amount);
+    return 1;
+  }
+
+  struct {
+    uint32_t rn, rm, want, z, n;
+  } cases[] = {
+      {0u, 0u, 0u, 1u, 0u},
+      {1u, 2u, 3u, 0u, 0u},
+      {0x80000000u, 1u, 0x80000001u, 0u, 1u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    cpu.r[11] = cases[c].rn;
+    cpu.r[7] = cases[c].rm;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    int z = (cpu.cpsr & MANGO_CPSR_Z) != 0;
+    int n = (cpu.cpsr & MANGO_CPSR_N) != 0;
+    int cv = (cpu.cpsr & (MANGO_CPSR_C | MANGO_CPSR_V)) == (MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[11] != cases[c].want || cpu.r[7] != cases[c].rm ||
+        (unsigned)z != cases[c].z || (unsigned)n != cases[c].n || !cv ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr, "FAIL(t32_orrs#%u): rc=%d r11=%x z=%d n=%d cpsr=%x\n", c, rc, cpu.r[11], z, n,
+              cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 ORRS.W r11,r11,r7 (Q-OTTD-0bf)\n");
+  return 0;
+}
+
 static int test_t32_orr_w_reg_lsl6(void) {
   /* Q-OTTD-0aw: orr.w r3,r1,r3,lsl #6 = ea41 1383. r3 = r1 | (r3<<6). Flags hold. */
   static const uint16_t kProg[] = {0xEA41u, 0x1383u, 0x4770u};
@@ -2995,8 +3144,8 @@ static int test_t32_orr_w_reg_lsl6(void) {
     fprintf(stderr, "FAIL(t32_orr_reg): Rn=15 no longer MOV\n");
     return 1;
   }
-  if (mango_decode_t32(0xEA51u, 0x1383u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_orr_reg): ORRS decoded\n");
+  if (mango_decode_t32(0xEA51u, 0x1383u, &di) != 0 || di.op != MANGO_OP_ORR || di.sets_flags != 1) {
+    fprintf(stderr, "FAIL(t32_orr_reg): ORRS op=%d s=%d\n", di.op, di.sets_flags);
     return 1;
   }
 
@@ -4004,7 +4153,7 @@ static int test_t32_tbb_pc(void) {
     return 1;
   }
 
-  /* Q-OTTD-0az: tbh [pc, r6, lsl #1] = e8df f016. Base Align(addr+4,4)=4.
+  /* Q-OTTD-0az: tbh [pc, r6, lsl #1] = e8df f016. Base is addr+4.
    * r6=0 half=1 → pc 6; r6=1 half=5 → pc 14. Thumb and NZCV hold. */
   if (mango_decode_t32(0xE8DFu, 0xF016u, &di) != 0 || di.op != MANGO_OP_TBB || di.b != 1 ||
       di.rn != MANGO_REG_PC || di.rm != 6) {
@@ -4039,7 +4188,28 @@ static int test_t32_tbb_pc(void) {
       return 1;
     }
   }
-  printf("ok: T32 TBB [pc, r2] and TBH [pc, r6] (Q-OTTD-0an/0az)\n");
+  /* Q-OTTD-0bc: tbb [pc, r2] at address 2, halfword-aligned like SDL
+   * e8df f001 at 0x32e2a. Table byte 0 is at addr+4 (6), not at the
+   * second halfword of the instruction (4, which is 0x02). Index 0
+   * byte 3 → pc 6+6 = 12. An aligned base would land on 10. */
+  uint8_t odd[32];
+  memset(odd, 0, sizeof(odd));
+  odd[2] = 0xdf;
+  odd[3] = 0xe8;
+  odd[4] = 0x02;
+  odd[5] = 0xf0;
+  odd[6] = 3;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_PC] = 2u;
+  cpu.r[2] = 0;
+  MangoMemory mem_odd = {odd, sizeof(odd)};
+  rc = mango_interp_run(&cpu, &mem_odd, 12u, 4);
+  if (rc != 0 || cpu.r[MANGO_REG_PC] != 12u || (cpu.cpsr & MANGO_CPSR_T) == 0) {
+    fprintf(stderr, "FAIL(t32_tbb odd): rc=%d pc=%x\n", rc, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: T32 TBB [pc, r2] and TBH [pc, r6] (Q-OTTD-0an/0az/0bc)\n");
   return 0;
 }
 
@@ -10075,6 +10245,9 @@ int main(void) {
   failures += test_t32_push_w_stmdb_sp();
   failures += test_t32_mul_ra15();
   failures += test_t32_mla();
+  failures += test_t32_smull();
+  failures += test_t32_sub_w_reg_asr31();
+  failures += test_t32_orrs_w_reg();
   failures += test_t32_orr_w_reg_lsl6();
   failures += test_t32_eor_w_reg();
   failures += test_t32_lsl_w_reg();
