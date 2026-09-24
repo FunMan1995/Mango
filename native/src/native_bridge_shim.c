@@ -58,6 +58,7 @@
 #define MANGO_JNI_CALL_OBJECT_METHOD 34
 #define MANGO_JNI_CALL_BOOLEAN_METHOD 37
 #define MANGO_JNI_CALL_INT_METHOD 49
+#define MANGO_JNI_CALL_FLOAT_METHOD 55
 #define MANGO_JNI_CALL_VOID_METHOD 61
 #define MANGO_JNI_GET_FIELD_ID 94
 #define MANGO_JNI_GET_OBJECT_FIELD 95
@@ -557,6 +558,7 @@ static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v);
 static uint32_t mango_load_u32_guest(const uint8_t* mem, uint32_t addr);
 static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n);
 static uint32_t mango_handle_intern(void* p);
+static uint32_t mango_guest_strdup(MangoLoadedLibrary* lib, const char* s);
 static void* mango_handle_lookup(uint32_t id);
 static const char* mango_fake_jstring_chars(MangoLoadedLibrary* lib, void* js);
 static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path, char* out,
@@ -850,7 +852,16 @@ typedef enum {
   MANGO_MID_PNG_GET_WIDTH,
   MANGO_MID_PNG_GET_HEIGHT,
   MANGO_MID_PNG_GET_PIXELS,
-  MANGO_MID_PNG_CLOSE
+  MANGO_MID_PNG_CLOSE,
+  /* Pacman Q3 StoreManager prefs (research/50) */
+  MANGO_MID_STORE_LOAD_BOOL,
+  MANGO_MID_STORE_SAVE_BOOL,
+  MANGO_MID_STORE_LOAD_INT,
+  MANGO_MID_STORE_SAVE_INT,
+  MANGO_MID_STORE_LOAD_FLOAT,
+  MANGO_MID_STORE_SAVE_FLOAT,
+  MANGO_MID_STORE_LOAD_STRING,
+  MANGO_MID_STORE_SAVE_STRING
 } MangoMidKind;
 
 typedef struct {
@@ -896,6 +907,39 @@ static MangoMidKind mango_classify_png_mid(const char* name, const char* sig) {
   if (strcmp(name, "close") == 0 && sig && strstr(sig, "Bitmap") != NULL &&
       strstr(sig, ")V") != NULL) {
     return MANGO_MID_PNG_CLOSE;
+  }
+  /* StoreManager — honour defValue when key missing (Engine_saved → false). */
+  if (strcmp(name, "loadBoolean") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")Z") != NULL) {
+    return MANGO_MID_STORE_LOAD_BOOL;
+  }
+  if (strcmp(name, "saveBoolean") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")V") != NULL) {
+    return MANGO_MID_STORE_SAVE_BOOL;
+  }
+  if (strcmp(name, "loadInt") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")I") != NULL) {
+    return MANGO_MID_STORE_LOAD_INT;
+  }
+  if (strcmp(name, "saveInt") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")V") != NULL) {
+    return MANGO_MID_STORE_SAVE_INT;
+  }
+  if (strcmp(name, "loadFloat") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")F") != NULL) {
+    return MANGO_MID_STORE_LOAD_FLOAT;
+  }
+  if (strcmp(name, "saveFloat") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")V") != NULL) {
+    return MANGO_MID_STORE_SAVE_FLOAT;
+  }
+  if (strcmp(name, "loadString") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")Ljava/lang/String;") != NULL) {
+    return MANGO_MID_STORE_LOAD_STRING;
+  }
+  if (strcmp(name, "saveString") == 0 && sig && strstr(sig, "String") != NULL &&
+      strstr(sig, ")V") != NULL) {
+    return MANGO_MID_STORE_SAVE_STRING;
   }
   return MANGO_MID_UNKNOWN;
 }
@@ -1150,6 +1194,270 @@ static uint32_t mango_jni_call_png(MangoLoadedLibrary* lib, MangoCpu* cpu, Mango
     default:
       return 0;
   }
+}
+
+/* Pacman Q3 (research/50): host StoreManager in-memory prefs.
+ * Soft CallBooleanMethod returned 1 → loadBool("Engine_saved", false) truthy →
+ * Engine::initLogic called load() with null currentMenu → ELF-magic vtable LDR.
+ * Honour defValue when key missing so cold start takes STATE_AFTER_LOADING. */
+#define MANGO_PREF_MAX 64
+#define MANGO_PREF_KEY_MAX 64
+#define MANGO_PREF_STR_MAX 256
+
+typedef enum {
+  MANGO_PREF_BOOL = 1,
+  MANGO_PREF_INT,
+  MANGO_PREF_FLOAT,
+  MANGO_PREF_STRING
+} MangoPrefType;
+
+typedef struct {
+  int used;
+  MangoPrefType type;
+  char key[MANGO_PREF_KEY_MAX];
+  int i;       /* bool/int */
+  float f;
+  char* s;     /* heap string for PREF_STRING */
+} MangoPref;
+
+static MangoPref g_prefs[MANGO_PREF_MAX];
+
+static MangoPref* mango_pref_find(const char* key) {
+  if (!key) {
+    return NULL;
+  }
+  for (int i = 0; i < MANGO_PREF_MAX; i++) {
+    if (g_prefs[i].used && strcmp(g_prefs[i].key, key) == 0) {
+      return &g_prefs[i];
+    }
+  }
+  return NULL;
+}
+
+static MangoPref* mango_pref_alloc(const char* key) {
+  MangoPref* p = mango_pref_find(key);
+  if (p) {
+    return p;
+  }
+  for (int i = 0; i < MANGO_PREF_MAX; i++) {
+    if (!g_prefs[i].used) {
+      p = &g_prefs[i];
+      memset(p, 0, sizeof(*p));
+      p->used = 1;
+      strncpy(p->key, key, sizeof(p->key) - 1u);
+      return p;
+    }
+  }
+  return NULL;
+}
+
+static void mango_pref_set_bool(const char* key, int v) {
+  MangoPref* p = mango_pref_alloc(key);
+  if (!p) {
+    return;
+  }
+  free(p->s);
+  p->s = NULL;
+  p->type = MANGO_PREF_BOOL;
+  p->i = v ? 1 : 0;
+}
+
+static void mango_pref_set_int(const char* key, int v) {
+  MangoPref* p = mango_pref_alloc(key);
+  if (!p) {
+    return;
+  }
+  free(p->s);
+  p->s = NULL;
+  p->type = MANGO_PREF_INT;
+  p->i = v;
+}
+
+static void mango_pref_set_float(const char* key, float v) {
+  MangoPref* p = mango_pref_alloc(key);
+  if (!p) {
+    return;
+  }
+  free(p->s);
+  p->s = NULL;
+  p->type = MANGO_PREF_FLOAT;
+  p->f = v;
+}
+
+static void mango_pref_set_string(const char* key, const char* val) {
+  MangoPref* p = mango_pref_alloc(key);
+  char* dup;
+  if (!p) {
+    return;
+  }
+  free(p->s);
+  p->s = NULL;
+  p->type = MANGO_PREF_STRING;
+  if (!val) {
+    val = "";
+  }
+  dup = (char*)malloc(strlen(val) + 1u);
+  if (!dup) {
+    return;
+  }
+  memcpy(dup, val, strlen(val) + 1u);
+  p->s = dup;
+}
+
+static int mango_jni_store_args(MangoLoadedLibrary* lib, MangoCpu* cpu, int form,
+                                uint32_t* arg0, uint32_t* arg1, uint32_t* arg2) {
+  /* form: 0=Call*Method, 1=Call*MethodV, 2=Call*MethodA. Store::* uses *V. */
+  *arg0 = 0;
+  *arg1 = 0;
+  *arg2 = 0;
+  if (form == 1) {
+    uint32_t va = cpu->r[3];
+    if (!mango_guest_range_ok(lib, va, 4u)) {
+      return 0;
+    }
+    *arg0 = mango_load_u32_guest(lib->guest_mem, va);
+    if (mango_guest_range_ok(lib, va + 4u, 4u)) {
+      *arg1 = mango_load_u32_guest(lib->guest_mem, va + 4u);
+    }
+    if (mango_guest_range_ok(lib, va + 8u, 4u)) {
+      *arg2 = mango_load_u32_guest(lib->guest_mem, va + 8u);
+    }
+    return 1;
+  }
+  if (form == 2) {
+    uint32_t jv = cpu->r[3];
+    if (!mango_guest_range_ok(lib, jv, 8u)) {
+      return 0;
+    }
+    *arg0 = mango_load_u32_guest(lib->guest_mem, jv);
+    *arg1 = mango_load_u32_guest(lib->guest_mem, jv + 8u);
+    if (mango_guest_range_ok(lib, jv + 16u, 4u)) {
+      *arg2 = mango_load_u32_guest(lib->guest_mem, jv + 16u);
+    }
+    return 1;
+  }
+  *arg0 = cpu->r[3];
+  if (mango_guest_range_ok(lib, cpu->r[MANGO_REG_SP], 4u)) {
+    *arg1 = mango_load_u32_guest(lib->guest_mem, cpu->r[MANGO_REG_SP]);
+  }
+  if (mango_guest_range_ok(lib, cpu->r[MANGO_REG_SP] + 4u, 4u)) {
+    *arg2 = mango_load_u32_guest(lib->guest_mem, cpu->r[MANGO_REG_SP] + 4u);
+  }
+  return 1;
+}
+
+static uint32_t mango_jni_call_store(MangoLoadedLibrary* lib, MangoCpu* cpu, MangoJniMethod* mid,
+                                     int form) {
+  uint32_t arg0 = 0, arg1 = 0, arg2 = 0;
+  const char* key;
+  if (mid->kind < MANGO_MID_STORE_LOAD_BOOL || mid->kind > MANGO_MID_STORE_SAVE_STRING) {
+    return 0;
+  }
+  if (!mango_jni_store_args(lib, cpu, form, &arg0, &arg1, &arg2)) {
+    fprintf(stderr, "mango: StoreManager Call* bad args form=%d\n", form);
+    cpu->r[0] = 0;
+    return 1;
+  }
+  key = mango_jstring_chars(lib, arg0);
+  if (!key) {
+    key = "";
+  }
+  switch (mid->kind) {
+    case MANGO_MID_STORE_LOAD_BOOL: {
+      MangoPref* p = mango_pref_find(key);
+      int def = arg1 ? 1 : 0;
+      int v = p && p->type == MANGO_PREF_BOOL ? p->i : def;
+      fprintf(stderr, "mango: StoreManager.loadBoolean %s -> %d (def=%d)\n", key, v, def);
+      cpu->r[0] = (uint32_t)v;
+      return 1;
+    }
+    case MANGO_MID_STORE_SAVE_BOOL: {
+      mango_pref_set_bool(key, arg1 ? 1 : 0);
+      fprintf(stderr, "mango: StoreManager.saveBoolean %s = %d\n", key, arg1 ? 1 : 0);
+      cpu->r[0] = 0;
+      return 1;
+    }
+    case MANGO_MID_STORE_LOAD_INT: {
+      MangoPref* p = mango_pref_find(key);
+      int def = (int)arg1;
+      int v = p && p->type == MANGO_PREF_INT ? p->i : def;
+      fprintf(stderr, "mango: StoreManager.loadInt %s -> %d (def=%d)\n", key, v, def);
+      cpu->r[0] = (uint32_t)v;
+      return 1;
+    }
+    case MANGO_MID_STORE_SAVE_INT: {
+      mango_pref_set_int(key, (int)arg1);
+      fprintf(stderr, "mango: StoreManager.saveInt %s = %d\n", key, (int)arg1);
+      cpu->r[0] = 0;
+      return 1;
+    }
+    case MANGO_MID_STORE_LOAD_FLOAT: {
+      /* Varargs promote float→double; lo/hi in arg1/arg2 after key. */
+      union {
+        double d;
+        uint32_t u[2];
+      } du;
+      union {
+        float f;
+        uint32_t u;
+      } fu;
+      MangoPref* p = mango_pref_find(key);
+      du.u[0] = arg1;
+      du.u[1] = arg2;
+      fu.f = (float)du.d;
+      if (p && p->type == MANGO_PREF_FLOAT) {
+        fu.f = p->f;
+      }
+      fprintf(stderr, "mango: StoreManager.loadFloat %s -> %g\n", key, (double)fu.f);
+      cpu->r[0] = fu.u;
+      return 1;
+    }
+    case MANGO_MID_STORE_SAVE_FLOAT: {
+      union {
+        double d;
+        uint32_t u[2];
+      } du;
+      du.u[0] = arg1;
+      du.u[1] = arg2;
+      mango_pref_set_float(key, (float)du.d);
+      fprintf(stderr, "mango: StoreManager.saveFloat %s = %g\n", key, du.d);
+      cpu->r[0] = 0;
+      return 1;
+    }
+    case MANGO_MID_STORE_LOAD_STRING: {
+      MangoPref* p = mango_pref_find(key);
+      if (p && p->type == MANGO_PREF_STRING && p->s) {
+        uint32_t ga = mango_guest_strdup(lib, p->s);
+        cpu->r[0] = mango_handle_intern((void*)(uintptr_t)ga);
+        fprintf(stderr, "mango: StoreManager.loadString %s -> (stored)\n", key);
+      } else {
+        /* Honour def jobject when unset. */
+        cpu->r[0] = arg1;
+        fprintf(stderr, "mango: StoreManager.loadString %s -> (def)\n", key);
+      }
+      return 1;
+    }
+    case MANGO_MID_STORE_SAVE_STRING: {
+      const char* val = mango_jstring_chars(lib, arg1);
+      mango_pref_set_string(key, val ? val : "");
+      fprintf(stderr, "mango: StoreManager.saveString %s\n", key);
+      cpu->r[0] = 0;
+      return 1;
+    }
+    default:
+      return 0;
+  }
+}
+
+static uint32_t mango_jni_call_host(MangoLoadedLibrary* lib, MangoCpu* cpu, MangoJniMethod* mid,
+                                    int form) {
+  if (!mid || mid->kind == MANGO_MID_UNKNOWN) {
+    return 0;
+  }
+  if (mango_jni_call_png(lib, cpu, mid, form)) {
+    return 1;
+  }
+  return mango_jni_call_store(lib, cpu, mid, form);
 }
 
 /* Resolve path for fopen: as-is, then <libdir>/../gamedata/<path>, then
@@ -3725,7 +4033,7 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
           fn == MANGO_JNI_CALL_OBJECT_METHOD + 2) {
         mid = mango_jni_method_from_mid(cpu->r[2]);
         if (mid && mid->kind != MANGO_MID_UNKNOWN &&
-            mango_jni_call_png(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_OBJECT_METHOD))) {
+            mango_jni_call_host(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_OBJECT_METHOD))) {
           break;
         }
       }
@@ -3738,9 +4046,19 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
     case MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD:
     case MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD + 1:
     case MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD + 2:
-    case MANGO_JNI_GET_BOOLEAN_FIELD:
+    case MANGO_JNI_GET_BOOLEAN_FIELD: {
+      MangoJniMethod* mid = NULL;
+      if (fn == MANGO_JNI_CALL_BOOLEAN_METHOD || fn == MANGO_JNI_CALL_BOOLEAN_METHOD + 1 ||
+          fn == MANGO_JNI_CALL_BOOLEAN_METHOD + 2) {
+        mid = mango_jni_method_from_mid(cpu->r[2]);
+        if (mid && mid->kind != MANGO_MID_UNKNOWN &&
+            mango_jni_call_host(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_BOOLEAN_METHOD))) {
+          break;
+        }
+      }
       cpu->r[0] = 1;
       break;
+    }
     case MANGO_JNI_CALL_INT_METHOD:
     case MANGO_JNI_CALL_INT_METHOD + 1:
     case MANGO_JNI_CALL_INT_METHOD + 2:
@@ -3754,11 +4072,22 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
           fn == MANGO_JNI_CALL_INT_METHOD + 2) {
         mid = mango_jni_method_from_mid(cpu->r[2]);
         if (mid && mid->kind != MANGO_MID_UNKNOWN &&
-            mango_jni_call_png(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_INT_METHOD))) {
+            mango_jni_call_host(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_INT_METHOD))) {
           break;
         }
       }
       cpu->r[0] = 1;
+      break;
+    }
+    case MANGO_JNI_CALL_FLOAT_METHOD:
+    case MANGO_JNI_CALL_FLOAT_METHOD + 1:
+    case MANGO_JNI_CALL_FLOAT_METHOD + 2: {
+      MangoJniMethod* mid = mango_jni_method_from_mid(cpu->r[2]);
+      if (mid && mid->kind != MANGO_MID_UNKNOWN &&
+          mango_jni_call_host(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_FLOAT_METHOD))) {
+        break;
+      }
+      cpu->r[0] = 0;
       break;
     }
     case MANGO_JNI_CALL_VOID_METHOD:
@@ -3774,7 +4103,7 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
           fn == MANGO_JNI_CALL_VOID_METHOD + 2) {
         mid = mango_jni_method_from_mid(cpu->r[2]);
         if (mid && mid->kind != MANGO_MID_UNKNOWN &&
-            mango_jni_call_png(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_VOID_METHOD))) {
+            mango_jni_call_host(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_VOID_METHOD))) {
           break;
         }
       }
@@ -3983,17 +4312,19 @@ static int mango_parse_shorty(const char* shorty, char* ret, char* args, uint32_
     const char* r = p + 1;
     *ret = mango_consume_jni_type(&r);
   } else {
+    /* ART shorty: one char per type (Z/B/S/C/I/J/F/D/V/L/[). Do NOT use
+     * mango_consume_jni_type here — that treats L as JNI Lfully/Name; and
+     * collapses VIILLL → IIL, dropping Asset/Store jobjects (Pacman Q3). */
     const char* p = shorty;
-    *ret = mango_consume_jni_type(&p);
+    if (*p == '\0') {
+      return -1;
+    }
+    *ret = *p++;
     while (*p) {
       if (n + 1 >= args_max) {
         return -1;
       }
-      char t = mango_consume_jni_type(&p);
-      if (t == 0) {
-        return -1;
-      }
-      args[n++] = t;
+      args[n++] = *p++;
     }
   }
   args[n] = 0;

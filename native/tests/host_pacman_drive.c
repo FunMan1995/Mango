@@ -177,11 +177,14 @@ int main(int argc, char** argv) {
   /* Host PngManager sentinel — JNI Call* dispatches open/getWidth/getHeight/
    * getPixels/close in native_bridge_shim (Pacman Q1 research/48). */
   static char png_mgr_obj = 'P';
+  /* Host StoreManager sentinel — in-memory prefs honour defValue (Pacman Q3
+   * research/50). Critical: loadBoolean("Engine_saved", false) → false. */
+  static char store_mgr_obj = 'S';
   JNIEnv* env = (JNIEnv*)(uintptr_t)1;
   jobject thiz = (jobject)(uintptr_t)2;
   jobject png_mgr = (jobject)&png_mgr_obj;
   jobject asset_mgr = (jobject)(uintptr_t)4; /* fake; AAsset* host I/O live */
-  jobject store_mgr = (jobject)(uintptr_t)5; /* fake; StoreManager prefs */
+  jobject store_mgr = (jobject)&store_mgr_obj;
 
   fprintf(stderr, "mango_host_pacman_drive: calling init(640,480,Png,Asset,Store)\n");
   ((mango_init_fn)init)(env, thiz, 640, 480, png_mgr, asset_mgr, store_mgr);
