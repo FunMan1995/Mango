@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <time.h>
 #ifndef ANDROID
 #include <png.h>
@@ -234,7 +235,16 @@
 #define MANGO_LIBC_STAT 145
 #define MANGO_LIBC_LSTAT 146
 #define MANGO_LIBC_ACCESS 147
-#define MANGO_LIBC_COUNT 148
+#define MANGO_LIBC_AASSET_MGR_FROM_JAVA 148
+#define MANGO_LIBC_AASSET_MGR_OPEN 149
+#define MANGO_LIBC_AASSET_MGR_OPENDIR 150
+#define MANGO_LIBC_AASSET_DIR_GET_NEXT 151
+#define MANGO_LIBC_AASSET_DIR_CLOSE 152
+#define MANGO_LIBC_AASSET_GET_LENGTH 153
+#define MANGO_LIBC_AASSET_READ 154
+#define MANGO_LIBC_AASSET_CLOSE 155
+#define MANGO_LIBC_AASSET_OPEN_FD 156
+#define MANGO_LIBC_COUNT 157
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x4000000u
@@ -446,6 +456,15 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "stat",
     "lstat",
     "access",
+    "AAssetManager_fromJava",
+    "AAssetManager_open",
+    "AAssetManager_openDir",
+    "AAssetDir_getNextFileName",
+    "AAssetDir_close",
+    "AAsset_getLength",
+    "AAsset_read",
+    "AAsset_close",
+    "AAsset_openFileDescriptor",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -655,6 +674,120 @@ static void mango_file_release(uint32_t id) {
     g_files[id] = NULL;
   }
 }
+
+/* Android AAsset* backed by $MANGO_ASSET_ROOT (Pacman Q0 research/47). Guest
+ * handles are small table ids; getNextFileName strings live in guest heap. */
+#define MANGO_AASSET_MAX 64
+#define MANGO_AASSET_DIR_MAX 16
+#define MANGO_AASSET_MGR_HANDLE 1u
+
+typedef struct {
+  int used;
+  FILE* fp;
+  long length;
+  long pos;
+  char host_path[768];
+} MangoAAsset;
+
+typedef struct {
+  int used;
+  DIR* dir;
+  char host_dir[768];
+  uint32_t guest_name;
+} MangoAAssetDir;
+
+static MangoAAsset g_aassets[MANGO_AASSET_MAX];
+static MangoAAssetDir g_aasset_dirs[MANGO_AASSET_DIR_MAX];
+
+static int mango_aasset_host_path(MangoLoadedLibrary* lib, const char* rel, char* out,
+                                  size_t outsz) {
+  const char* root;
+  (void)lib;
+  if (!rel || !out || outsz == 0) {
+    return 0;
+  }
+  while (rel[0] == '.' && rel[1] == '/') {
+    rel += 2;
+  }
+  if (rel[0] == '/' && access(rel, F_OK) == 0) {
+    snprintf(out, outsz, "%s", rel);
+    return 1;
+  }
+  root = getenv("MANGO_ASSET_ROOT");
+  if (root && root[0]) {
+    if (rel[0] == '\0') {
+      snprintf(out, outsz, "%s", root);
+    } else {
+      snprintf(out, outsz, "%s/%s", root, rel);
+    }
+    if (access(out, F_OK) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static uint32_t mango_aasset_alloc(void) {
+  for (uint32_t i = 1; i < MANGO_AASSET_MAX; i++) {
+    if (!g_aassets[i].used) {
+      memset(&g_aassets[i], 0, sizeof(g_aassets[i]));
+      g_aassets[i].used = 1;
+      return i;
+    }
+  }
+  return 0;
+}
+
+static MangoAAsset* mango_aasset_get(uint32_t id) {
+  if (id == 0 || id >= MANGO_AASSET_MAX || !g_aassets[id].used) {
+    return NULL;
+  }
+  return &g_aassets[id];
+}
+
+static void mango_aasset_free(uint32_t id) {
+  MangoAAsset* a = mango_aasset_get(id);
+  if (!a) {
+    return;
+  }
+  if (a->fp) {
+    fclose(a->fp);
+    a->fp = NULL;
+  }
+  a->used = 0;
+}
+
+static uint32_t mango_aasset_dir_alloc(void) {
+  for (uint32_t i = 1; i < MANGO_AASSET_DIR_MAX; i++) {
+    if (!g_aasset_dirs[i].used) {
+      memset(&g_aasset_dirs[i], 0, sizeof(g_aasset_dirs[i]));
+      g_aasset_dirs[i].used = 1;
+      return i;
+    }
+  }
+  return 0;
+}
+
+static MangoAAssetDir* mango_aasset_dir_get(uint32_t id) {
+  if (id == 0 || id >= MANGO_AASSET_DIR_MAX || !g_aasset_dirs[id].used) {
+    return NULL;
+  }
+  return &g_aasset_dirs[id];
+}
+
+static void mango_aasset_dir_free(uint32_t id) {
+  MangoAAssetDir* d = mango_aasset_dir_get(id);
+  if (!d) {
+    return;
+  }
+  if (d->dir) {
+    closedir(d->dir);
+    d->dir = NULL;
+  }
+  d->guest_name = 0;
+  d->used = 0;
+}
+
 
 /* Resolve path for fopen: as-is, then <libdir>/../gamedata/<path>, then
  * <libdir>/../<path>, then $MANGO_ASSET_ROOT/<path>. */
@@ -1350,8 +1483,11 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
     name = "ANativeWindow_getWidth";
   } else if (strcmp(name, "ANativeWindow_getHeight") == 0) {
     name = "ANativeWindow_getHeight";
+  } else if (strncmp(name, "AAsset", 6) == 0) {
+    /* Pacman Q0: real AAsset* host I/O via kLibcNames + MANGO_ASSET_ROOT.
+     * Do not soft-map to eglGetDisplay (getNextFileName must eventually NULL). */
   } else if (strncmp(name, "egl", 3) == 0 || strncmp(name, "ANative", 7) == 0 ||
-             strncmp(name, "ALooper", 7) == 0 || strncmp(name, "AAsset", 6) == 0) {
+             strncmp(name, "ALooper", 7) == 0) {
     name = "eglGetDisplay";
   } else if (name[0] == 'g' && name[1] == 'l') {
     return lib->stub_addr;
@@ -2719,6 +2855,179 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         mango_set_guest_errno(lib, errno);
       }
       cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_AASSET_MGR_FROM_JAVA:
+      /* Opaque manager; open/openDir ignore contents. */
+      cpu->r[0] = MANGO_AASSET_MGR_HANDLE;
+      break;
+    case MANGO_LIBC_AASSET_MGR_OPEN: {
+      /* AAssetManager_open(mgr, filename, mode) */
+      const char* rel = mango_guest_cstr(lib, r1);
+      char host[768];
+      FILE* fp;
+      long len;
+      uint32_t id;
+      (void)r0;
+      (void)r2;
+      if (!rel || !mango_aasset_host_path(lib, rel, host, sizeof(host))) {
+        static int s_fail;
+        if (s_fail < 12) {
+          fprintf(stderr, "mango: AAssetManager_open FAIL %s\n", rel ? rel : "(null)");
+          s_fail++;
+        }
+        cpu->r[0] = 0;
+        break;
+      }
+      fp = fopen(host, "rb");
+      if (!fp) {
+        cpu->r[0] = 0;
+        break;
+      }
+      if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        cpu->r[0] = 0;
+        break;
+      }
+      len = ftell(fp);
+      if (len < 0) {
+        fclose(fp);
+        cpu->r[0] = 0;
+        break;
+      }
+      rewind(fp);
+      id = mango_aasset_alloc();
+      if (id == 0) {
+        fclose(fp);
+        cpu->r[0] = 0;
+        break;
+      }
+      g_aassets[id].fp = fp;
+      g_aassets[id].length = len;
+      g_aassets[id].pos = 0;
+      snprintf(g_aassets[id].host_path, sizeof(g_aassets[id].host_path), "%s", host);
+      {
+        static int s_ok;
+        if (s_ok < 16) {
+          fprintf(stderr, "mango: AAssetManager_open ok %s len=%ld id=%u\n", rel, len, id);
+          s_ok++;
+        }
+      }
+      cpu->r[0] = id;
+      break;
+    }
+    case MANGO_LIBC_AASSET_MGR_OPENDIR: {
+      /* AAssetManager_openDir(mgr, dirName) — dirName may be "". */
+      const char* rel = mango_guest_cstr(lib, r1);
+      char host[768];
+      DIR* dir;
+      uint32_t id;
+      (void)r0;
+      if (rel == NULL) {
+        rel = "";
+      }
+      if (!mango_aasset_host_path(lib, rel, host, sizeof(host))) {
+        static int s_fail;
+        if (s_fail < 8) {
+          fprintf(stderr, "mango: AAssetManager_openDir FAIL %s\n", rel[0] ? rel : "(root)");
+          s_fail++;
+        }
+        cpu->r[0] = 0;
+        break;
+      }
+      dir = opendir(host);
+      if (!dir) {
+        cpu->r[0] = 0;
+        break;
+      }
+      id = mango_aasset_dir_alloc();
+      if (id == 0) {
+        closedir(dir);
+        cpu->r[0] = 0;
+        break;
+      }
+      g_aasset_dirs[id].dir = dir;
+      snprintf(g_aasset_dirs[id].host_dir, sizeof(g_aasset_dirs[id].host_dir), "%s", host);
+      {
+        static int s_ok;
+        if (s_ok < 8) {
+          fprintf(stderr, "mango: AAssetManager_openDir ok %s id=%u\n", rel[0] ? rel : "(root)", id);
+          s_ok++;
+        }
+      }
+      cpu->r[0] = id;
+      break;
+    }
+    case MANGO_LIBC_AASSET_DIR_GET_NEXT: {
+      /* AAssetDir_getNextFileName — return guest cstr or NULL at EOF. */
+      MangoAAssetDir* d = mango_aasset_dir_get(r0);
+      struct dirent* ent;
+      if (!d || !d->dir) {
+        cpu->r[0] = 0;
+        break;
+      }
+      for (;;) {
+        ent = readdir(d->dir);
+        if (!ent) {
+          cpu->r[0] = 0;
+          break;
+        }
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+          continue;
+        }
+        d->guest_name = mango_guest_strdup(lib, ent->d_name);
+        cpu->r[0] = d->guest_name;
+        break;
+      }
+      break;
+    }
+    case MANGO_LIBC_AASSET_DIR_CLOSE:
+      mango_aasset_dir_free(r0);
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_AASSET_GET_LENGTH: {
+      MangoAAsset* a = mango_aasset_get(r0);
+      cpu->r[0] = a ? (uint32_t)a->length : 0;
+      break;
+    }
+    case MANGO_LIBC_AASSET_READ: {
+      /* AAsset_read(asset, buf, count) */
+      MangoAAsset* a = mango_aasset_get(r0);
+      size_t want = (size_t)r2;
+      size_t n;
+      if (!a || !a->fp || want == 0 || !mango_guest_range_ok(lib, r1, (uint32_t)want)) {
+        cpu->r[0] = 0;
+        break;
+      }
+      if (fseek(a->fp, a->pos, SEEK_SET) != 0) {
+        cpu->r[0] = 0;
+        break;
+      }
+      n = fread(lib->guest_mem + r1, 1, want, a->fp);
+      a->pos += (long)n;
+      cpu->r[0] = (uint32_t)n;
+      break;
+    }
+    case MANGO_LIBC_AASSET_CLOSE:
+      mango_aasset_free(r0);
+      cpu->r[0] = 0;
+      break;
+    case MANGO_LIBC_AASSET_OPEN_FD: {
+      /* AAsset_openFileDescriptor(asset, off_t* outStart, off_t* outLength) */
+      MangoAAsset* a = mango_aasset_get(r0);
+      int fd;
+      if (!a || a->host_path[0] == '\0') {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (r1 && mango_guest_range_ok(lib, r1, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r1, 0);
+      }
+      if (r2 && mango_guest_range_ok(lib, r2, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r2, (uint32_t)a->length);
+      }
+      fd = open(a->host_path, O_RDONLY);
+      cpu->r[0] = (fd >= 0) ? (uint32_t)fd : (uint32_t)-1;
       break;
     }
     default:

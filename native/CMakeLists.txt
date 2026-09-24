@@ -111,3 +111,16 @@ target_link_libraries(mango_host_liquidwars_drive PRIVATE mango_core m)
 if(PNG_FOUND)
   target_link_libraries(mango_host_liquidwars_drive PRIVATE PNG::PNG)
 endif()
+
+
+# Host-only Pacman drive helper for Test Lab (not a ctest). Loads
+# armeabi libpacman.so (explicit Java_* PacmanLib init/step; no JNI_OnLoad).
+add_executable(mango_host_pacman_drive
+  src/native_bridge_shim.c
+  tests/host_pacman_drive.c
+)
+target_include_directories(mango_host_pacman_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_pacman_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_pacman_drive PRIVATE PNG::PNG)
+endif()
