@@ -3298,6 +3298,43 @@ static int test_t32_eor_w_imm1(void) {
   return 0;
 }
 
+static int test_t32_tst_w_imm1(void) {
+  /* Q-OTTD-0ap: tst.w r3,#1 = f013 0f01. Flags from r3 & 1; r3 unchanged.
+   * #1 is unrotated, so C and V stay as they were. N is clear. */
+  static const uint16_t kProg[] = {0xF013u, 0x0F01u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  struct {
+    uint32_t in;
+    int z;
+  } cases[] = {
+      {0u, 1},
+      {1u, 0},
+      {2u, 1},
+      {0x80000001u, 0},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V | MANGO_CPSR_N;
+    cpu.r[3] = cases[c].in;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    int z = (cpu.cpsr & MANGO_CPSR_Z) != 0;
+    int n = (cpu.cpsr & MANGO_CPSR_N) != 0;
+    int cv = (cpu.cpsr & (MANGO_CPSR_C | MANGO_CPSR_V)) == (MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[3] != cases[c].in || z != cases[c].z || n || !cv ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr, "FAIL(t32_tst#%u): rc=%d r3=%x cpsr=%x\n", c, rc, cpu.r[3], cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 TST.W r3,#1 (Q-OTTD-0ap)\n");
+  return 0;
+}
+
 static int test_t32_rsb_w_imm1(void) {
   /* Q-OTTD-0am: rsb.w r4,r0,#1 = f1c0 0401. r4 = 1 - r0; NZCV unchanged.
    * RSBS f1d0 0401 and Rd/Rn=PC stay closed. */
@@ -7385,9 +7422,15 @@ static int test_t32_and_w_modimm_reject(void) {
     fprintf(stderr, "FAIL(t32_and_w_reject): Rn=PC f00f0301 decoded as op=%d\n", di.op);
     return 1;
   }
-  /* f013 0f01 = ands.w pc,r3,#1 — Rd=PC */
-  if (mango_decode_t32(0xF013u, 0x0F01u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_and_w_reject): Rd=PC f0130f01 decoded as op=%d\n", di.op);
+  /* Q-OTTD-0ap: f013 0f01 = tst.w r3,#1 (ANDS Rd=15). S=0 Rd=PC stays closed. */
+  if (mango_decode_t32(0xF013u, 0x0F01u, &di) != 0 || di.op != MANGO_OP_TST || di.rn != 3 ||
+      di.imm != 1u || di.sets_flags != 1) {
+    fprintf(stderr, "FAIL(t32_and_w_reject): TST f0130f01 op=%d rn=%u imm=%u\n", di.op, di.rn,
+            di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xF003u, 0x0F01u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_and_w_reject): AND Rd=PC f0030f01 decoded as op=%d\n", di.op);
     return 1;
   }
   /* 0q BIC still tip */
@@ -7417,7 +7460,7 @@ static int test_t32_and_w_modimm_reject(void) {
     fprintf(stderr, "FAIL(t32_and_w_reject): LDRH f8341f02 want LDRH after 0ab\n");
     return 1;
   }
-  printf("ok: T32 AND.W reject PC; BIC/LDRH/STRH tip; CLZ tip (Q-OTTD-0ac)\n");
+  printf("ok: T32 TST.W tip; AND Rd=PC/Rn=PC closed; BIC/CLZ tip (Q-OTTD-0ac/0ap)\n");
   return 0;
 }
 
@@ -9460,6 +9503,7 @@ int main(void) {
   failures += test_t32_adds_w_imm0();
   failures += test_t32_orr_w_imm1();
   failures += test_t32_eor_w_imm1();
+  failures += test_t32_tst_w_imm1();
   failures += test_t32_rsb_w_imm1();
   failures += test_t32_tbb_pc();
   failures += test_t32_mov_w_modimm_0();

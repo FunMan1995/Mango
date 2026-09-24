@@ -1993,7 +1993,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0ac: AND/ANDS.W Rd,Rn,#<const> modified-imm (op=0000).
    * Primary f013 0301 = ands.w r3,r3,#1; contrast f003 0301 = and.w r3,r3,#1;
    * sib f013 03ff = ands.w r3,r3,#255. Mirror 0q BIC but open both S=0 and S=1 via
-   * sets_flags=(hw1>>4)&1. Do NOT steal BIC (F02x/F03x) / ORR / etc. Reject Rd/Rn=PC. */
+   * sets_flags=(hw1>>4)&1. Do NOT steal BIC (F02x/F03x) / ORR / etc.
+   * S=1 Rd=15 is TST (Q-OTTD-0ap). S=0 Rd=15 and Rn=PC stay closed. */
   if ((hw1 & 0xFBE0u) == 0xF000u && (hw2 & 0x8000u) == 0) {
     uint32_t i = (hw1 >> 10) & 1u;
     uint32_t rn = hw1 & 0xFu;
@@ -2002,11 +2003,21 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     uint32_t imm8 = hw2 & 0xFFu;
     uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
     uint32_t imm = 0;
-    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+    int s = (hw1 & 0x10u) != 0;
+    if (rn == MANGO_REG_PC || (rd == MANGO_REG_PC && !s)) {
       return -1;
     }
     if (mango_thumb_expand_imm(imm12, &imm) != 0) {
       return -1;
+    }
+    if (rd == MANGO_REG_PC) {
+      out->op = MANGO_OP_TST;
+      out->rn = rn;
+      out->is_imm = 1;
+      out->sets_flags = 1;
+      out->imm = imm;
+      out->shift_amount = 0;
+      return 0;
     }
     out->op = MANGO_OP_AND;
     out->rd = rd;
