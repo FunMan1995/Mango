@@ -99,3 +99,15 @@ target_link_libraries(mango_host_tuxrider_drive PRIVATE mango_core m)
 if(PNG_FOUND)
   target_link_libraries(mango_host_tuxrider_drive PRIVATE PNG::PNG)
 endif()
+
+# Host-only Liquid Wars OS drive helper for Test Lab (not a ctest). Loads
+# armeabi libnativeinterface.so (explicit Java_* GLSurfaceView JNI).
+add_executable(mango_host_liquidwars_drive
+  src/native_bridge_shim.c
+  tests/host_liquidwars_drive.c
+)
+target_include_directories(mango_host_liquidwars_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_liquidwars_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_liquidwars_drive PRIVATE PNG::PNG)
+endif()

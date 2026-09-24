@@ -7648,6 +7648,92 @@ static int test_vld1_vst1(void) {
   return 0;
 }
 
+
+static int test_kuser_cmpxchg_and_version(void) {
+  /* Liquid Wars Q0 RUNTIME/kuser: __kuser_cmpxchg @ 0xffff0fc0 + version word.
+   * Drive PC straight into the helper (same as guest blx); no guest opcode for 0. */
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  /* cell at VA 64: start as 0 for success path */
+  mem_buf[64] = 0;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[0] = 0;            /* old */
+  cpu.r[1] = 1;            /* new */
+  cpu.r[2] = 64u;          /* ptr */
+  cpu.r[MANGO_REG_LR] = 0x200u;
+  cpu.r[MANGO_REG_PC] = 0xffff0fc0u;
+  cpu.cpsr = 0; /* ARM, C clear */
+
+  int rc = mango_interp_run(&cpu, &mem, 0x200u, 100);
+  if (rc != 0 || cpu.r[0] != 0 || cpu.r[MANGO_REG_PC] != 0x200u) {
+    fprintf(stderr, "FAIL(kuser_cmpxchg_success): rc=%d r0=%u pc=0x%x\n", rc, cpu.r[0],
+            cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  if ((cpu.cpsr & MANGO_CPSR_C) == 0) {
+    fprintf(stderr, "FAIL(kuser_cmpxchg_success): expected C set on success\n");
+    return 1;
+  }
+  if ((cpu.cpsr & MANGO_CPSR_T) != 0) {
+    fprintf(stderr, "FAIL(kuser_cmpxchg_success): T must stay clear (A32 helper)\n");
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + 64) != 1u) {
+    fprintf(stderr, "FAIL(kuser_cmpxchg_success): mem[64]=0x%x want 1\n",
+            bytes_to_u32_le(mem_buf + 64));
+    return 1;
+  }
+
+  /* Fail path: old mismatch, cell stays 1, C clear, r0 nonzero. */
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[0] = 0; /* stale old */
+  cpu.r[1] = 2;
+  cpu.r[2] = 64u;
+  cpu.r[MANGO_REG_LR] = 0x200u;
+  cpu.r[MANGO_REG_PC] = 0xffff0fc0u;
+  cpu.cpsr = MANGO_CPSR_C; /* prove we clear C */
+
+  rc = mango_interp_run(&cpu, &mem, 0x200u, 100);
+  if (rc != 0 || cpu.r[0] == 0 || (cpu.cpsr & MANGO_CPSR_C) != 0) {
+    fprintf(stderr, "FAIL(kuser_cmpxchg_fail): rc=%d r0=%u cpsr=0x%x\n", rc, cpu.r[0], cpu.cpsr);
+    return 1;
+  }
+  if (bytes_to_u32_le(mem_buf + 64) != 1u) {
+    fprintf(stderr, "FAIL(kuser_cmpxchg_fail): cell mutated to 0x%x\n",
+            bytes_to_u32_le(mem_buf + 64));
+    return 1;
+  }
+
+  /* memory_barrier is a no-op bx lr */
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[MANGO_REG_LR] = 0x200u;
+  cpu.r[MANGO_REG_PC] = 0xffff0fa0u;
+  rc = mango_interp_run(&cpu, &mem, 0x200u, 100);
+  if (rc != 0 || cpu.r[MANGO_REG_PC] != 0x200u) {
+    fprintf(stderr, "FAIL(kuser_memory_barrier): rc=%d pc=0x%x\n", rc, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+
+  /* LDR __kuser_helper_version @ 0xffff0ffc via guest code at VA 0. */
+  memset(mem_buf, 0, sizeof(mem_buf));
+  u32_to_bytes_le(mem_buf + 0, 0xE5910000u); /* ldr r0, [r1] */
+  u32_to_bytes_le(mem_buf + 4, 0xE12FFF1Eu); /* bx lr */
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.r[1] = 0xffff0ffcu;
+  cpu.r[MANGO_REG_LR] = 0x100u;
+  cpu.r[MANGO_REG_PC] = 0;
+  rc = mango_interp_run(&cpu, &mem, 0x100u, 100);
+  if (rc != 0 || cpu.r[0] < 3u) {
+    fprintf(stderr, "FAIL(kuser_helper_version): rc=%d r0=%u (want >=3)\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: kuser cmpxchg success/fail+C, barrier, version=%u\n", cpu.r[0]);
+  return 0;
+}
+
 static int test_ldrex_strex(void) {
   static const uint32_t kProgram[] = {
       0xE3A01040u, /* mov r1, #64 */
@@ -8845,6 +8931,7 @@ int main(void) {
   failures += test_vldr_s_from_stack();
   failures += test_vmov_i32_and_clz();
   failures += test_vld1_vst1();
+  failures += test_kuser_cmpxchg_and_version();
   failures += test_ldrex_strex();
   failures += test_vdup_q9();
   failures += test_vaddi_i32();

@@ -18,7 +18,49 @@ static void mango_store_u32_le(uint8_t* p, uint32_t v) {
   p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
+/* ARM Linux AArch32 kernel-user helpers (kernel_user_helpers.txt). Guest VA
+ * 0xffff0xxx sits outside the flat MANGO_AS_SIZE window — synthesize a 4KiB
+ * page for data (version word) and trap helper entry PCs to C. */
+#define MANGO_KUSER_BASE 0xffff0000u
+#define MANGO_KUSER_SIZE 0x1000u
+#define MANGO_KUSER_VERSION 5u
+#define MANGO_KUSER_CMPXCHG64 0xffff0f60u
+#define MANGO_KUSER_MEMORY_BARRIER 0xffff0fa0u
+#define MANGO_KUSER_CMPXCHG 0xffff0fc0u
+#define MANGO_KUSER_GET_TLS 0xffff0fe0u
+#define MANGO_KUSER_HELPER_VERSION 0xffff0ffcu
+
+static uint8_t g_mango_kuser_page[MANGO_KUSER_SIZE];
+static int g_mango_kuser_ready;
+
+static void mango_kuser_ensure(void) {
+  if (g_mango_kuser_ready) {
+    return;
+  }
+  memset(g_mango_kuser_page, 0, sizeof(g_mango_kuser_page));
+  /* __kuser_helper_version @ 0xffff0ffc — ≥5 advertises cmpxchg64 for later. */
+  g_mango_kuser_page[0xffc] = (uint8_t)(MANGO_KUSER_VERSION & 0xFFu);
+  g_mango_kuser_page[0xffd] = (uint8_t)((MANGO_KUSER_VERSION >> 8) & 0xFFu);
+  g_mango_kuser_page[0xffe] = (uint8_t)((MANGO_KUSER_VERSION >> 16) & 0xFFu);
+  g_mango_kuser_page[0xfff] = (uint8_t)((MANGO_KUSER_VERSION >> 24) & 0xFFu);
+  g_mango_kuser_ready = 1;
+}
+
+/* Flat AS pointer, or synthetic kuser page when addr is in 0xffff0xxx. */
+static uint8_t* mango_mem_at(MangoMemory* mem, uint32_t addr) {
+  if (addr >= MANGO_KUSER_BASE && addr < MANGO_KUSER_BASE + MANGO_KUSER_SIZE) {
+    mango_kuser_ensure();
+    return g_mango_kuser_page + (addr - MANGO_KUSER_BASE);
+  }
+  return mem->bytes + addr;
+}
+
+
 static int mango_check_range(const MangoMemory* mem, uint32_t addr, uint32_t n) {
+  if (addr >= MANGO_KUSER_BASE &&
+      (uint64_t)addr + (uint64_t)n <= (uint64_t)MANGO_KUSER_BASE + MANGO_KUSER_SIZE) {
+    return 0;
+  }
   if ((uint64_t)addr + n > mem->size) { /* uint64_t so addr near UINT32_MAX can't wrap */
     return -1;
   }
@@ -34,6 +76,9 @@ static int mango_check_word_access(const MangoMemory* mem, uint32_t addr) {
 }
 
 static int mango_check_byte_access(const MangoMemory* mem, uint32_t addr) {
+  if (addr >= MANGO_KUSER_BASE && addr < MANGO_KUSER_BASE + MANGO_KUSER_SIZE) {
+    return 0;
+  }
   return addr < mem->size ? 0 : -1;
 }
 
@@ -76,6 +121,53 @@ static void mango_branch_to(MangoCpu* cpu, uint32_t dest, uint32_t stop_addr, ui
     cpu->cpsr &= ~MANGO_CPSR_T;
     *next_addr = dest;
   }
+}
+
+static void mango_kuser_return(MangoCpu* cpu, uint32_t stop_addr, uint32_t* next_addr) {
+  mango_branch_to(cpu, cpu->r[MANGO_REG_LR], stop_addr, next_addr);
+}
+
+/* Trap ARM Linux kuser helper entry PCs. Returns 0 if handled. */
+static int mango_kuser_handle(MangoCpu* cpu, MangoMemory* mem, uint32_t addr, uint32_t stop_addr,
+                             uint32_t* next_addr) {
+  if (addr == MANGO_KUSER_MEMORY_BARRIER) {
+    /* DMB equivalent — no-op on single-threaded host. */
+    mango_kuser_return(cpu, stop_addr, next_addr);
+    return 0;
+  }
+  if (addr == MANGO_KUSER_CMPXCHG) {
+    /* r0=old, r1=new, r2=ptr; out r0=0 success / nonzero fail; C set on success. */
+    uint32_t oldv = cpu->r[0];
+    uint32_t newv = cpu->r[1];
+    uint32_t ptr = cpu->r[2];
+    if (mango_check_word_access(mem, ptr) != 0) {
+      return -1;
+    }
+    uint32_t cur = mango_load_u32_le(mango_mem_at(mem, ptr));
+    if (cur == oldv) {
+      mango_store_u32_le(mango_mem_at(mem, ptr), newv);
+      cpu->r[0] = 0;
+      cpu->cpsr |= MANGO_CPSR_C;
+    } else {
+      uint32_t delta = cur - oldv;
+      cpu->r[0] = delta != 0u ? delta : 1u;
+      cpu->cpsr &= ~MANGO_CPSR_C;
+    }
+    mango_kuser_return(cpu, stop_addr, next_addr);
+    return 0;
+  }
+  if (addr == MANGO_KUSER_GET_TLS) {
+    cpu->r[0] = 0; /* soft stub until TLS wired */
+    mango_kuser_return(cpu, stop_addr, next_addr);
+    return 0;
+  }
+  if (addr == MANGO_KUSER_CMPXCHG64) {
+    cpu->r[0] = 1u;
+    cpu->cpsr &= ~MANGO_CPSR_C;
+    mango_kuser_return(cpu, stop_addr, next_addr);
+    return 0;
+  }
+  return -1;
 }
 
 /* ALUWritePC / BranchWritePC for data-processing writes to PC (MOV/ADD/…).
@@ -461,6 +553,17 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
       return 0;
     }
 
+    /* RUNTIME/kuser: trap ARM Linux helper page entry points (Liquid Wars Q0). */
+    if (addr >= MANGO_KUSER_BASE && addr < MANGO_KUSER_BASE + MANGO_KUSER_SIZE) {
+      uint32_t next_k = 0;
+      if (mango_kuser_handle(cpu, mem, addr, stop_addr, &next_k) != 0) {
+        return -1;
+      }
+      addr = next_k;
+      cpu->r[MANGO_REG_PC] = addr;
+      continue;
+    }
+
     int thumb = (cpu->cpsr & MANGO_CPSR_T) != 0;
     MangoInsn insn;
     uint32_t next_addr;
@@ -469,12 +572,12 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
       if ((addr % 2u) != 0 || mango_check_half_access(mem, addr) != 0) {
         return -1;
       }
-      uint16_t hw = (uint16_t)mango_load_u16_le(mem->bytes + addr);
+      uint16_t hw = (uint16_t)mango_load_u16_le(mango_mem_at(mem, addr));
       if ((hw >> 11) >= 0x1Du) {
         if (mango_check_half_access(mem, addr + 2u) != 0) {
           return -1;
         }
-        uint16_t hw2 = (uint16_t)mango_load_u16_le(mem->bytes + addr + 2u);
+        uint16_t hw2 = (uint16_t)mango_load_u16_le(mango_mem_at(mem, addr + 2u));
         if (mango_decode_t32(hw, hw2, &insn) != 0) {
           return -1;
         }
@@ -488,7 +591,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
       if (mango_check_word_access(mem, addr) != 0) {
         return -1;
       }
-      if (mango_decode(mango_load_u32_le(mem->bytes + addr), &insn) != 0) {
+      if (mango_decode(mango_load_u32_le(mango_mem_at(mem, addr)), &insn) != 0) {
         return -1;
       }
       next_addr = addr + 4u;
@@ -783,16 +886,16 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               return -1;
             }
             if (insn.op == MANGO_OP_LDR) {
-              mango_write_rd(cpu, insn.rd, mem->bytes[eaddr], stop_addr, &next_addr);
+              mango_write_rd(cpu, insn.rd, mango_mem_at(mem, eaddr)[0], stop_addr, &next_addr);
             } else {
-              mem->bytes[eaddr] = (uint8_t)(cpu->r[insn.rd] & 0xFFu);
+              mango_mem_at(mem, eaddr)[0] = (uint8_t)(cpu->r[insn.rd] & 0xFFu);
             }
           } else {
             if (mango_check_range(mem, eaddr, 4u) != 0) {
               return -1;
             }
             if (insn.op == MANGO_OP_LDR) {
-              uint32_t loaded = mango_load_u32_le(mem->bytes + eaddr);
+              uint32_t loaded = mango_load_u32_le(mango_mem_at(mem, eaddr));
               /* LoadWritePC: interwork from bit0 (unlike ALUWritePC). */
               if (insn.rd == MANGO_REG_PC) {
                 mango_branch_to(cpu, loaded, stop_addr, &next_addr);
@@ -800,7 +903,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
                 cpu->r[insn.rd] = loaded;
               }
             } else {
-              mango_store_u32_le(mem->bytes + eaddr, cpu->r[insn.rd]);
+              mango_store_u32_le(mango_mem_at(mem, eaddr), cpu->r[insn.rd]);
             }
           }
           if (insn.w) {
@@ -825,17 +928,17 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             if (mango_check_byte_access(mem, eaddr) != 0) {
               return -1;
             }
-            cpu->r[insn.rd] = mango_sign_extend8(mem->bytes[eaddr]);
+            cpu->r[insn.rd] = mango_sign_extend8(mango_mem_at(mem, eaddr)[0]);
           } else {
             if (mango_check_range(mem, eaddr, 2u) != 0) {
               return -1;
             }
             if (insn.op == MANGO_OP_STRH) {
-              mango_store_u16_le(mem->bytes + eaddr, cpu->r[insn.rd]);
+              mango_store_u16_le(mango_mem_at(mem, eaddr), cpu->r[insn.rd]);
             } else if (insn.op == MANGO_OP_LDRH) {
-              cpu->r[insn.rd] = mango_load_u16_le(mem->bytes + eaddr);
+              cpu->r[insn.rd] = mango_load_u16_le(mango_mem_at(mem, eaddr));
             } else {
-              cpu->r[insn.rd] = mango_sign_extend16(mango_load_u16_le(mem->bytes + eaddr));
+              cpu->r[insn.rd] = mango_sign_extend16(mango_load_u16_le(mango_mem_at(mem, eaddr)));
             }
           }
           if (insn.w) {
@@ -854,11 +957,11 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             return -1;
           }
           if (insn.op == MANGO_OP_STRD) {
-            mango_store_u32_le(mem->bytes + eaddr, cpu->r[insn.rd]);
-            mango_store_u32_le(mem->bytes + eaddr + 4u, cpu->r[insn.rd + 1u]);
+            mango_store_u32_le(mango_mem_at(mem, eaddr), cpu->r[insn.rd]);
+            mango_store_u32_le(mango_mem_at(mem, eaddr + 4u), cpu->r[insn.rd + 1u]);
           } else {
-            cpu->r[insn.rd] = mango_load_u32_le(mem->bytes + eaddr);
-            cpu->r[insn.rd + 1u] = mango_load_u32_le(mem->bytes + eaddr + 4u);
+            cpu->r[insn.rd] = mango_load_u32_le(mango_mem_at(mem, eaddr));
+            cpu->r[insn.rd + 1u] = mango_load_u32_le(mango_mem_at(mem, eaddr + 4u));
           }
           if (insn.w) {
             cpu->r[insn.rn] = wbaddr;
@@ -873,15 +976,15 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             if (mango_check_byte_access(mem, eaddr) != 0) {
               return -1;
             }
-            uint32_t loaded = mem->bytes[eaddr];
-            mem->bytes[eaddr] = (uint8_t)(store_val & 0xFFu);
+            uint32_t loaded = mango_mem_at(mem, eaddr)[0];
+            mango_mem_at(mem, eaddr)[0] = (uint8_t)(store_val & 0xFFu);
             cpu->r[insn.rd] = loaded;
           } else {
             if (mango_check_word_access(mem, eaddr) != 0) {
               return -1;
             }
-            uint32_t loaded = mango_load_u32_le(mem->bytes + eaddr);
-            mango_store_u32_le(mem->bytes + eaddr, store_val);
+            uint32_t loaded = mango_load_u32_le(mango_mem_at(mem, eaddr));
+            mango_store_u32_le(mango_mem_at(mem, eaddr), store_val);
             cpu->r[insn.rd] = loaded;
           }
           break;
@@ -917,9 +1020,9 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               continue;
             }
             if (insn.op == MANGO_OP_STM) {
-              mango_store_u32_le(mem->bytes + eaddr, mango_read_reg(cpu, addr, i));
+              mango_store_u32_le(mango_mem_at(mem, eaddr), mango_read_reg(cpu, addr, i));
             } else if (i == MANGO_REG_PC) {
-              uint32_t value = mango_load_u32_le(mem->bytes + eaddr);
+              uint32_t value = mango_load_u32_le(mango_mem_at(mem, eaddr));
               if (value == stop_addr && (value & 1u)) {
                 /* odd sentinel: keep the exact value so the run stops */
               } else if (value & 1u) {
@@ -933,7 +1036,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               loaded_pc = 1;
               new_pc = value;
             } else {
-              cpu->r[i] = mango_load_u32_le(mem->bytes + eaddr);
+              cpu->r[i] = mango_load_u32_le(mango_mem_at(mem, eaddr));
             }
             eaddr += 4u;
           }
@@ -958,20 +1061,20 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             if (insn.b) {
               uint32_t eaddr = start + i * 8u;
               if (insn.op == MANGO_OP_VLDM) {
-                uint64_t v = (uint64_t)mango_load_u32_le(mem->bytes + eaddr) |
-                             ((uint64_t)mango_load_u32_le(mem->bytes + eaddr + 4u) << 32);
+                uint64_t v = (uint64_t)mango_load_u32_le(mango_mem_at(mem, eaddr)) |
+                             ((uint64_t)mango_load_u32_le(mango_mem_at(mem, eaddr + 4u)) << 32);
                 mango_vfp_set_d(cpu, insn.rd + i, v);
               } else {
                 uint64_t v = mango_vfp_get_d(cpu, insn.rd + i);
-                mango_store_u32_le(mem->bytes + eaddr, (uint32_t)v);
-                mango_store_u32_le(mem->bytes + eaddr + 4u, (uint32_t)(v >> 32));
+                mango_store_u32_le(mango_mem_at(mem, eaddr), (uint32_t)v);
+                mango_store_u32_le(mango_mem_at(mem, eaddr + 4u), (uint32_t)(v >> 32));
               }
             } else if (insn.rd + i < 32u) {
               uint32_t eaddr = start + i * 4u;
               if (insn.op == MANGO_OP_VLDM) {
-                cpu->s[insn.rd + i] = mango_load_u32_le(mem->bytes + eaddr);
+                cpu->s[insn.rd + i] = mango_load_u32_le(mango_mem_at(mem, eaddr));
               } else {
-                mango_store_u32_le(mem->bytes + eaddr, cpu->s[insn.rd + i]);
+                mango_store_u32_le(mango_mem_at(mem, eaddr), cpu->s[insn.rd + i]);
               }
             }
           }
@@ -991,18 +1094,18 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           }
           if (insn.op == MANGO_OP_VLDR) {
             if (insn.b) {
-              uint64_t v = (uint64_t)mango_load_u32_le(mem->bytes + eaddr) |
-                           ((uint64_t)mango_load_u32_le(mem->bytes + eaddr + 4u) << 32);
+              uint64_t v = (uint64_t)mango_load_u32_le(mango_mem_at(mem, eaddr)) |
+                           ((uint64_t)mango_load_u32_le(mango_mem_at(mem, eaddr + 4u)) << 32);
               mango_vfp_set_d(cpu, insn.rd, v);
             } else if (insn.rd < 32u) {
-              cpu->s[insn.rd] = mango_load_u32_le(mem->bytes + eaddr);
+              cpu->s[insn.rd] = mango_load_u32_le(mango_mem_at(mem, eaddr));
             }
           } else if (insn.b) {
             uint64_t v = mango_vfp_get_d(cpu, insn.rd);
-            mango_store_u32_le(mem->bytes + eaddr, (uint32_t)v);
-            mango_store_u32_le(mem->bytes + eaddr + 4u, (uint32_t)(v >> 32));
+            mango_store_u32_le(mango_mem_at(mem, eaddr), (uint32_t)v);
+            mango_store_u32_le(mango_mem_at(mem, eaddr + 4u), (uint32_t)(v >> 32));
           } else if (insn.rd < 32u) {
-            mango_store_u32_le(mem->bytes + eaddr, cpu->s[insn.rd]);
+            mango_store_u32_le(mango_mem_at(mem, eaddr), cpu->s[insn.rd]);
           }
           break;
         }
@@ -1251,13 +1354,13 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           for (uint32_t i = 0; i < insn.imm; i++) {
             uint32_t eaddr = base + i * 8u;
             if (insn.op == MANGO_OP_VLD1) {
-              uint64_t v = (uint64_t)mango_load_u32_le(mem->bytes + eaddr) |
-                           ((uint64_t)mango_load_u32_le(mem->bytes + eaddr + 4u) << 32);
+              uint64_t v = (uint64_t)mango_load_u32_le(mango_mem_at(mem, eaddr)) |
+                           ((uint64_t)mango_load_u32_le(mango_mem_at(mem, eaddr + 4u)) << 32);
               mango_vfp_set_d(cpu, insn.rd + i, v);
             } else {
               uint64_t v = mango_vfp_get_d(cpu, insn.rd + i);
-              mango_store_u32_le(mem->bytes + eaddr, (uint32_t)v);
-              mango_store_u32_le(mem->bytes + eaddr + 4u, (uint32_t)(v >> 32));
+              mango_store_u32_le(mango_mem_at(mem, eaddr), (uint32_t)v);
+              mango_store_u32_le(mango_mem_at(mem, eaddr + 4u), (uint32_t)(v >> 32));
             }
           }
           if (insn.rm != 0xFu) {
@@ -1524,26 +1627,26 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           }
           if (insn.op == MANGO_OP_LDREX) {
             if (n == 1u) {
-              cpu->r[insn.rd] = mem->bytes[eaddr];
+              cpu->r[insn.rd] = mango_mem_at(mem, eaddr)[0];
             } else if (n == 2u) {
-              cpu->r[insn.rd] = mango_load_u16_le(mem->bytes + eaddr);
+              cpu->r[insn.rd] = mango_load_u16_le(mango_mem_at(mem, eaddr));
             } else if (n == 8u) {
-              cpu->r[insn.rd] = mango_load_u32_le(mem->bytes + eaddr);
-              cpu->r[insn.rd + 1u] = mango_load_u32_le(mem->bytes + eaddr + 4u);
+              cpu->r[insn.rd] = mango_load_u32_le(mango_mem_at(mem, eaddr));
+              cpu->r[insn.rd + 1u] = mango_load_u32_le(mango_mem_at(mem, eaddr + 4u));
             } else {
-              cpu->r[insn.rd] = mango_load_u32_le(mem->bytes + eaddr);
+              cpu->r[insn.rd] = mango_load_u32_le(mango_mem_at(mem, eaddr));
             }
           } else {
             uint32_t val = cpu->r[insn.rm];
             if (n == 1u) {
-              mem->bytes[eaddr] = (uint8_t)(val & 0xFFu);
+              mango_mem_at(mem, eaddr)[0] = (uint8_t)(val & 0xFFu);
             } else if (n == 2u) {
-              mango_store_u16_le(mem->bytes + eaddr, val);
+              mango_store_u16_le(mango_mem_at(mem, eaddr), val);
             } else if (n == 8u) {
-              mango_store_u32_le(mem->bytes + eaddr, cpu->r[insn.rm]);
-              mango_store_u32_le(mem->bytes + eaddr + 4u, cpu->r[insn.rm + 1u]);
+              mango_store_u32_le(mango_mem_at(mem, eaddr), cpu->r[insn.rm]);
+              mango_store_u32_le(mango_mem_at(mem, eaddr + 4u), cpu->r[insn.rm + 1u]);
             } else {
-              mango_store_u32_le(mem->bytes + eaddr, val);
+              mango_store_u32_le(mango_mem_at(mem, eaddr), val);
             }
             cpu->r[insn.rd] = 0; /* exclusive store succeeded */
           }
