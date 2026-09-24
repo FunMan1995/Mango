@@ -9266,6 +9266,58 @@ static int test_t32_sbcs_w_reg(void) {
   return 0;
 }
 
+static int test_t32_adds_w_reg(void) {
+  /* Q-OTTD-0cd: adds.w r6, r10, r4 = eb1a 0604 (llvm-mc [1a,eb,04,06]).
+   * r6 = r10 + r4. NZCV from the add. */
+  static const uint16_t kProg[] = {0xEB1Au, 0x0604u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t r10, r4, want, nzcv;
+  } cases[] = {
+      {5u, 3u, 8u, 0u},
+      {0xffffffffu, 1u, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0x7fffffffu, 1u, 0x80000000u, MANGO_CPSR_N | MANGO_CPSR_V},
+      {0u, 0u, 0u, MANGO_CPSR_Z},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xEB1Au, 0x0604u, &di) != 0 || di.op != MANGO_OP_ADD || di.rd != 6 ||
+      di.rn != 10 || di.rm != 4 || di.is_imm != 0 || di.sets_flags != 1 || di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_adds_w_reg): decode op=%d rd=%u rn=%u flags=%d\n", di.op, di.rd, di.rn,
+            di.sets_flags);
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C;
+    cpu.r[10] = cases[c].r10;
+    cpu.r[4] = cases[c].r4;
+    cpu.r[6] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[6] != cases[c].want || cpu.r[10] != cases[c].r10 || cpu.r[4] != cases[c].r4 ||
+        nzcv != cases[c].nzcv) {
+      fprintf(stderr, "FAIL(t32_adds_w_reg#%u): rc=%d r6=%x want %x nzcv=%x want %x\n", c, rc,
+              cpu.r[6], cases[c].want, nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+  if (mango_decode_t32(0xEB0Eu, 0x0080u, &di) != 0 || di.op != MANGO_OP_ADD || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_adds_w_reg): ADD.W S=0 should stay flags-off\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xEB1Au, 0x0F04u, &di) == 0 || mango_decode_t32(0xEB1Fu, 0x0604u, &di) == 0 ||
+      mango_decode_t32(0xEB1Au, 0x060Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_adds_w_reg): Rd/Rn/Rm=PC should stay closed\n");
+    return 1;
+  }
+  printf("ok: T32 ADDS.W r6, r10, r4 (Q-OTTD-0cd)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -9501,7 +9553,8 @@ static int test_t32_add_w_reg_lsl2(void) {
 }
 
 static int test_t32_add_w_reg_reject(void) {
-  /* Q-OTTD-0bk: ea0e 0080 = and.w r0,lr,r0. ADD Rd/Rn/Rm=PC and ADDS stay closed. */
+  /* Q-OTTD-0bk: ea0e 0080 = and.w r0,lr,r0. ADD Rd/Rn/Rm=PC stay closed.
+   * ADDS register is Q-OTTD-0cd. */
   MangoInsn di;
   if (mango_decode_t32(0xEA0Eu, 0x0080u, &di) != 0 || di.op != MANGO_OP_AND || di.rd != 0 ||
       di.rn != 14 || di.rm != 0 || di.sets_flags != 0) {
@@ -9523,12 +9576,14 @@ static int test_t32_add_w_reg_reject(void) {
     fprintf(stderr, "FAIL(t32_add_w_reg_reject): Rm=PC eb0e008f decoded as op=%d\n", di.op);
     return 1;
   }
-  /* eb1e 0080 = ADD.W S=1 — out of scope */
-  if (mango_decode_t32(0xEB1Eu, 0x0080u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_add_w_reg_reject): S=1 eb1e0080 decoded as op=%d\n", di.op);
+  /* eb1e 0080 = adds.w r0, lr, r0, lsl #2 — Q-OTTD-0cd */
+  if (mango_decode_t32(0xEB1Eu, 0x0080u, &di) != 0 || di.op != MANGO_OP_ADD || di.sets_flags != 1 ||
+      di.rd != 0 || di.rn != 14 || di.shift_amount != 2) {
+    fprintf(stderr, "FAIL(t32_add_w_reg_reject): ADDS eb1e0080 op=%d flags=%d sh=%u\n", di.op,
+            di.sets_flags, di.shift_amount);
     return 1;
   }
-  printf("ok: T32 ADD.W reg reject PC/S=1; AND reg is 0bk (Q-OTTD-0l-add)\n");
+  printf("ok: T32 ADD.W reg reject PC; ADDS is 0cd; AND reg is 0bk (Q-OTTD-0l-add)\n");
   return 0;
 }
 
@@ -11606,6 +11661,7 @@ int main(void) {
   failures += test_t32_adc_w_imm();
   failures += test_t32_sbcs_w_imm0();
   failures += test_t32_sbcs_w_reg();
+  failures += test_t32_adds_w_reg();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
