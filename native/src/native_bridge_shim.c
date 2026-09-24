@@ -3519,9 +3519,23 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_PTHREAD_SELF:
       cpu->r[0] = 1;
       break;
-    case MANGO_LIBC_PTHREAD_CREATE:
-      cpu->r[0] = 11; /* EAGAIN: do not start a guest thread */
+    case MANGO_LIBC_PTHREAD_CREATE: {
+      /* SDL_OpenAudio treats EAGAIN as fatal ("Couldn't create audio
+       * thread") and the guest exits. Store a pthread_t and return 0.
+       * The start routine is not run: the interpreter stays single-threaded
+       * and SDL's audio loop does not return. sem_wait is still a zero stub,
+       * so SDL_CreateThread's SemWait does not block. */
+      static uint32_t next_id = 2;
+      uint32_t id = next_id++;
+      if (id == 0u) {
+        id = next_id++;
+      }
+      if (r0 != 0 && mango_guest_range_ok(lib, r0, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r0, id);
+      }
+      cpu->r[0] = 0;
       break;
+    }
     /* PrBoom Q1 (research/56): real soft open/read/close/lseek via guest fd
      * table. Keep cpuinfo/present/possible/auxv fake specials on same hook. */
     case MANGO_LIBC_OPEN: {
@@ -3966,7 +3980,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_EXIT_UNDERSCORE:
       /* Noreturn: mono/Unity BL exit/abort with LR on the next literal pool.
        * The default mov-r0-#0 stub returned there (OFDP pc=0x17101c word=0x0022ff98).
-       * Point LR at the JNI stop sentinel so the thunk's bx lr ends the trampoline. */
+       * Point LR at the JNI stop sentinel so the thunk's bx lr ends the trampoline.
+       * LR here is the caller's return address (the insn after the call). */
+      fprintf(stderr, "mango: exit lr=%#x r0=%#x\n", cpu->r[MANGO_REG_LR], cpu->r[0]);
       cpu->r[MANGO_REG_LR] = MANGO_JNI_STOP;
       break;
     case MANGO_LIBC_AEABI_IDIV:
