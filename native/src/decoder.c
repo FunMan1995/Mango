@@ -3421,7 +3421,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0bg: T32 UXTB.W Rd,Rm{,ROR#} — Rn=15, unsigned byte.
    * SDL fa5f f588 = uxtb.w r5,r8 (llvm-mc [5f,fa,88,f5]); sib fa5f fb86.
-   * Same hw2 shape as UXTH.W. b=0. SXTH/SXTB and Rn≠15 stay closed. */
+   * Same hw2 shape as UXTH.W. b=0. UXTAB (Rn≠15) is Q-OTTD-0ch.
+   * SXTB and SXTAH stay closed. */
   if (hw1 == 0xFA5Fu && (hw2 & 0xF0C0u) == 0xF080u) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -3435,6 +3436,27 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->imm = ((hw2 >> 4) & 3u) * 8u;
     out->u = 1;
     out->b = 0; /* byte */
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0ch: T32 UXTAB Rd,Rn,Rm{,ROR#}. SQLexer::Lex fa53 f381 =
+   * uxtab r3, r3, r1 (llvm-mc [53,fa,81,f3]). Rd = Rn + the low byte
+   * of Rm after the rotate. Rn=15 is UXTB.W. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFA50u && (hw1 & 0xFu) != 0xFu && (hw2 & 0xF0C0u) == 0xF080u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_XTEND;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->imm = ((hw2 >> 4) & 3u) * 8u;
+    out->u = 1;
+    out->b = 0;
     out->sets_flags = 0;
     return 0;
   }
