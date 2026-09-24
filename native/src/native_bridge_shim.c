@@ -248,8 +248,16 @@
 #define MANGO_LIBC_AASSET_READ 154
 #define MANGO_LIBC_AASSET_CLOSE 155
 #define MANGO_LIBC_AASSET_OPEN_FD 156
-#define MANGO_LIBC_COUNT 157
+#define MANGO_LIBC_SL_CREATE_ENGINE 157
+#define MANGO_LIBC_COUNT 158
 #define MANGO_TSD_KEYS 16
+
+/* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
+#define MANGO_SL_SVC_BASE 0x3000u
+#define MANGO_SL_GET_INTERFACE 0
+#define MANGO_SL_CREATE_OUTPUT_MIX 1
+#define MANGO_SL_CREATE_AUDIO_PLAYER 2
+#define MANGO_SL_COUNT 3
 
 #define MANGO_AS_SIZE 0x4000000u
 #define MANGO_LIB_CAP 0x2000000u
@@ -469,6 +477,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "AAsset_read",
     "AAsset_close",
     "AAsset_openFileDescriptor",
+    "slCreateEngine",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -518,6 +527,31 @@ static uint32_t g_meritous_seen_mask; /* bit0 DungeonPlay, bit1 Generate, bit2 R
 static uint8_t g_meritous_font[16384]; /* 256 glyphs × 64B rearrange; was 8192 and clobbered progress statics */
 static int g_meritous_font_ready;
 static uint32_t g_meritous_draw_text_calls;
+
+/* Soft OpenSLES (Pacman Q2 research/49): guest objects + IID cells so
+ * slCreateEngine writes a live SLObjectItf instead of leaving engineObj=0. */
+static int g_sl_ready;
+static uint32_t g_sl_success_stub;   /* mov r0,#0; bx lr */
+static uint32_t g_sl_destroy_stub;   /* bx lr (void Destroy) */
+static uint32_t g_sl_obj_vtable;
+static uint32_t g_sl_engine_vtable;
+static uint32_t g_sl_play_vtable;
+static uint32_t g_sl_seek_vtable;
+static uint32_t g_sl_bq_vtable;
+static uint32_t g_sl_volume_vtable;
+static uint32_t g_sl_effect_vtable;
+static uint32_t g_sl_iid_engine;       /* UUID struct addr (GetInterface arg) */
+static uint32_t g_sl_iid_play;
+static uint32_t g_sl_iid_seek;
+static uint32_t g_sl_iid_volume;
+static uint32_t g_sl_iid_bufferqueue;
+static uint32_t g_sl_iid_effectsend;
+static uint32_t g_sl_iid_engine_cell;  /* import: pointer cell → UUID */
+static uint32_t g_sl_iid_play_cell;
+static uint32_t g_sl_iid_seek_cell;
+static uint32_t g_sl_iid_volume_cell;
+static uint32_t g_sl_iid_bufferqueue_cell;
+static uint32_t g_sl_iid_effectsend_cell;
 
 static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v);
 static uint32_t mango_load_u32_guest(const uint8_t* mem, uint32_t addr);
@@ -1690,6 +1724,179 @@ static void mango_init_ctype_tables(MangoLoadedLibrary* lib) {
   }
 }
 
+/* Pacman Q2: minimal soft OpenSLES. SLObjectItf is double-indirect
+ * (pointer to pointer-to-vtable). Vtable slots that must write out-params
+ * use SVC thunks; everything else is SUCCESS / void no-ops. */
+static uint32_t mango_sl_fill_vtable(MangoLoadedLibrary* lib, uint32_t nslots,
+                                     uint32_t getiface_slot, uint32_t create_player_slot,
+                                     uint32_t create_mix_slot) {
+  uint32_t vt = mango_guest_alloc(lib, nslots * 4u);
+  uint32_t i;
+  uint32_t gi_thunk = 0;
+  uint32_t cp_thunk = 0;
+  uint32_t cm_thunk = 0;
+  if (vt == 0) {
+    return 0;
+  }
+  if (getiface_slot < nslots) {
+    gi_thunk = mango_guest_alloc(lib, MANGO_JNI_THUNK_SIZE);
+    if (gi_thunk) {
+      mango_write_jni_thunk(lib->guest_mem, gi_thunk,
+                            MANGO_SL_SVC_BASE + MANGO_SL_GET_INTERFACE);
+    }
+  }
+  if (create_player_slot < nslots) {
+    cp_thunk = mango_guest_alloc(lib, MANGO_JNI_THUNK_SIZE);
+    if (cp_thunk) {
+      mango_write_jni_thunk(lib->guest_mem, cp_thunk,
+                            MANGO_SL_SVC_BASE + MANGO_SL_CREATE_AUDIO_PLAYER);
+    }
+  }
+  if (create_mix_slot < nslots) {
+    cm_thunk = mango_guest_alloc(lib, MANGO_JNI_THUNK_SIZE);
+    if (cm_thunk) {
+      mango_write_jni_thunk(lib->guest_mem, cm_thunk,
+                            MANGO_SL_SVC_BASE + MANGO_SL_CREATE_OUTPUT_MIX);
+    }
+  }
+  for (i = 0; i < nslots; i++) {
+    uint32_t fn = g_sl_success_stub;
+    /* Object::Destroy is void @ slot 6; engine/itfs use SUCCESS there. */
+    if (i == 6u && g_sl_destroy_stub && getiface_slot == 3u) {
+      fn = g_sl_destroy_stub;
+    }
+    if (i == getiface_slot && gi_thunk) {
+      fn = gi_thunk;
+    }
+    if (i == create_player_slot && cp_thunk) {
+      fn = cp_thunk;
+    }
+    if (i == create_mix_slot && cm_thunk) {
+      fn = cm_thunk;
+    }
+    mango_store_u32_guest(lib->guest_mem, vt + i * 4u, fn);
+  }
+  return vt;
+}
+
+static uint32_t mango_sl_make_itf(MangoLoadedLibrary* lib, uint32_t vtable) {
+  uint32_t cell = mango_guest_alloc(lib, 4u);
+  if (cell == 0 || vtable == 0) {
+    return 0;
+  }
+  mango_store_u32_guest(lib->guest_mem, cell, vtable);
+  return cell; /* SLObjectItf / SL*Itf value */
+}
+
+static uint32_t mango_sl_make_iid_cell(MangoLoadedLibrary* lib, uint32_t* out_uuid) {
+  /* Distinct 16-byte UUID + pointer cell. Identity compare is enough for soft
+   * GetInterface; content unused. */
+  uint32_t uuid = mango_guest_alloc(lib, 16u);
+  uint32_t cell = mango_guest_alloc(lib, 4u);
+  if (uuid == 0 || cell == 0) {
+    return 0;
+  }
+  /* stamp a unique tag so UUIDs differ if anyone memcmp's */
+  mango_store_u32_guest(lib->guest_mem, uuid, uuid);
+  mango_store_u32_guest(lib->guest_mem, cell, uuid);
+  if (out_uuid) {
+    *out_uuid = uuid;
+  }
+  return cell;
+}
+
+static void mango_init_opensles(MangoLoadedLibrary* lib) {
+  uint8_t* mem;
+  if (g_sl_ready || lib == NULL || lib->guest_mem == NULL) {
+    return;
+  }
+  mem = lib->guest_mem;
+
+  g_sl_success_stub = mango_guest_alloc(lib, 8u);
+  if (g_sl_success_stub == 0) {
+    return;
+  }
+  mango_store_u32_guest(mem, g_sl_success_stub, 0xE3A00000u); /* mov r0, #0 */
+  mango_store_u32_guest(mem, g_sl_success_stub + 4u, 0xE12FFF1Eu); /* bx lr */
+
+  g_sl_destroy_stub = mango_guest_alloc(lib, 8u);
+  if (g_sl_destroy_stub == 0) {
+    return;
+  }
+  mango_store_u32_guest(mem, g_sl_destroy_stub, 0xE12FFF1Eu); /* bx lr */
+  mango_store_u32_guest(mem, g_sl_destroy_stub + 4u, 0xE1A00000u); /* nop */
+
+  /* Object vtable: Realize@0, GetInterface@3 (0xc), Destroy@6 (0x18). */
+  g_sl_obj_vtable = mango_sl_fill_vtable(lib, 10u, 3u, 0xffffffffu, 0xffffffffu);
+  /* Engine: CreateAudioPlayer@2 (8), CreateOutputMix@7 (0x1c). */
+  g_sl_engine_vtable = mango_sl_fill_vtable(lib, 16u, 0xffffffffu, 2u, 7u);
+  /* Play / Seek / BufferQueue / Volume / EffectSend — SUCCESS no-ops. */
+  g_sl_play_vtable = mango_sl_fill_vtable(lib, 12u, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+  g_sl_seek_vtable = mango_sl_fill_vtable(lib, 4u, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+  g_sl_bq_vtable = mango_sl_fill_vtable(lib, 8u, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+  g_sl_volume_vtable = mango_sl_fill_vtable(lib, 8u, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+  g_sl_effect_vtable = mango_sl_fill_vtable(lib, 8u, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+
+  g_sl_iid_engine_cell = mango_sl_make_iid_cell(lib, &g_sl_iid_engine);
+  g_sl_iid_play_cell = mango_sl_make_iid_cell(lib, &g_sl_iid_play);
+  g_sl_iid_seek_cell = mango_sl_make_iid_cell(lib, &g_sl_iid_seek);
+  g_sl_iid_volume_cell = mango_sl_make_iid_cell(lib, &g_sl_iid_volume);
+  g_sl_iid_bufferqueue_cell = mango_sl_make_iid_cell(lib, &g_sl_iid_bufferqueue);
+  g_sl_iid_effectsend_cell = mango_sl_make_iid_cell(lib, &g_sl_iid_effectsend);
+
+  if (g_sl_obj_vtable && g_sl_engine_vtable && g_sl_iid_engine_cell) {
+    g_sl_ready = 1;
+    fprintf(stderr, "mango: soft OpenSLES ready obj_vt=%x engine_vt=%x\n",
+            g_sl_obj_vtable, g_sl_engine_vtable);
+  }
+}
+
+static void mango_sl_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
+  uint32_t r0 = cpu->r[0];
+  uint32_t r1 = cpu->r[1];
+  uint32_t r2 = cpu->r[2];
+  (void)r0;
+  switch (fn) {
+    case MANGO_SL_GET_INTERFACE: {
+      /* GetInterface(self, iid, pInterface) — iid is UUID addr. */
+      uint32_t vt = g_sl_play_vtable;
+      uint32_t itf;
+      if (r1 == g_sl_iid_engine) {
+        vt = g_sl_engine_vtable;
+      } else if (r1 == g_sl_iid_play) {
+        vt = g_sl_play_vtable;
+      } else if (r1 == g_sl_iid_seek) {
+        vt = g_sl_seek_vtable;
+      } else if (r1 == g_sl_iid_volume) {
+        vt = g_sl_volume_vtable;
+      } else if (r1 == g_sl_iid_bufferqueue) {
+        vt = g_sl_bq_vtable;
+      } else if (r1 == g_sl_iid_effectsend) {
+        vt = g_sl_effect_vtable;
+      }
+      itf = mango_sl_make_itf(lib, vt);
+      if (r2 != 0 && mango_guest_range_ok(lib, r2, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r2, itf);
+      }
+      cpu->r[0] = 0; /* SL_RESULT_SUCCESS */
+      break;
+    }
+    case MANGO_SL_CREATE_OUTPUT_MIX:
+    case MANGO_SL_CREATE_AUDIO_PLAYER: {
+      /* Create*(self, pObject, ...) — write new soft SLObjectItf to *pObject. */
+      uint32_t obj = mango_sl_make_itf(lib, g_sl_obj_vtable);
+      if (r1 != 0 && mango_guest_range_ok(lib, r1, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r1, obj);
+      }
+      cpu->r[0] = 0;
+      break;
+    }
+    default:
+      cpu->r[0] = 0;
+      break;
+  }
+}
+
 static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
   uint32_t base = MANGO_LIB_CAP;
   uint32_t vm_table = base + 4u;
@@ -1736,6 +1943,7 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
   mango_store_u32_guest(mem, heap + 4u, 0xA5A5A5A5u);
   mango_store_u32_guest(mem, heap + 8u, 4096u); /* bionic __page_size */
   mango_init_ctype_tables(lib); /* bump heap_used for _ctype_ / case tabs */
+  mango_init_opensles(lib); /* Pacman Q2 soft OpenSLES IIDs + vtables */
   lib->stack_top = need - 16u;
   lib->host_vm = NULL;
   mango_store_u32_guest(mem, base, vm_table);
@@ -1818,6 +2026,28 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
     name = "malloc";
   } else if (strcmp(name, "_ZdlPv") == 0 || strcmp(name, "_ZdaPv") == 0) {
     name = "free";
+  } else if (strncmp(name, "SL_IID_", 7) == 0) {
+    /* Pacman Q2: OpenSLES IID objects — pointer cells, never stub_addr. */
+    mango_init_opensles(lib);
+    if (strcmp(name, "SL_IID_ENGINE") == 0) {
+      return g_sl_iid_engine_cell;
+    }
+    if (strcmp(name, "SL_IID_PLAY") == 0) {
+      return g_sl_iid_play_cell;
+    }
+    if (strcmp(name, "SL_IID_SEEK") == 0) {
+      return g_sl_iid_seek_cell;
+    }
+    if (strcmp(name, "SL_IID_VOLUME") == 0) {
+      return g_sl_iid_volume_cell;
+    }
+    if (strcmp(name, "SL_IID_BUFFERQUEUE") == 0) {
+      return g_sl_iid_bufferqueue_cell;
+    }
+    if (strcmp(name, "SL_IID_EFFECTSEND") == 0) {
+      return g_sl_iid_effectsend_cell;
+    }
+    return lib->stub_addr;
   } else if (strncmp(name, "AAsset", 6) == 0) {
     /* Pacman Q0: real AAsset* host I/O via kLibcNames + MANGO_ASSET_ROOT.
      * Do not soft-map to eglGetDisplay (getNextFileName must eventually NULL). */
@@ -3365,6 +3595,18 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = (fd >= 0) ? (uint32_t)fd : (uint32_t)-1;
       break;
     }
+    case MANGO_LIBC_SL_CREATE_ENGINE: {
+      /* slCreateEngine(pEngine, numOptions, pOptions, numIfaces, pIds, pReq)
+       * Must write non-null SLObjectItf into *pEngine on SUCCESS (research/49). */
+      uint32_t obj;
+      mango_init_opensles(lib);
+      obj = mango_sl_make_itf(lib, g_sl_obj_vtable);
+      if (r0 != 0 && mango_guest_range_ok(lib, r0, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r0, obj);
+      }
+      cpu->r[0] = 0; /* SL_RESULT_SUCCESS */
+      break;
+    }
     default:
       cpu->r[0] = (uint32_t)-1;
       break;
@@ -3851,7 +4093,8 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         uint32_t imm = mango_load_u32_guest(mem.bytes, pc + 8u);
         if ((imm >= MANGO_JNI_SVC_BASE && imm < MANGO_JNI_SVC_BASE + MANGO_JNI_TABLE_LEN) ||
             (imm >= MANGO_JVM_SVC_BASE && imm < MANGO_JVM_SVC_BASE + MANGO_JVM_TABLE_LEN) ||
-            (imm >= MANGO_LIBC_SVC_BASE && imm < MANGO_LIBC_SVC_BASE + MANGO_LIBC_COUNT)) {
+            (imm >= MANGO_LIBC_SVC_BASE && imm < MANGO_LIBC_SVC_BASE + MANGO_LIBC_COUNT) ||
+            (imm >= MANGO_SL_SVC_BASE && imm < MANGO_SL_SVC_BASE + MANGO_SL_COUNT)) {
           nr = imm;
         }
       }
@@ -3867,6 +4110,8 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         mango_meritous_progress(cpu->r[MANGO_REG_LR]);
         mango_pc_hist_sample(cpu->r[MANGO_REG_LR]);
       }
+    } else if (nr >= MANGO_SL_SVC_BASE && nr < MANGO_SL_SVC_BASE + MANGO_SL_COUNT) {
+      mango_sl_svc(lib, cpu, nr - MANGO_SL_SVC_BASE);
     } else {
       cpu->r[0] = (uint32_t)-1;
     }
