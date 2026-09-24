@@ -1772,7 +1772,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0k: CMP.W Rn,#<const> modified-imm (op=1101, S=1, Rd=15 flags-only).
    * Primary f1b5 4f00 = cmp.w r5,#0x80000000 (imm12 0x400 → ThumbExpandImm 0x80000000,
    * NOT #0x400 / f5b5 6f80). Sibling f1b9 0f1a = cmp.w r9,#0x1a.
-   * Same op as 0d SUB but S=1 + Rd=15; do not accept S=1 Rd≠15 (SUBS) this bite. */
+   * Same op as 0d SUB but S=1 + Rd=15. S=1 Rd≠15 is SUBS.W (Q-OTTD-0as). */
   if ((hw1 & 0xFBE0u) == 0xF1A0u && (hw1 & 0x10u) != 0 && ((hw2 >> 8) & 0xFu) == 0xFu &&
       (hw2 & 0x8000u) == 0) {
     uint32_t i = (hw1 >> 10) & 1u;
@@ -1788,6 +1788,34 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       return -1;
     }
     out->op = MANGO_OP_CMP;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->sets_flags = 1;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0as: SUBS.W Rd,Rn,#<const> modified-imm (S=1, Rd≠15).
+   * OpenTTD f1b5 0610 = subs.w r6,r5,#0x10 (llvm-mc [b5,f1,10,06]).
+   * Same expand as 0d; sets NZCV. Rd=15 stays CMP. Reject Rd/Rn=PC.
+   * Register-form SUBS (EBBx) and RSBS (f1d0) stay closed. */
+  if ((hw1 & 0xFBE0u) == 0xF1A0u && (hw1 & 0x10u) != 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_SUB;
+    out->rd = rd;
     out->rn = rn;
     out->is_imm = 1;
     out->sets_flags = 1;
@@ -2572,6 +2600,38 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     }
   }
 
+
+  /* Q-OTTD-0at: T32 LDREX/STREX word. Must precede the STRD mask
+   * (hw1&0xFE50)==0xE840, which also covers STREX hw1 E84x and rejects it
+   * as P=0 W=0. OpenTTD e853 2f00 = ldrex r2,[r3] (llvm-mc [53,e8,00,2f]);
+   * e843 1e00 = strex lr,r1,[r3]. Single-thread: STREX status is 0.
+   * Byte/half/double and CLREX stay closed. Reject Rn/Rt=PC; status may be LR. */
+  if ((hw1 & 0xFFF0u) == 0xE850u && (hw2 & 0x0FFFu) == 0x0F00u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    if (rn == MANGO_REG_PC || rt == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDREX;
+    out->rn = rn;
+    out->rd = rt;
+    out->b = 0; /* word */
+    return 0;
+  }
+  if ((hw1 & 0xFFF0u) == 0xE840u && (hw2 & 0x00FFu) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    if (rn == MANGO_REG_PC || rt == MANGO_REG_PC || rd == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_STREX;
+    out->rn = rn;
+    out->rd = rd;
+    out->rm = rt;
+    out->b = 0;
+    return 0;
+  }
 
   /* Q-OTTD-0t / widen 0e-strd: T32 STRD imm T1 L=0 — general P/U/W from hw1.
    * Guest e946 4502 = strd r4,r5,[r6,#-8] (P=1 U=0 W=0). Also tip 0e e9c1/e9c6

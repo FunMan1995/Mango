@@ -148,15 +148,28 @@ int main(int argc, char** argv) {
     fprintf(stderr, "mango_host_openttd_drive: nativeInit returned\n");
   }
 
-  void* sm = find_tramp(h_app, "SDL_main", "*III", 4);
+  void* sm = find_tramp(h_app, "SDL_main", "*IIL", 4);
+  if (!sm) sm = find_tramp(h_app, "SDL_main", "*III", 4);
   if (!sm) sm = find_tramp(h_app, "SDL_main", "II", 2);
   if (!sm) {
     fprintf(stderr, "mango_host_openttd_drive: no SDL_main trampoline\n");
     rc = 1;
     goto unload;
   }
-  fprintf(stderr, "mango_host_openttd_drive: calling SDL_main(0, NULL)\n");
-  int smrc = ((mango_sdl_main_fn)sm)(0, NULL);
+  /* argv[0] is "<cwd>/openttd" so DeterminePaths treats cwd as the binary dir.
+   * Run the drive with cwd at the extracted OpenTTD data root (baseset/). */
+  char cwd[PATH_MAX];
+  char prog[PATH_MAX];
+  char* av[2];
+  if (getcwd(cwd, sizeof(cwd)) == NULL) {
+    cwd[0] = '.';
+    cwd[1] = '\0';
+  }
+  snprintf(prog, sizeof(prog), "%s/openttd", cwd);
+  av[0] = prog;
+  av[1] = NULL;
+  fprintf(stderr, "mango_host_openttd_drive: calling SDL_main(1, %s)\n", prog);
+  int smrc = ((mango_sdl_main_fn)sm)(1, av);
   fprintf(stderr, "mango_host_openttd_drive: SDL_main returned %d\n", smrc);
 
 unload:

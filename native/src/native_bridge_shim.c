@@ -275,7 +275,15 @@
 #define MANGO_LIBC_VSPRINTF 168
 #define MANGO_LIBC_UNLINK 169
 #define MANGO_LIBC_STRNCPY 170
-#define MANGO_LIBC_COUNT 171
+/* OpenTTD ScanPath: opendir/readdir/closedir plus getcwd/chdir for search paths. */
+#define MANGO_LIBC_OPENDIR 171
+#define MANGO_LIBC_READDIR 172
+#define MANGO_LIBC_CLOSEDIR 173
+#define MANGO_LIBC_GETCWD 174
+#define MANGO_LIBC_CHDIR 175
+/* OpenTTD usererror → vseprintf → vsnprintf. Without this the message stays empty. */
+#define MANGO_LIBC_VSNPRINTF 176
+#define MANGO_LIBC_COUNT 177
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -517,6 +525,12 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "vsprintf",
     "unlink",
     "strncpy",
+    "opendir",
+    "readdir",
+    "closedir",
+    "getcwd",
+    "chdir",
+    "vsnprintf",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -2821,6 +2835,63 @@ static int mango_guest_format(MangoLoadedLibrary* lib, char* out, size_t out_sz,
 
 static void mango_meritous_host_draw_text(MangoLoadedLibrary* lib, uint32_t x0, uint32_t y0,
                                           uint32_t str_addr, uint32_t color);
+
+/* Bionic armeabi-v7a struct dirent: d_name at +19 (uint64 ino, int64 off,
+ * uint16 reclen, uint8 type). OpenTTD does `add r0, dirent, #0x13`. */
+#define MANGO_DIR_MAX 32
+#define MANGO_DIRENT_SIZE 280u
+#define MANGO_DIRENT_NAME 19u
+
+typedef struct MangoDirSlot {
+  DIR* dir;
+  uint32_t ent;
+} MangoDirSlot;
+
+static MangoDirSlot g_dirs[MANGO_DIR_MAX];
+
+static void mango_store_bionic_dirent(uint8_t* mem, uint32_t addr, const struct dirent* ent) {
+  uint64_t ino;
+  int64_t off;
+  uint16_t reclen;
+  size_t n;
+  memset(mem + addr, 0, MANGO_DIRENT_SIZE);
+  ino = (uint64_t)ent->d_ino;
+  off = (int64_t)ent->d_off;
+  reclen = (uint16_t)(MANGO_DIRENT_NAME + 256u);
+  memcpy(mem + addr + 0, &ino, 8);
+  memcpy(mem + addr + 8, &off, 8);
+  memcpy(mem + addr + 16, &reclen, 2);
+  mem[addr + 18] = (uint8_t)ent->d_type;
+  n = 0;
+  while (n < 255u && ent->d_name[n] != '\0') {
+    mem[addr + MANGO_DIRENT_NAME + n] = (uint8_t)ent->d_name[n];
+    n++;
+  }
+  mem[addr + MANGO_DIRENT_NAME + n] = 0;
+}
+
+static uint32_t mango_dir_intern(MangoLoadedLibrary* lib, DIR* dir) {
+  uint32_t i;
+  uint32_t ent;
+  if (!dir) {
+    return 0;
+  }
+  for (i = 1; i < MANGO_DIR_MAX; i++) {
+    if (g_dirs[i].dir == NULL) {
+      ent = mango_guest_alloc(lib, MANGO_DIRENT_SIZE);
+      if (ent == 0) {
+        closedir(dir);
+        return 0;
+      }
+      g_dirs[i].dir = dir;
+      g_dirs[i].ent = ent;
+      return i;
+    }
+  }
+  closedir(dir);
+  return 0;
+}
+
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
@@ -2959,6 +3030,151 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       }
       break;
     }
+    case MANGO_LIBC_OPENDIR: {
+      const char* path = mango_guest_cstr(lib, r0);
+      char host[768];
+      DIR* dir;
+      uint32_t id;
+      if (!path) {
+        mango_set_guest_errno(lib, EFAULT);
+        cpu->r[0] = 0;
+        break;
+      }
+      if (!mango_host_map_path(lib, path, host, sizeof(host))) {
+        mango_set_guest_errno(lib, ENOENT);
+        cpu->r[0] = 0;
+        break;
+      }
+      dir = opendir(host);
+      if (!dir) {
+        int e = errno;
+        mango_set_guest_errno(lib, e);
+        id = 0;
+      } else {
+        id = mango_dir_intern(lib, dir);
+      }
+      {
+        static int s_od;
+        int printable = 1;
+        if (s_od < 40) {
+          for (const char* p = host; *p; p++) {
+            if ((unsigned char)*p < 0x20u || (unsigned char)*p >= 0x7fu) {
+              printable = 0;
+              break;
+            }
+          }
+          if (printable) {
+            fprintf(stderr, "mango: opendir %s -> %s\n", host, id ? "ok" : "fail");
+          } else {
+            fprintf(stderr, "mango: opendir hex ");
+            for (size_t i = 0; i < 24u && host[i]; i++) {
+              fprintf(stderr, "%02x", (unsigned char)host[i]);
+            }
+            fprintf(stderr, " -> %s\n", id ? "ok" : "fail");
+          }
+          s_od++;
+        }
+      }
+      cpu->r[0] = id;
+      break;
+    }
+    case MANGO_LIBC_READDIR: {
+      uint32_t id = r0;
+      struct dirent* ent;
+      if (id == 0 || id >= MANGO_DIR_MAX || g_dirs[id].dir == NULL) {
+        cpu->r[0] = 0;
+        break;
+      }
+      errno = 0;
+      ent = readdir(g_dirs[id].dir);
+      if (!ent) {
+        if (errno != 0) {
+          mango_set_guest_errno(lib, errno);
+        }
+        cpu->r[0] = 0;
+        break;
+      }
+      if (!mango_guest_range_ok(lib, g_dirs[id].ent, MANGO_DIRENT_SIZE)) {
+        cpu->r[0] = 0;
+        break;
+      }
+      mango_store_bionic_dirent(lib->guest_mem, g_dirs[id].ent, ent);
+      cpu->r[0] = g_dirs[id].ent;
+      break;
+    }
+    case MANGO_LIBC_CLOSEDIR: {
+      uint32_t id = r0;
+      if (id == 0 || id >= MANGO_DIR_MAX || g_dirs[id].dir == NULL) {
+        mango_set_guest_errno(lib, EBADF);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      cpu->r[0] = (uint32_t)closedir(g_dirs[id].dir);
+      g_dirs[id].dir = NULL;
+      g_dirs[id].ent = 0;
+      break;
+    }
+    case MANGO_LIBC_GETCWD: {
+      char tmp[1024];
+      size_t cap = r1;
+      const char* got;
+      size_t n;
+      if (r0 == 0 || cap == 0 || !mango_guest_range_ok(lib, r0, cap > 1024u ? 1024u : cap)) {
+        mango_set_guest_errno(lib, EINVAL);
+        cpu->r[0] = 0;
+        break;
+      }
+      got = getcwd(tmp, sizeof(tmp));
+      if (!got) {
+        mango_set_guest_errno(lib, errno);
+        cpu->r[0] = 0;
+        break;
+      }
+      n = strlen(got);
+      if (n + 1u > cap) {
+        mango_set_guest_errno(lib, ERANGE);
+        cpu->r[0] = 0;
+        break;
+      }
+      memcpy(lib->guest_mem + r0, got, n + 1u);
+      {
+        static int s_cwd;
+        if (s_cwd < 4) {
+          fprintf(stderr, "mango: getcwd %s\n", got);
+          s_cwd++;
+        }
+      }
+      cpu->r[0] = r0;
+      break;
+    }
+    case MANGO_LIBC_CHDIR: {
+      const char* path = mango_guest_cstr(lib, r0);
+      char host[768];
+      int rc;
+      if (!path) {
+        mango_set_guest_errno(lib, EFAULT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (!mango_host_map_path(lib, path, host, sizeof(host))) {
+        mango_set_guest_errno(lib, ENOENT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      rc = chdir(host);
+      if (rc != 0) {
+        mango_set_guest_errno(lib, errno);
+      }
+      {
+        static int s_cd;
+        if (s_cd < 8) {
+          fprintf(stderr, "mango: chdir %s -> %d\n", host, rc);
+          s_cd++;
+        }
+      }
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
     case MANGO_LIBC_MEMMEM: {
       if (!mango_guest_range_ok(lib, r0, r1) || !mango_guest_range_ok(lib, r2, cpu->r[3])) {
         cpu->r[0] = 0;
@@ -3060,8 +3276,52 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = a;
       break;
     }
-    case MANGO_LIBC_ALOG:
-    case MANGO_LIBC_PRINTF:
+    case MANGO_LIBC_ALOG: {
+      /* __android_log_print(prio, tag, fmt, ...). OpenTTD ShowOSErrorBox
+       * logs the usererror text here before exit(1). */
+      const char* tag = mango_guest_cstr(lib, r1);
+      const char* fmt = mango_guest_cstr(lib, r2);
+      char tmp[512];
+      tmp[0] = 0;
+      if (fmt) {
+        MangoGuestVA va;
+        va.lib = lib;
+        va.nregs = 1;
+        va.regs[0] = cpu->r[3];
+        va.sp = cpu->r[MANGO_REG_SP];
+        mango_guest_format(lib, tmp, sizeof(tmp), fmt, &va);
+      }
+      fprintf(stderr, "mango: alog %u %s: %s\n", r0, tag ? tag : "(null)", tmp);
+      {
+        const char* arg = mango_guest_cstr(lib, cpu->r[3]);
+        if (arg == NULL || arg[0] == '\0' || strstr(tmp, arg) == NULL) {
+          fprintf(stderr, "mango: alog r3=%#x arg=%s\n", cpu->r[3], arg ? arg : "(null)");
+        }
+      }
+      cpu->r[0] = (uint32_t)strlen(tmp);
+      break;
+    }
+    case MANGO_LIBC_PRINTF: {
+      const char* fmt = mango_guest_cstr(lib, r0);
+      char tmp[512];
+      tmp[0] = 0;
+      if (fmt) {
+        MangoGuestVA va;
+        va.lib = lib;
+        va.nregs = 3;
+        va.regs[0] = r1;
+        va.regs[1] = r2;
+        va.regs[2] = cpu->r[3];
+        va.sp = cpu->r[MANGO_REG_SP];
+        mango_guest_format(lib, tmp, sizeof(tmp), fmt, &va);
+      }
+      fputs(tmp, stderr);
+      if (tmp[0] == 0 || tmp[strlen(tmp) - 1] != '\n') {
+        fputc('\n', stderr);
+      }
+      cpu->r[0] = (uint32_t)strlen(tmp);
+      break;
+    }
     case MANGO_LIBC_PTHREAD_LOCK:
     case MANGO_LIBC_PTHREAD_UNLOCK:
       cpu->r[0] = 0;
@@ -4396,6 +4656,35 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = val;
       break;
     }
+    case MANGO_LIBC_VSNPRINTF: {
+      /* vsnprintf(buf, size, fmt, ap). OpenTTD vseprintf uses this for usererror. */
+      const char* fmt = mango_guest_cstr(lib, r2);
+      uint32_t cap = r1;
+      if (!fmt || cap == 0 || !mango_guest_range_ok(lib, r0, cap > 512u ? 512u : cap)) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      char tmp[512];
+      MangoGuestVA va;
+      va.lib = lib;
+      va.nregs = 0;
+      va.sp = cpu->r[3];
+      int wrote = mango_guest_format(lib, tmp, sizeof(tmp), fmt, &va);
+      if (wrote < 0) {
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      size_t n = (size_t)wrote;
+      if (n >= cap) {
+        n = cap - 1u;
+      }
+      if (n > 0) {
+        memcpy(lib->guest_mem + r0, tmp, n);
+      }
+      lib->guest_mem[r0 + (uint32_t)n] = 0;
+      cpu->r[0] = (uint32_t)wrote;
+      break;
+    }
     case MANGO_LIBC_VSPRINTF: {
       /* vsprintf(buf, fmt, ap) — ARM va_list is a guest pointer to args. */
       const char* fmt = mango_guest_cstr(lib, r1);
@@ -5225,6 +5514,35 @@ static void mango_xw_ensure_tid_env(MangoLoadedLibrary* lib, uint32_t ctxt) {
   }
 }
 
+/* Copy a host argv into guest memory. SDL_main's char** is a 64-bit host
+ * pointer; the guest can only load through a 32-bit address. */
+static uint32_t mango_guest_host_argv(MangoLoadedLibrary* lib, char** argv) {
+  uint32_t ptrs[8];
+  uint32_t n = 0;
+  uint32_t arr;
+  if (argv == NULL) {
+    return 0;
+  }
+  while (n < 7u && argv[n] != NULL) {
+    size_t len = strlen(argv[n]);
+    uint32_t a = mango_guest_alloc(lib, (uint32_t)len + 1u);
+    if (a == 0) {
+      return 0;
+    }
+    memcpy(lib->guest_mem + a, argv[n], len + 1u);
+    ptrs[n++] = a;
+  }
+  arr = mango_guest_alloc(lib, (n + 1u) * 4u);
+  if (arr == 0) {
+    return 0;
+  }
+  for (uint32_t i = 0; i < n; i++) {
+    mango_store_u32_guest(lib->guest_mem, arr + i * 4u, ptrs[i]);
+  }
+  mango_store_u32_guest(lib->guest_mem, arr + n * 4u, 0);
+  return arr;
+}
+
 static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
   MangoLoadedLibrary* lib = slot ? slot->lib : NULL;
   if (!lib) {
@@ -5289,8 +5607,13 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
       lo = u.u;
     } else if (t == 'L' || t == '[') {
       void* p = va_arg(ap, void*);
-      /* Raw AAPCS: pass the pointer bits (guest addr). JNI: intern a handle. */
-      lo = raw ? (uint32_t)(uintptr_t)p : mango_handle_intern(p);
+      /* SDL_main(argc, argv): argv is a host char**. Copy it into the guest. */
+      if (raw && t == 'L' && slot->name[0] && strcmp(slot->name, "SDL_main") == 0) {
+        lo = mango_guest_host_argv(lib, (char**)p);
+      } else {
+        /* Raw AAPCS: pass the pointer bits (guest addr). JNI: intern a handle. */
+        lo = raw ? (uint32_t)(uintptr_t)p : mango_handle_intern(p);
+      }
     } else {
       lo = (uint32_t)va_arg(ap, int);
     }

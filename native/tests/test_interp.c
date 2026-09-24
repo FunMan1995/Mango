@@ -3203,6 +3203,105 @@ static int test_t32_adds_w_imm0(void) {
   return 0;
 }
 
+static int test_t32_subs_w_imm16(void) {
+  /* Q-OTTD-0as: subs.w r6,r5,#0x10 = f1b5 0610. r6 = r5-16; NZCV from the sub.
+   * CMP (Rd=15) stays CMP. Rn=PC stays closed. */
+  static const uint16_t kProg[] = {0xF1B5u, 0x0610u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xF1B5u, 0x0610u, &di) != 0 || di.op != MANGO_OP_SUB || di.rd != 6 ||
+      di.rn != 5 || di.is_imm != 1 || di.imm != 0x10u || di.sets_flags != 1) {
+    fprintf(stderr, "FAIL(t32_subs_w): decode op=%d rd=%u rn=%u imm=%u s=%d\n", di.op, di.rd,
+            di.rn, di.imm, di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xF1B5u, 0x4F00u, &di) != 0 || di.op != MANGO_OP_CMP) {
+    fprintf(stderr, "FAIL(t32_subs_w): CMP.W Rd=15 no longer CMP\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF1BFu, 0x0610u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_subs_w): Rn=PC decoded\n");
+    return 1;
+  }
+
+  struct {
+    uint32_t in, want, nzcv;
+  } cases[] = {
+      {0u, 0xfffffff0u, MANGO_CPSR_N},
+      {0x10u, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0x20u, 0x10u, MANGO_CPSR_C},
+      {0x80000000u, 0x7ffffff0u, MANGO_CPSR_C | MANGO_CPSR_V},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[5] = cases[c].in;
+    cpu.r[6] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[6] != cases[c].want || cpu.r[5] != cases[c].in || nzcv != cases[c].nzcv ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr, "FAIL(t32_subs_w#%u): rc=%d r6=%x nzcv=%x want r6=%x nzcv=%x\n", c, rc,
+              cpu.r[6], nzcv, cases[c].want, cases[c].nzcv);
+      return 1;
+    }
+  }
+  printf("ok: T32 SUBS.W r6,r5,#0x10 (Q-OTTD-0as)\n");
+  return 0;
+}
+
+static int test_t32_ldrex_strex(void) {
+  /* Q-OTTD-0at: ldrex r2,[r3] = e853 2f00; strex r0,r1,[r3] = e843 1000.
+   * Guest also uses strex lr,r1,[r3] = e843 1e00 (status in LR). */
+  static const uint16_t kProg[] = {0xE853u, 0x2F00u, 0xE843u, 0x1000u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 5);
+  mem_buf[16] = 0x44;
+  mem_buf[17] = 0x33;
+  mem_buf[18] = 0x22;
+  mem_buf[19] = 0x11;
+  MangoInsn di;
+  if (mango_decode_t32(0xE853u, 0x2F00u, &di) != 0 || di.op != MANGO_OP_LDREX || di.rd != 2 ||
+      di.rn != 3 || di.b != 0) {
+    fprintf(stderr, "FAIL(t32_ldrex): decode op=%d rd=%u rn=%u b=%d\n", di.op, di.rd, di.rn, di.b);
+    return 1;
+  }
+  if (mango_decode_t32(0xE843u, 0x1E00u, &di) != 0 || di.op != MANGO_OP_STREX || di.rd != 14 ||
+      di.rm != 1 || di.rn != 3 || di.b != 0) {
+    fprintf(stderr, "FAIL(t32_strex_lr): decode op=%d rd=%u rm=%u rn=%u\n", di.op, di.rd, di.rm,
+            di.rn);
+    return 1;
+  }
+  if (mango_decode_t32(0xE85Fu, 0x2F00u, &di) == 0 || mango_decode_t32(0xE853u, 0xFF00u, &di) == 0 ||
+      mango_decode_t32(0xE843u, 0x1F00u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrex): Rn/Rt=PC decoded\n");
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C;
+  cpu.r[3] = 16;
+  cpu.r[1] = 0xAABBCCDDu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  uint32_t stored = (uint32_t)mem_buf[16] | ((uint32_t)mem_buf[17] << 8) |
+                    ((uint32_t)mem_buf[18] << 16) | ((uint32_t)mem_buf[19] << 24);
+  if (rc != 0 || cpu.r[2] != 0x11223344u || cpu.r[0] != 0 || stored != 0xAABBCCDDu ||
+      (cpu.cpsr & MANGO_CPSR_T) == 0 || (cpu.cpsr & MANGO_CPSR_C) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrex): rc=%d r2=%x r0=%x mem=%x cpsr=%x\n", rc, cpu.r[2], cpu.r[0],
+            stored, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 LDREX/STREX word (Q-OTTD-0at)\n");
+  return 0;
+}
+
 static int test_t32_orr_w_imm1(void) {
   /* Q-OTTD-0al: orr.w r6,r6,#1 = f046 0601. r6 |= 1; NZCV unchanged.
    * ORRS f056 0601 and Rd=PC stay closed. MOV.W Rn=15 still MOV. */
@@ -6845,11 +6944,13 @@ static int test_t32_cmp_w_modimm_1a(void) {
 }
 
 static int test_t32_cmp_w_modimm_reject(void) {
-  /* S=1 Rd≠15 is SUBS — out of scope; Rn=PC UNPRED; CMN/BIC footnotes uncover. */
+  /* Rn=PC UNPRED; CMN/BIC footnotes uncover. SUBS.W S=1 Rd≠15 is Q-OTTD-0as. */
   MangoInsn di;
-  /* f1b5 0f00 with Rd≠15 forced: use f1b5 0400 = SUBS-like Rd=4 S=1 */
-  if (mango_decode_t32(0xF1B5u, 0x0400u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_cmp_w_reject): S=1 Rd≠15 f1b50400 decoded as op=%d\n", di.op);
+  /* f1b5 0400 = subs.w r4,r5,#0 */
+  if (mango_decode_t32(0xF1B5u, 0x0400u, &di) != 0 || di.op != MANGO_OP_SUB || di.rd != 4 ||
+      di.rn != 5 || di.sets_flags != 1 || di.imm != 0) {
+    fprintf(stderr, "FAIL(t32_cmp_w_reject): SUBS f1b50400 op=%d rd=%u rn=%u imm=%u s=%d\n", di.op,
+            di.rd, di.rn, di.imm, di.sets_flags);
     return 1;
   }
   /* f1bf 4f00 = CMP.W pc,#0x80000000 — Rn=PC */
@@ -6881,7 +6982,7 @@ static int test_t32_cmp_w_modimm_reject(void) {
             di.op, di.rd, di.rn, di.imm, di.sets_flags);
     return 1;
   }
-  printf("ok: T32 CMP.W reject SUBS/Rn=PC/CMN; BIC cleared by 0q (Q-OTTD-0k)\n");
+  printf("ok: T32 CMP.W reject Rn=PC/CMN; SUBS cleared by 0as (Q-OTTD-0k)\n");
   return 0;
 }
 
@@ -9594,6 +9695,8 @@ int main(void) {
   failures += test_t32_stmia_r12_wb();
   failures += test_t32_ldrsb_w_imm12();
   failures += test_t32_adds_w_imm0();
+  failures += test_t32_subs_w_imm16();
+  failures += test_t32_ldrex_strex();
   failures += test_t32_orr_w_imm1();
   failures += test_t32_eor_w_imm1();
   failures += test_t32_tst_w_imm1();
