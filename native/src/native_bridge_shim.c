@@ -53,6 +53,7 @@
 #define MANGO_JNI_EXCEPTION_CLEAR 17
 #define MANGO_JNI_FATAL_ERROR 18
 #define MANGO_JNI_NEW_GLOBAL_REF 21
+#define MANGO_JNI_DELETE_GLOBAL_REF 22
 #define MANGO_JNI_DELETE_LOCAL_REF 23
 #define MANGO_JNI_IS_SAME_OBJECT 24
 #define MANGO_JNI_GET_OBJECT_CLASS 31
@@ -4507,6 +4508,13 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
               ? mango_handle_intern((*env)->NewGlobalRef(env, mango_handle_lookup(cpu->r[1])))
               : cpu->r[1];
       break;
+    case MANGO_JNI_DELETE_GLOBAL_REF:
+      /* CrossWords Q1 (research/65): JNI index 22 / vtable +0x58. Soft NewGlobalRef
+       * returns identity when host JNI weak — mirror DeleteLocalRef soft no-op. */
+      if (mango_host_jni_ok(env)) {
+        (*env)->DeleteGlobalRef(env, mango_handle_lookup(cpu->r[1]));
+      }
+      break;
     case MANGO_JNI_DELETE_LOCAL_REF:
       if (mango_host_jni_ok(env)) {
         (*env)->DeleteLocalRef(env, mango_handle_lookup(cpu->r[1]));
@@ -5155,6 +5163,58 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
   }
 }
 
+/* CrossWords Q1 (research/65): game_dispose zeros XP tid→env entries while
+ * leaving count/table live; cleanGlobals → destroyDUtil → envForMe then misses
+ * tid and returns NULL → LDR [0] ELF magic → DeleteGlobalRef slot fault.
+ * Soft pthread_self is stably 1 — re-seed {jni_env_addr, tid=1} before destroy. */
+static void mango_xw_ensure_tid_env(MangoLoadedLibrary* lib, uint32_t ctxt) {
+  uint32_t count, table, env_addr, i;
+  int slot = -1;
+  if (!lib || !lib->guest_mem || ctxt == 0 || ctxt + 12u > lib->guest_mem_size) {
+    return;
+  }
+  env_addr = lib->jni_env_addr;
+  if (env_addr == 0) {
+    return;
+  }
+  count = mango_load_u32_guest(lib->guest_mem, ctxt + 4u);
+  table = mango_load_u32_guest(lib->guest_mem, ctxt + 8u);
+  if (count == 0 || table == 0 || table + 8u > lib->guest_mem_size) {
+    uint32_t neu = mango_guest_alloc(lib, 16u);
+    if (neu == 0) {
+      return;
+    }
+    mango_store_u32_guest(lib->guest_mem, ctxt + 4u, 2u);
+    mango_store_u32_guest(lib->guest_mem, ctxt + 8u, neu);
+    mango_store_u32_guest(lib->guest_mem, neu, env_addr);
+    mango_store_u32_guest(lib->guest_mem, neu + 4u, 1u); /* soft pthread_self */
+    return;
+  }
+  for (i = 0; i < count && i < 16u; i++) {
+    uint32_t e = table + i * 8u;
+    uint32_t etid;
+    if (e + 8u > lib->guest_mem_size) {
+      break;
+    }
+    etid = mango_load_u32_guest(lib->guest_mem, e + 4u);
+    if (etid == 1u) {
+      slot = (int)i;
+      break;
+    }
+    if (etid == 0u && slot < 0) {
+      slot = (int)i;
+    }
+  }
+  if (slot < 0) {
+    slot = 0;
+  }
+  {
+    uint32_t e = table + (uint32_t)slot * 8u;
+    mango_store_u32_guest(lib->guest_mem, e, env_addr);
+    mango_store_u32_guest(lib->guest_mem, e + 4u, 1u);
+  }
+}
+
 static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
   MangoLoadedLibrary* lib = slot ? slot->lib : NULL;
   if (!lib) {
@@ -5260,6 +5320,12 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
   cpu.r[MANGO_REG_PC] = pc;
   for (uint32_t i = 0; i < nstack; i++) {
     mango_store_u32_guest(lib->guest_mem, cpu.r[MANGO_REG_SP] + i * 4u, stack[i]);
+  }
+
+  /* CrossWords Q1: keep envForMe tid→env live through cleanGlobals/destroyDUtil. */
+  if (!raw && !onload && nreg > 2u && slot->name[0] &&
+      strstr(slot->name, "cleanGlobals") != NULL) {
+    mango_xw_ensure_tid_env(lib, regs[2]);
   }
 
   if (mango_run_guest(lib, &cpu, env) != 0) {
