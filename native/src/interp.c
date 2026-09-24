@@ -498,7 +498,11 @@ static void mango_advance_itstate(MangoCpu* cpu) {
   if ((it & 7u) == 0) {
     mango_set_itstate(cpu, 0);
   } else {
-    mango_set_itstate(cpu, (it & 0xE0u) | ((it & 0x1Fu) << 1));
+    /* Bit 4 is the current then/else bit. Mask the shift back to bits
+     * [4:0] so it does not stick in bit 5. An odd condition (LE, NE, ...)
+     * otherwise becomes AL and the rest of the block always executes.
+     * GfxFillRect `ite le` is Q-OTTD-0bv. */
+    mango_set_itstate(cpu, (it & 0xE0u) | ((it << 1) & 0x1Fu));
   }
 }
 

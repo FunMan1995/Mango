@@ -2493,6 +2493,44 @@ static int test_thumb_it_preserves_flags(void) {
   return 0;
 }
 
+static int test_thumb_ite_le(void) {
+  /* Q-OTTD-0bv: GfxFillRect `ite le; rsble r8,r10,lr; rsbgt r8,r10,r8`
+   * (bfd4 / ebca 080e / ebca 0808, llvm-mc [d4,bf] [ca,eb,0e,08] [ca,eb,08,08]).
+   * Equal operands are LE: r8 = lr - r10, and the GT arm must not run.
+   * A greater r5 is GT: only the second subtract runs. */
+  static const uint16_t kLe[] = {
+      0x4670u, 0x2505u, 0x2205u, 0x4690u, 0x2104u, 0x468Au, 0x46AEu, 0x4545u, 0xBFD4u,
+      0xEBCAu, 0x080Eu, 0xEBCAu, 0x0808u, 0x4686u, 0x4770u,
+  };
+  static const uint16_t kGt[] = {
+      0x4670u, 0x2509u, 0x2205u, 0x4690u, 0x2102u, 0x468Au, 0x46AEu, 0x4545u, 0xBFD4u,
+      0xEBCAu, 0x080Eu, 0xEBCAu, 0x0808u, 0x4686u, 0x4770u,
+  };
+  uint8_t mem_buf[64];
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  MangoCpu cpu;
+
+  load_halfwords(mem_buf, sizeof(mem_buf), kLe, 15);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_LR] = 0x40u;
+  if (mango_interp_run(&cpu, &mem, 0x40u, 30) != 0 || cpu.r[8] != 1u || cpu.r[10] != 4u) {
+    fprintf(stderr, "FAIL(ite_le): r8=%x r10=%x cpsr=%x\n", cpu.r[8], cpu.r[10], cpu.cpsr);
+    return 1;
+  }
+
+  load_halfwords(mem_buf, sizeof(mem_buf), kGt, 15);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[MANGO_REG_LR] = 0x40u;
+  if (mango_interp_run(&cpu, &mem, 0x40u, 30) != 0 || cpu.r[8] != 3u || cpu.r[10] != 2u) {
+    fprintf(stderr, "FAIL(ite_le gt): r8=%x r10=%x cpsr=%x\n", cpu.r[8], cpu.r[10], cpu.cpsr);
+    return 1;
+  }
+  printf("ok: ite le keeps the else condition (Q-OTTD-0bv)\n");
+  return 0;
+}
+
 static int test_thumb_b_w(void) {
   static const uint16_t kProg[] = {
       0xF000u, 0xB802u, /* b.w .+8 */
@@ -11042,6 +11080,7 @@ int main(void) {
   failures += test_thumb_it_eq_taken();
   failures += test_thumb_it_eq_skipped();
   failures += test_thumb_it_preserves_flags();
+  failures += test_thumb_ite_le();
   failures += test_thumb_b_w();
   failures += test_arm_movw_movt();
   failures += test_arm_blx_reg();
