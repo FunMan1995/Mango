@@ -174,10 +174,13 @@ int main(int argc, char** argv) {
     goto unload;
   }
 
+  /* Host PngManager sentinel — JNI Call* dispatches open/getWidth/getHeight/
+   * getPixels/close in native_bridge_shim (Pacman Q1 research/48). */
+  static char png_mgr_obj = 'P';
   JNIEnv* env = (JNIEnv*)(uintptr_t)1;
   jobject thiz = (jobject)(uintptr_t)2;
-  jobject png_mgr = (jobject)(uintptr_t)3;   /* fake; guest may JNI-call PngManager */
-  jobject asset_mgr = (jobject)(uintptr_t)4; /* fake; AAsset* → soft stub today */
+  jobject png_mgr = (jobject)&png_mgr_obj;
+  jobject asset_mgr = (jobject)(uintptr_t)4; /* fake; AAsset* host I/O live */
   jobject store_mgr = (jobject)(uintptr_t)5; /* fake; StoreManager prefs */
 
   fprintf(stderr, "mango_host_pacman_drive: calling init(640,480,Png,Asset,Store)\n");

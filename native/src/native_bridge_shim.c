@@ -77,6 +77,10 @@
 #define MANGO_JNI_GET_STRING_UTF_LENGTH 168
 #define MANGO_JNI_GET_STRING_UTF_CHARS 169
 #define MANGO_JNI_RELEASE_STRING_UTF_CHARS 170
+#define MANGO_JNI_GET_ARRAY_LENGTH 171
+#define MANGO_JNI_NEW_INT_ARRAY 179
+#define MANGO_JNI_GET_INT_ARRAY_ELEMENTS 187
+#define MANGO_JNI_RELEASE_INT_ARRAY_ELEMENTS 195
 #define MANGO_JNI_REGISTER_NATIVES 215
 #define MANGO_JNI_GET_JAVA_VM 219
 #define MANGO_JNI_EXCEPTION_CHECK 228
@@ -516,7 +520,17 @@ static int g_meritous_font_ready;
 static uint32_t g_meritous_draw_text_calls;
 
 static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v);
+static uint32_t mango_load_u32_guest(const uint8_t* mem, uint32_t addr);
 static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n);
+static uint32_t mango_handle_intern(void* p);
+static void* mango_handle_lookup(uint32_t id);
+static const char* mango_fake_jstring_chars(MangoLoadedLibrary* lib, void* js);
+static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path, char* out,
+                                   size_t outsz);
+#ifndef ANDROID
+static int mango_png_decode(const char* host_path, uint8_t** out_pixels, uint32_t* out_w,
+                            uint32_t* out_h, uint32_t* out_bpp);
+#endif
 
 static void mango_aeabi_note(uint32_t which) {
   if (which < MANGO_LIBC_COUNT) {
@@ -788,6 +802,321 @@ static void mango_aasset_dir_free(uint32_t id) {
   d->used = 0;
 }
 
+/* Pacman Q1 (research/48): host PngManager + Bitmap + jintArray via JNI.
+ * Art::loadPng calls open/getWidth/getHeight/getPixels/close on the
+ * PngManager jobject passed to PacmanLib_init; soft Call* left levels[]
+ * poisoned with float 0.25 bits (0x3e800000). */
+#define MANGO_BITMAP_MAX 64
+#define MANGO_JINTARRAY_MAX 64
+#define MANGO_JNIMETHOD_MAX 128
+
+typedef enum {
+  MANGO_MID_UNKNOWN = 0,
+  MANGO_MID_PNG_OPEN,
+  MANGO_MID_PNG_GET_WIDTH,
+  MANGO_MID_PNG_GET_HEIGHT,
+  MANGO_MID_PNG_GET_PIXELS,
+  MANGO_MID_PNG_CLOSE
+} MangoMidKind;
+
+typedef struct {
+  int used;
+  MangoMidKind kind;
+  char name[64];
+  char sig[96];
+} MangoJniMethod;
+
+typedef struct {
+  int used;
+  int width;
+  int height;
+  uint32_t* argb; /* host AARRGGBB, length width*height */
+} MangoBitmap;
+
+typedef struct {
+  int used;
+  int length;
+  uint32_t guest_elems; /* guest jint[] backing store */
+} MangoJIntArray;
+
+static MangoJniMethod g_jni_methods[MANGO_JNIMETHOD_MAX];
+static MangoBitmap g_bitmaps[MANGO_BITMAP_MAX];
+static MangoJIntArray g_jintarrays[MANGO_JINTARRAY_MAX];
+static MangoMidKind mango_classify_png_mid(const char* name, const char* sig) {
+  if (!name) {
+    return MANGO_MID_UNKNOWN;
+  }
+  if (strcmp(name, "open") == 0 && sig && strstr(sig, "Landroid/graphics/Bitmap;") != NULL &&
+      strstr(sig, "String") != NULL) {
+    return MANGO_MID_PNG_OPEN;
+  }
+  if (strcmp(name, "getWidth") == 0 && sig && strstr(sig, "Bitmap") != NULL) {
+    return MANGO_MID_PNG_GET_WIDTH;
+  }
+  if (strcmp(name, "getHeight") == 0 && sig && strstr(sig, "Bitmap") != NULL) {
+    return MANGO_MID_PNG_GET_HEIGHT;
+  }
+  if (strcmp(name, "getPixels") == 0 && sig && strstr(sig, "[I") != NULL) {
+    return MANGO_MID_PNG_GET_PIXELS;
+  }
+  if (strcmp(name, "close") == 0 && sig && strstr(sig, "Bitmap") != NULL &&
+      strstr(sig, ")V") != NULL) {
+    return MANGO_MID_PNG_CLOSE;
+  }
+  return MANGO_MID_UNKNOWN;
+}
+
+static MangoJniMethod* mango_jni_method_alloc(const char* name, const char* sig) {
+  for (int i = 1; i < MANGO_JNIMETHOD_MAX; i++) {
+    if (!g_jni_methods[i].used) {
+      MangoJniMethod* m = &g_jni_methods[i];
+      memset(m, 0, sizeof(*m));
+      m->used = 1;
+      m->kind = mango_classify_png_mid(name, sig);
+      if (name) {
+        strncpy(m->name, name, sizeof(m->name) - 1u);
+      }
+      if (sig) {
+        strncpy(m->sig, sig, sizeof(m->sig) - 1u);
+      }
+      return m;
+    }
+  }
+  return NULL;
+}
+
+static MangoJniMethod* mango_jni_method_from_mid(uint32_t mid_handle) {
+  void* p = mango_handle_lookup(mid_handle);
+  if (!p) {
+    return NULL;
+  }
+  uintptr_t u = (uintptr_t)p;
+  if (u >= (uintptr_t)&g_jni_methods[0] &&
+      u < (uintptr_t)&g_jni_methods[MANGO_JNIMETHOD_MAX]) {
+    MangoJniMethod* m = (MangoJniMethod*)p;
+    return m->used ? m : NULL;
+  }
+  /* Legacy soft GetMethodID double-intern: handle → name_addr|1. */
+  return NULL;
+}
+
+static MangoBitmap* mango_bitmap_alloc(void) {
+  for (int i = 1; i < MANGO_BITMAP_MAX; i++) {
+    if (!g_bitmaps[i].used) {
+      memset(&g_bitmaps[i], 0, sizeof(g_bitmaps[i]));
+      g_bitmaps[i].used = 1;
+      return &g_bitmaps[i];
+    }
+  }
+  return NULL;
+}
+
+static MangoBitmap* mango_bitmap_from_handle(uint32_t h) {
+  void* p = mango_handle_lookup(h);
+  if (!p) {
+    return NULL;
+  }
+  uintptr_t u = (uintptr_t)p;
+  if (u >= (uintptr_t)&g_bitmaps[0] && u < (uintptr_t)&g_bitmaps[MANGO_BITMAP_MAX]) {
+    MangoBitmap* b = (MangoBitmap*)p;
+    return b->used ? b : NULL;
+  }
+  return NULL;
+}
+
+static void mango_bitmap_free(MangoBitmap* b) {
+  if (!b || !b->used) {
+    return;
+  }
+  free(b->argb);
+  b->argb = NULL;
+  b->width = 0;
+  b->height = 0;
+  b->used = 0;
+}
+
+static MangoJIntArray* mango_jintarray_alloc(void) {
+  for (int i = 1; i < MANGO_JINTARRAY_MAX; i++) {
+    if (!g_jintarrays[i].used) {
+      memset(&g_jintarrays[i], 0, sizeof(g_jintarrays[i]));
+      g_jintarrays[i].used = 1;
+      return &g_jintarrays[i];
+    }
+  }
+  return NULL;
+}
+
+static MangoJIntArray* mango_jintarray_from_handle(uint32_t h) {
+  void* p = mango_handle_lookup(h);
+  if (!p) {
+    return NULL;
+  }
+  uintptr_t u = (uintptr_t)p;
+  if (u >= (uintptr_t)&g_jintarrays[0] &&
+      u < (uintptr_t)&g_jintarrays[MANGO_JINTARRAY_MAX]) {
+    MangoJIntArray* a = (MangoJIntArray*)p;
+    return a->used ? a : NULL;
+  }
+  return NULL;
+}
+
+static const char* mango_jstring_chars(MangoLoadedLibrary* lib, uint32_t handle) {
+  void* js = mango_handle_lookup(handle);
+  if (!js) {
+    return NULL;
+  }
+  return mango_fake_jstring_chars(lib, js);
+}
+
+static uint32_t mango_png_open(MangoLoadedLibrary* lib, const char* rel) {
+  char host_path[768];
+  uint8_t* pix = NULL;
+  uint32_t w = 0, h = 0, bpp = 0;
+  MangoBitmap* bmp;
+  size_t n, i;
+  (void)lib;
+  if (!rel || rel[0] == '\0') {
+    fprintf(stderr, "mango: PngManager.open FAIL (null path)\n");
+    return 0;
+  }
+  if (!mango_aasset_host_path(lib, rel, host_path, sizeof(host_path))) {
+    /* Also try host resolve (textures/... under asset root). */
+    if (!mango_host_resolve_path(lib, rel, host_path, sizeof(host_path))) {
+      fprintf(stderr, "mango: PngManager.open FAIL %s\n", rel);
+      return 0;
+    }
+  }
+#ifndef ANDROID
+  if (mango_png_decode(host_path, &pix, &w, &h, &bpp) != 0 || !pix || w == 0 || h == 0) {
+    fprintf(stderr, "mango: PngManager.open decode FAIL %s\n", host_path);
+    free(pix);
+    return 0;
+  }
+#else
+  (void)host_path;
+  fprintf(stderr, "mango: PngManager.open unavailable on ANDROID build\n");
+  return 0;
+#endif
+  bmp = mango_bitmap_alloc();
+  if (!bmp) {
+    free(pix);
+    return 0;
+  }
+  n = (size_t)w * (size_t)h;
+  bmp->argb = (uint32_t*)malloc(n * sizeof(uint32_t));
+  if (!bmp->argb) {
+    free(pix);
+    mango_bitmap_free(bmp);
+    return 0;
+  }
+  bmp->width = (int)w;
+  bmp->height = (int)h;
+  if (bpp == 4) {
+    for (i = 0; i < n; i++) {
+      uint8_t r = pix[i * 4u + 0u];
+      uint8_t g = pix[i * 4u + 1u];
+      uint8_t b = pix[i * 4u + 2u];
+      uint8_t a = pix[i * 4u + 3u];
+      bmp->argb[i] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+  } else if (bpp == 1) {
+    for (i = 0; i < n; i++) {
+      uint8_t g = pix[i];
+      bmp->argb[i] = 0xff000000u | ((uint32_t)g << 16) | ((uint32_t)g << 8) | (uint32_t)g;
+    }
+  } else {
+    free(pix);
+    mango_bitmap_free(bmp);
+    return 0;
+  }
+  free(pix);
+  fprintf(stderr, "mango: PngManager.open ok %s %ux%u\n", rel, w, h);
+  return mango_handle_intern(bmp);
+}
+
+static uint32_t mango_jni_call_png(MangoLoadedLibrary* lib, MangoCpu* cpu, MangoJniMethod* mid,
+                                   int form) {
+  /* form: 0=Call*Method, 1=Call*MethodV (r3=va_list), 2=Call*MethodA (r3=jvalue*).
+   * Pacman Art::loadPng uses the *V wrappers at 0xc4a4/0xc4be/0xc4d8. */
+  uint32_t arg0 = 0, arg1 = 0;
+  if (form == 1) {
+    uint32_t va = cpu->r[3];
+    if (!mango_guest_range_ok(lib, va, 4u)) {
+      fprintf(stderr, "mango: PngManager Call*V bad va_list=%x\n", va);
+      cpu->r[0] = 0;
+      return 1;
+    }
+    arg0 = mango_load_u32_guest(lib->guest_mem, va);
+    if (mango_guest_range_ok(lib, va + 4u, 4u)) {
+      arg1 = mango_load_u32_guest(lib->guest_mem, va + 4u);
+    }
+  } else if (form == 2) {
+    uint32_t jv = cpu->r[3];
+    if (!mango_guest_range_ok(lib, jv, 8u)) {
+      cpu->r[0] = 0;
+      return 1;
+    }
+    /* jvalue is 8-byte aligned union; .l/.i in low 4 bytes each slot. */
+    arg0 = mango_load_u32_guest(lib->guest_mem, jv);
+    arg1 = mango_load_u32_guest(lib->guest_mem, jv + 8u);
+  } else {
+    arg0 = cpu->r[3];
+    if (mango_guest_range_ok(lib, cpu->r[MANGO_REG_SP], 4u)) {
+      arg1 = mango_load_u32_guest(lib->guest_mem, cpu->r[MANGO_REG_SP]);
+    }
+  }
+  switch (mid->kind) {
+    case MANGO_MID_PNG_OPEN: {
+      const char* path = mango_jstring_chars(lib, arg0);
+      uint32_t h = mango_png_open(lib, path);
+      cpu->r[0] = h;
+      return 1;
+    }
+    case MANGO_MID_PNG_GET_WIDTH: {
+      MangoBitmap* b = mango_bitmap_from_handle(arg0);
+      cpu->r[0] = b ? (uint32_t)b->width : 0;
+      return 1;
+    }
+    case MANGO_MID_PNG_GET_HEIGHT: {
+      MangoBitmap* b = mango_bitmap_from_handle(arg0);
+      cpu->r[0] = b ? (uint32_t)b->height : 0;
+      return 1;
+    }
+    case MANGO_MID_PNG_GET_PIXELS: {
+      MangoBitmap* b = mango_bitmap_from_handle(arg0);
+      MangoJIntArray* a = mango_jintarray_from_handle(arg1);
+      int n, i;
+      if (!b || !a || !b->argb || !a->guest_elems) {
+        fprintf(stderr, "mango: PngManager.getPixels FAIL bmp=%u arr=%u\n", arg0, arg1);
+        cpu->r[0] = 0;
+        return 1;
+      }
+      n = b->width * b->height;
+      if (n > a->length) {
+        n = a->length;
+      }
+      if (!mango_guest_range_ok(lib, a->guest_elems, (uint32_t)n * 4u)) {
+        cpu->r[0] = 0;
+        return 1;
+      }
+      for (i = 0; i < n; i++) {
+        mango_store_u32_guest(lib->guest_mem, a->guest_elems + (uint32_t)i * 4u, b->argb[i]);
+      }
+      cpu->r[0] = 0;
+      return 1;
+    }
+    case MANGO_MID_PNG_CLOSE: {
+      MangoBitmap* b = mango_bitmap_from_handle(arg0);
+      if (b) {
+        mango_bitmap_free(b);
+      }
+      cpu->r[0] = 0;
+      return 1;
+    }
+    default:
+      return 0;
+  }
+}
 
 /* Resolve path for fopen: as-is, then <libdir>/../gamedata/<path>, then
  * <libdir>/../<path>, then $MANGO_ASSET_ROOT/<path>. */
@@ -1483,6 +1812,12 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
     name = "ANativeWindow_getWidth";
   } else if (strcmp(name, "ANativeWindow_getHeight") == 0) {
     name = "ANativeWindow_getHeight";
+  } else if (strcmp(name, "_Znwj") == 0 || strcmp(name, "_Znaj") == 0) {
+    /* Pacman Q1: Art::loadPng / argb2rgba use operator new / new[]. Stub
+     * returned NULL and argb2rgba wrote pixels at 0 → clobbered .text. */
+    name = "malloc";
+  } else if (strcmp(name, "_ZdlPv") == 0 || strcmp(name, "_ZdaPv") == 0) {
+    name = "free";
   } else if (strncmp(name, "AAsset", 6) == 0) {
     /* Pacman Q0: real AAsset* host I/O via kLibcNames + MANGO_ASSET_ROOT.
      * Do not soft-map to eglGetDisplay (getNextFileName must eventually NULL). */
@@ -3116,7 +3451,17 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
 #else
       (void)fn;
       if (name) {
-        mid = (jmethodID)(uintptr_t)mango_handle_intern((void*)(uintptr_t)(cpu->r[2] | 1u));
+        const char* sig = mango_guest_cstr(lib, cpu->r[3]);
+        MangoJniMethod* m = mango_jni_method_alloc(name, sig);
+        if (m) {
+          mid = (jmethodID)m;
+          if (m->kind != MANGO_MID_UNKNOWN) {
+            fprintf(stderr, "mango: GetMethodID host %s %s kind=%d\n", name,
+                    sig ? sig : "?", (int)m->kind);
+          }
+        } else {
+          mid = (jmethodID)(uintptr_t)mango_handle_intern((void*)(uintptr_t)(cpu->r[2] | 1u));
+        }
       }
 #endif
       cpu->r[0] = mango_handle_intern(mid);
@@ -3132,9 +3477,19 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
     case MANGO_JNI_CALL_STATIC_OBJECT_METHOD + 1:
     case MANGO_JNI_CALL_STATIC_OBJECT_METHOD + 2:
     case MANGO_JNI_GET_OBJECT_FIELD:
-    case MANGO_JNI_GET_STATIC_OBJECT_FIELD:
+    case MANGO_JNI_GET_STATIC_OBJECT_FIELD: {
+      MangoJniMethod* mid = NULL;
+      if (fn == MANGO_JNI_CALL_OBJECT_METHOD || fn == MANGO_JNI_CALL_OBJECT_METHOD + 1 ||
+          fn == MANGO_JNI_CALL_OBJECT_METHOD + 2) {
+        mid = mango_jni_method_from_mid(cpu->r[2]);
+        if (mid && mid->kind != MANGO_MID_UNKNOWN &&
+            mango_jni_call_png(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_OBJECT_METHOD))) {
+          break;
+        }
+      }
       cpu->r[0] = mango_dummy_jobject(lib);
       break;
+    }
     case MANGO_JNI_CALL_BOOLEAN_METHOD:
     case MANGO_JNI_CALL_BOOLEAN_METHOD + 1:
     case MANGO_JNI_CALL_BOOLEAN_METHOD + 2:
@@ -3151,9 +3506,19 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
     case MANGO_JNI_CALL_STATIC_INT_METHOD + 1:
     case MANGO_JNI_CALL_STATIC_INT_METHOD + 2:
     case MANGO_JNI_GET_INT_FIELD:
-    case MANGO_JNI_GET_STATIC_INT_FIELD:
+    case MANGO_JNI_GET_STATIC_INT_FIELD: {
+      MangoJniMethod* mid = NULL;
+      if (fn == MANGO_JNI_CALL_INT_METHOD || fn == MANGO_JNI_CALL_INT_METHOD + 1 ||
+          fn == MANGO_JNI_CALL_INT_METHOD + 2) {
+        mid = mango_jni_method_from_mid(cpu->r[2]);
+        if (mid && mid->kind != MANGO_MID_UNKNOWN &&
+            mango_jni_call_png(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_INT_METHOD))) {
+          break;
+        }
+      }
       cpu->r[0] = 1;
       break;
+    }
     case MANGO_JNI_CALL_VOID_METHOD:
     case MANGO_JNI_CALL_VOID_METHOD + 1:
     case MANGO_JNI_CALL_VOID_METHOD + 2:
@@ -3161,9 +3526,19 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
     case MANGO_JNI_CALL_STATIC_VOID_METHOD + 1:
     case MANGO_JNI_CALL_STATIC_VOID_METHOD + 2:
     case MANGO_JNI_SET_OBJECT_FIELD:
-    case MANGO_JNI_SET_INT_FIELD:
+    case MANGO_JNI_SET_INT_FIELD: {
+      MangoJniMethod* mid = NULL;
+      if (fn == MANGO_JNI_CALL_VOID_METHOD || fn == MANGO_JNI_CALL_VOID_METHOD + 1 ||
+          fn == MANGO_JNI_CALL_VOID_METHOD + 2) {
+        mid = mango_jni_method_from_mid(cpu->r[2]);
+        if (mid && mid->kind != MANGO_MID_UNKNOWN &&
+            mango_jni_call_png(lib, cpu, mid, (int)(fn - MANGO_JNI_CALL_VOID_METHOD))) {
+          break;
+        }
+      }
       cpu->r[0] = 0;
       break;
+    }
     case MANGO_JNI_GET_FIELD_ID:
     case MANGO_JNI_GET_STATIC_FIELD_ID: {
       const char* name = mango_guest_cstr(lib, cpu->r[2]);
@@ -3212,6 +3587,55 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       break;
     }
     case MANGO_JNI_RELEASE_STRING_UTF_CHARS:
+      break;
+    case MANGO_JNI_GET_ARRAY_LENGTH: {
+      MangoJIntArray* a = mango_jintarray_from_handle(cpu->r[1]);
+      cpu->r[0] = a ? (uint32_t)a->length : 0;
+      break;
+    }
+    case MANGO_JNI_NEW_INT_ARRAY: {
+      int n = (int)cpu->r[1];
+      MangoJIntArray* a;
+      uint32_t ga;
+      if (n < 0) {
+        n = 0;
+      }
+      if (n > 16 * 1024 * 1024) {
+        cpu->r[0] = 0;
+        break;
+      }
+      a = mango_jintarray_alloc();
+      if (!a) {
+        cpu->r[0] = 0;
+        break;
+      }
+      ga = n > 0 ? mango_guest_alloc(lib, (uint32_t)n * 4u) : 0;
+      if (n > 0 && ga == 0) {
+        a->used = 0;
+        cpu->r[0] = 0;
+        break;
+      }
+      a->length = n;
+      a->guest_elems = ga;
+      cpu->r[0] = mango_handle_intern(a);
+      break;
+    }
+    case MANGO_JNI_GET_INT_ARRAY_ELEMENTS: {
+      MangoJIntArray* a = mango_jintarray_from_handle(cpu->r[1]);
+      if (!a) {
+        cpu->r[0] = 0;
+        break;
+      }
+      /* isCopy out-param: report not-a-copy so Release may no-op free. */
+      if (cpu->r[2] && mango_guest_range_ok(lib, cpu->r[2], 1u)) {
+        lib->guest_mem[cpu->r[2]] = 0;
+      }
+      cpu->r[0] = a->guest_elems; /* raw guest jint* for Texture.pixels */
+      break;
+    }
+    case MANGO_JNI_RELEASE_INT_ARRAY_ELEMENTS:
+      /* Guest keeps guest_elems pointer in Texture; mode ignored. */
+      cpu->r[0] = 0;
       break;
     case MANGO_JNI_REGISTER_NATIVES: {
       uint32_t n = cpu->r[3];
