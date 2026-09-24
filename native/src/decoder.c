@@ -2721,7 +2721,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * Guest f834 1f02 = ldrh.w r1,[r4,#2]! (P=1 U=1 W=1). Also covers post
    * f834 1b02 and U=0 no-WB f834 1c02. Mirror 0aa LDRB.W imm8 (F810); reuse
    * MANGO_OP_LDRH. Execute already honors p/u/w + halfword. Distinct from
-   * F8B0 LDRH imm12 (bit7=1) and 0v STRH-reg (F820 bit11=0). Reject LDRHT
+   * F8B0 LDRH imm12 (bit7=1) and 0v STRH-reg (F820 bit11=0). LDRH.W
+   * register (bits[11:6]==0) is Q-OTTD-0by. Reject LDRHT
    * (P=0 W=0), Rt/Rn=PC, and writeback into Rt (W=1 && Rt==Rn UNPRED).
    * Hold T32 CLZ; STRH.W imm8 is 0ae. */
   if ((hw1 & 0xFFF0u) == 0xF830u && (hw2 & 0x0800u) != 0) {
@@ -2748,6 +2749,33 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->p = p;
     out->u = u;
     out->w = w;
+    return 0;
+  }
+
+  /* Q-OTTD-0by: T32 LDRH.W Rt,[Rn,Rm,LSL#imm2] T2 — size=01 L=1,
+   * register form bits[11:6]=0. ConvertDateToYMD f832 3014 =
+   * ldrh.w r3, [r2, r4, lsl #1] (llvm-mc [32,f8,14,30]).
+   * Mirror 0v STRH.W reg (F820) and 0m LDRB.W reg (F810).
+   * Mutually exclusive with 0ab imm8 (bit11=1) and F8B0 imm12 (bit7=1).
+   * Reject Rt/Rn/Rm=PC. LDRSH register (F930, bit11=0) stays closed. */
+  if ((hw1 & 0xFFF0u) == 0xF830u && (hw2 & 0x0FC0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm2 = (hw2 >> 4) & 3u;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDRH;
+    out->rd = rt;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_amount = imm2;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
     return 0;
   }
 
@@ -2786,7 +2814,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0m: T32 LDRB.W Rt,[Rn,Rm,LSL#imm2] T2 — size=00 L=1, register form.
    * Guest f81b 0032 = ldrb.w r0,[r11,r2,lsl#3]; sib f81b 8003 imm2=0.
    * Open any imm2 0..3 (execute honors shift_amount). Reject Rt/Rn/Rm=PC.
-   * Distinct from F890 LDRB imm12 (bit7=1). Do not open LDRSB/LDRH-reg. */
+   * Distinct from F890 LDRB imm12 (bit7=1). LDRH.W register is Q-OTTD-0by.
+   * LDRSB register stays closed. */
   if ((hw1 & 0xFFF0u) == 0xF810u && (hw2 & 0x0FC0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
