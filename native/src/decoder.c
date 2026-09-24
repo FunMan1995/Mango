@@ -2987,6 +2987,30 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0bo: T32 LDMDB Rn{!} without PC. NWidget e914 0006 =
+   * ldmdb r4, {r1, r2} (llvm-mc [14,e9,06,00]). p=1 u=0. W is hw1 bit 5;
+   * e934 0006 is ldmdb r4!, {r1, r2}. STMDB (E920, L=0) stays closed.
+   * Reject empty list, Rn=PC, PC in the list, and writeback with a
+   * non-SP Rn also in the list. */
+  if ((hw1 & 0xFFD0u) == 0xE910u && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t reglist = hw2 & 0x7FFFu;
+    int w = (hw1 & 0x0020u) != 0;
+    if (rn == MANGO_REG_PC || reglist == 0) {
+      return -1;
+    }
+    if (w && (reglist & (1u << rn)) && rn != MANGO_REG_SP) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDM;
+    out->rn = rn;
+    out->reglist = reglist;
+    out->p = 1;
+    out->u = 0;
+    out->w = w;
+    return 0;
+  }
+
   /* Q-OTTD-0i-pop: T32 LDMIA / POP.W SP! with PC in list (P=1, M=0).
    * Guest e8bd 81f0 = pop.w {r4-r8,pc}. Keep bit15 in reglist for LoadWritePC
    * (execute already sets/clears CPSR.T from loaded word bit0). Reject LR+PC. */
@@ -3070,7 +3094,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0bi: T32 SMULxy. SDL fb12 f000 = smulbb r0,r2,r0
    * (llvm-mc [12,fb,00,f0]). 16x16 signed, N=hw2 bit5, M=hw2 bit4.
-   * Ra=15. SMLAxy (Ra≠15) stays closed. Reject Rd/Rn/Rm=PC. */
+   * Ra=15. SMLAxy is Q-OTTD-0bp. Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFF0u) == 0xFB10u && (hw2 & 0xF0C0u) == 0xF000u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -3080,6 +3104,29 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     }
     out->op = MANGO_OP_SMUL;
     out->rd = rd;
+    out->rm = rn;
+    out->rs = rm;
+    out->b = (int)((hw2 >> 5) & 1u);
+    out->u = (int)((hw2 >> 4) & 1u);
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bp: T32 SMLAxy Rd,Rn,Rm,Ra. WindowDesc fb12 3300 =
+   * smlabb r3,r2,r0,r3 (llvm-mc [12,fb,00,33]). Rd = Ra + bottom/top
+   * 16x16 product. N=hw2 bit5, M=hw2 bit4. Ra is hw2[15:12], not 15
+   * (that is SMUL). Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFB10u && (hw2 & 0x00C0u) == 0 && ((hw2 >> 12) & 0xFu) != 0xFu) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t ra = (hw2 >> 12) & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_SMLA;
+    out->rd = rd;
+    out->rn = ra;
     out->rm = rn;
     out->rs = rm;
     out->b = (int)((hw2 >> 5) & 1u);
