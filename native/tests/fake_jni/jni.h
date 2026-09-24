@@ -17,6 +17,7 @@
 
 typedef void* jclass;
 typedef void* jobject;
+typedef void* jobjectArray;
 typedef void* jstring;
 typedef void* jthrowable;
 typedef void* jmethodID;

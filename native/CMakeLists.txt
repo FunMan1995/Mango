@@ -124,3 +124,29 @@ target_link_libraries(mango_host_pacman_drive PRIVATE mango_core m)
 if(PNG_FOUND)
   target_link_libraries(mango_host_pacman_drive PRIVATE PNG::PNG)
 endif()
+
+
+# Host-only HyperRogue (hyperroid) drive helper for Test Lab (not a ctest). Loads
+# armeabi libhyper.so (explicit Java_* initGame/loadMap/update; no JNI_OnLoad).
+add_executable(mango_host_hyperrogue_drive
+  src/native_bridge_shim.c
+  tests/host_hyperrogue_drive.c
+)
+target_include_directories(mango_host_hyperrogue_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_hyperrogue_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_hyperrogue_drive PRIVATE PNG::PNG)
+endif()
+
+
+# Host-only PrBoom (prboom4android) drive helper for Test Lab (not a ctest). Loads
+# armeabi libprboom_jni.so (explicit Java_* DoomMain/keyEvent/motionEvent; no JNI_OnLoad).
+add_executable(mango_host_prboom_drive
+  src/native_bridge_shim.c
+  tests/host_prboom_drive.c
+)
+target_include_directories(mango_host_prboom_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_prboom_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_prboom_drive PRIVATE PNG::PNG)
+endif()

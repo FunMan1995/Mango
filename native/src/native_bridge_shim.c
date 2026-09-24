@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -79,6 +80,8 @@
 #define MANGO_JNI_GET_STRING_UTF_CHARS 169
 #define MANGO_JNI_RELEASE_STRING_UTF_CHARS 170
 #define MANGO_JNI_GET_ARRAY_LENGTH 171
+#define MANGO_JNI_NEW_OBJECT_ARRAY 172
+#define MANGO_JNI_GET_OBJECT_ARRAY_ELEMENT 173
 #define MANGO_JNI_NEW_INT_ARRAY 179
 #define MANGO_JNI_GET_INT_ARRAY_ELEMENTS 187
 #define MANGO_JNI_RELEASE_INT_ARRAY_ELEMENTS 195
@@ -250,7 +253,9 @@
 #define MANGO_LIBC_AASSET_CLOSE 155
 #define MANGO_LIBC_AASSET_OPEN_FD 156
 #define MANGO_LIBC_SL_CREATE_ENGINE 157
-#define MANGO_LIBC_COUNT 158
+#define MANGO_LIBC_STRCASECMP 158
+#define MANGO_LIBC_STRNCASECMP 159
+#define MANGO_LIBC_COUNT 160
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -479,6 +484,8 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "AAsset_close",
     "AAsset_openFileDescriptor",
     "slCreateEngine",
+    "strcasecmp",
+    "strncasecmp",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -883,6 +890,16 @@ typedef struct {
   int length;
   uint32_t guest_elems; /* guest jint[] backing store */
 } MangoJIntArray;
+
+/* Host-built String[] for Lab drives (PrBoom DoomMain). Layout must match
+ * host_prboom_drive.c MangoHostStringArray. Magic 'JSAR'. */
+#define MANGO_HOST_STRARR_MAGIC 0x4a534152u
+#define MANGO_HOST_STRARR_MAX 16
+typedef struct {
+  uint32_t magic;
+  int length;
+  const char* items[MANGO_HOST_STRARR_MAX];
+} MangoHostStringArray;
 
 static MangoJniMethod g_jni_methods[MANGO_JNIMETHOD_MAX];
 static MangoBitmap g_bitmaps[MANGO_BITMAP_MAX];
@@ -2700,6 +2717,21 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = (a && b) ? (uint32_t)strncmp(a, b, r2) : (uint32_t)-1;
       break;
     }
+    /* PrBoom Q0 (research/55): unbound strcasecmp stub always returned 0 →
+     * M_CheckParm false-hits → -net client path → SDLNet_AddSocket(NULL).
+     * NULL-safe → non-zero (unlike equal). */
+    case MANGO_LIBC_STRCASECMP: {
+      const char* a = mango_guest_cstr(lib, r0);
+      const char* b = mango_guest_cstr(lib, r1);
+      cpu->r[0] = (a && b) ? (uint32_t)strcasecmp(a, b) : (uint32_t)-1;
+      break;
+    }
+    case MANGO_LIBC_STRNCASECMP: {
+      const char* a = mango_guest_cstr(lib, r0);
+      const char* b = mango_guest_cstr(lib, r1);
+      cpu->r[0] = (a && b) ? (uint32_t)strncasecmp(a, b, r2) : (uint32_t)-1;
+      break;
+    }
     case MANGO_LIBC_STRCPY: {
       const char* src = mango_guest_cstr(lib, r1);
       size_t n = src ? strlen(src) + 1u : 0;
@@ -4161,9 +4193,43 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       break;
     case MANGO_JNI_GET_ARRAY_LENGTH: {
       MangoJIntArray* a = mango_jintarray_from_handle(cpu->r[1]);
-      cpu->r[0] = a ? (uint32_t)a->length : 0;
+      if (a) {
+        cpu->r[0] = (uint32_t)a->length;
+        break;
+      }
+      /* Host String[] sentinel (PrBoom DoomMain argv). */
+      {
+        void* p = mango_handle_lookup(cpu->r[1]);
+        if (p) {
+          MangoHostStringArray* sa = (MangoHostStringArray*)p;
+          if (sa->magic == MANGO_HOST_STRARR_MAGIC && sa->length >= 0 &&
+              sa->length <= MANGO_HOST_STRARR_MAX) {
+            cpu->r[0] = (uint32_t)sa->length;
+            break;
+          }
+        }
+      }
+      cpu->r[0] = 0;
       break;
     }
+    case MANGO_JNI_GET_OBJECT_ARRAY_ELEMENT: {
+      void* p = mango_handle_lookup(cpu->r[1]);
+      int idx = (int)cpu->r[2];
+      cpu->r[0] = 0;
+      if (p) {
+        MangoHostStringArray* sa = (MangoHostStringArray*)p;
+        if (sa->magic == MANGO_HOST_STRARR_MAGIC && idx >= 0 && idx < sa->length &&
+            idx < MANGO_HOST_STRARR_MAX && sa->items[idx]) {
+          /* Host char* doubles as fake jstring (mango_fake_jstring_chars). */
+          cpu->r[0] = mango_handle_intern((void*)sa->items[idx]);
+        }
+      }
+      break;
+    }
+    case MANGO_JNI_NEW_OBJECT_ARRAY:
+      /* Soft: return dummy; Lab builds String[] on host. */
+      cpu->r[0] = mango_dummy_jobject(lib);
+      break;
     case MANGO_JNI_NEW_INT_ARRAY: {
       int n = (int)cpu->r[1];
       MangoJIntArray* a;
@@ -4332,11 +4398,20 @@ static int mango_parse_shorty(const char* shorty, char* ret, char* args, uint32_
 }
 
 static int mango_is_jni_onload(const MangoJniSlot* slot) {
+  /* Explicit OnLoad/OnUnload names always marshall as (JavaVM*, void*). */
   if (strcmp(slot->name, "JNI_OnLoad") == 0 || strcmp(slot->name, "JNI_OnUnload") == 0) {
     return 1;
   }
-  /* ART's JNI_OnLoad shorty; tests also use this with mango_add. */
-  return slot->shorty[0] == 'I' && slot->shorty[1] == 'L' && slot->shorty[2] == '\0';
+  /* ART shorty "IL" is historically OnLoad (tests use mango_add+"IL"). PrBoom
+   * DoomMain is also shorty IL (int DoomMain(String[])) — exclude Java_* JNI
+   * natives so they keep env/thiz marshalling (research/54 Lab). */
+  if (slot->shorty[0] == 'I' && slot->shorty[1] == 'L' && slot->shorty[2] == '\0') {
+    if (strncmp(slot->name, "Java_", 5) == 0) {
+      return 0;
+    }
+    return 1;
+  }
+  return 0;
 }
 
 /* Leading '*' = raw AAPCS (no JNIEnv/jobject). Used for SDL_main etc.
@@ -4495,7 +4570,6 @@ static intptr_t mango_jni_invoke(MangoJniSlot* slot, JNIEnv* env, va_list ap) {
     regs[0] = lib->jni_env_addr;
     regs[1] = mango_handle_intern(thiz);
   }
-
   for (int i = 0; i < nargs; i++) {
     char t = args[i];
     uint32_t lo, hi = 0;
