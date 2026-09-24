@@ -1898,6 +1898,30 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0ay: EOR.W Rd,Rn,Rm{,shift} register, S=0.
+   * OpenTTD ea82 0304 = eor.w r3,r2,r4 (llvm-mc [82,ea,04,03]).
+   * EORS (EA9x) stays closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA80u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_EOR;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0e: ADD.W Rd,Rn,#<const> modified-imm (S=0). Guest f50d 5108 =
    * add.w r1,sp,#0x2200 (ThumbExpandImm(0xD08)=0x2200). Plain ADDW #0xD08 is
    * f60d 5108 (already handled). SP as Rn allowed; PC as Rd/Rn rejected. */
@@ -1980,15 +2004,41 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0an: TBB/TBH. OpenTTD e8df f002 = tbb [pc, r2]
-   * (llvm-mc [df,e8,02,f0]). hw1 E8D0|Rn, hw2 F000|(H<<4)|Rm.
-   * BranchWritePC(PC + 2*table). Rn=PC uses Align(PC,4) as the table
-   * base; TBH with Rn=PC is UNPREDICTABLE. Rm=PC rejected. */
+  /* Q-OTTD-0bb: RSB.W Rd,Rn,Rm{,shift} register, S=0.
+   * OpenTTD ebc5 05c5 = rsb.w r5,r5,r5,lsl #3 (llvm-mc [c5,eb,c5,05]),
+   * r5 = (r5<<3) - r5. Sibling ebc6 1606 is lsl #4. RSBS (EBDx) stays
+   * closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEBC0u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_RSB;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0an / 0az: TBB/TBH. OpenTTD e8df f002 = tbb [pc, r2]
+   * (llvm-mc [df,e8,02,f0]). e8df f016 = tbh [pc, r6, lsl #1]
+   * (llvm-mc [df,e8,16,f0]) in the deque push switch.
+   * hw1 E8D0|Rn, hw2 F000|(H<<4)|Rm. BranchWritePC(PC + 2*table).
+   * Rn=PC uses Align(PC,4) for both TBB and TBH. Rm=PC rejected. */
   if ((hw1 & 0xFFF0u) == 0xE8D0u && (hw2 & 0xFFE0u) == 0xF000u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rm = hw2 & 0xFu;
     int tbh = (hw2 & 0x10u) != 0;
-    if (rm == MANGO_REG_PC || (tbh && rn == MANGO_REG_PC)) {
+    if (rm == MANGO_REG_PC) {
       return -1;
     }
     out->op = MANGO_OP_TBB;

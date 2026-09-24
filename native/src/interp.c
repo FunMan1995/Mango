@@ -601,6 +601,14 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
     uint32_t cond = insn.cond;
     if (it != 0 && insn.op != MANGO_OP_IT) {
       cond = (it >> 4) & 0xFu;
+      /* Q-OTTD-0ba: ALU inside an IT block must not write NZCV. Utf8Decode's
+       * `itt eq; moveq r2,#1; beq` otherwise clears Z and misses the NUL.
+       * CMP/CMN/TST/TEQ still write flags; they are only legal as the last
+       * instruction in the block. */
+      if (insn.op != MANGO_OP_CMP && insn.op != MANGO_OP_CMN && insn.op != MANGO_OP_TST &&
+          insn.op != MANGO_OP_TEQ) {
+        insn.sets_flags = 0;
+      }
     }
 
     /* condition false = no-op, covers B/BX too, no per-case handling needed */
