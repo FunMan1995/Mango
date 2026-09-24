@@ -3086,10 +3086,11 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0n: T32 LDRD imm T1 exact guest shape — P=1 U=1 W=0 L=1.
-   * e9d1 2302 = ldrd r2,r3,[r1,#8] (Rn unchanged). Sib e9d4 2302 same mask.
-   * Reuse MANGO_OP_LDRD / A32 pair execute. Not W=1 (e9f1) or post-index. */
-  if ((hw1 & 0xFFF0u) == 0xE9D0u) {
+  /* Q-OTTD-0n / 0ce: T32 LDRD imm T1, P=1 W=0 L=1, either direction.
+   * e9d1 2302 = ldrd r2,r3,[r1,#8]. CreateDefaultDelegate e955 ab04 =
+   * ldrd r10,r11,[r5,#-16] (llvm-mc). Rn unchanged. Not W=1 (e9f1)
+   * or post-index. */
+  if ((hw1 & 0xFF70u) == 0xE950u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
     uint32_t rt2 = (hw2 >> 8) & 0xFu;
@@ -3106,7 +3107,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->is_imm = 1;
     out->imm = imm8 << 2;
     out->p = 1;
-    out->u = 1;
+    out->u = (int)((hw1 >> 7) & 1u);
     out->w = 0;
     return 0;
   }

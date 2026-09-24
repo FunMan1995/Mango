@@ -9318,6 +9318,43 @@ static int test_t32_adds_w_reg(void) {
   return 0;
 }
 
+static int test_t32_ldrd_neg16(void) {
+  /* Q-OTTD-0ce: ldrd r10, r11, [r5, #-16] = e955 ab04.
+   * Loads the pair at r5-16. Rn and NZCV hold. */
+  static const uint16_t kProg[] = {0xE955u, 0xAB04u, 0x4770u};
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xE955u, 0xAB04u, &di) != 0 || di.op != MANGO_OP_LDRD || di.rd != 10 ||
+      di.rn != 5 || di.is_imm != 1 || di.imm != 16u || di.p != 1 || di.u != 0 || di.w != 0) {
+    fprintf(stderr, "FAIL(t32_ldrd_neg): decode op=%d rd=%u rn=%u imm=%u u=%d w=%d\n", di.op, di.rd,
+            di.rn, di.imm, di.u, di.w);
+    return 1;
+  }
+  uint32_t base = 64u;
+  u32_to_bytes_le(mem_buf + base - 16u, 0x11111111u);
+  u32_to_bytes_le(mem_buf + base - 12u, 0x22222222u);
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[5] = base;
+  cpu.r[10] = 0xffffffffu;
+  cpu.r[11] = 0xffffffffu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[10] != 0x11111111u || cpu.r[11] != 0x22222222u || cpu.r[5] != base ||
+      cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_ldrd_neg): rc=%d r10=%x r11=%x r5=%x cpsr=%x\n", rc, cpu.r[10],
+            cpu.r[11], cpu.r[5], cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 LDRD r10, r11, [r5, #-16] (Q-OTTD-0ce)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -11662,6 +11699,7 @@ int main(void) {
   failures += test_t32_sbcs_w_imm0();
   failures += test_t32_sbcs_w_reg();
   failures += test_t32_adds_w_reg();
+  failures += test_t32_ldrd_neg16();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
