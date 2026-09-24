@@ -88,6 +88,7 @@ typedef enum MangoOp {
   MANGO_OP_VRECPS,
   MANGO_OP_VORR,
   MANGO_OP_VSWP,
+  MANGO_OP_TBB, /* T32 table branch. b=0 byte (TBB), b=1 halfword (TBH). */
 } MangoOp;
 
 typedef struct MangoInsn {

@@ -1890,6 +1890,24 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0an: TBB/TBH. OpenTTD e8df f002 = tbb [pc, r2]
+   * (llvm-mc [df,e8,02,f0]). hw1 E8D0|Rn, hw2 F000|(H<<4)|Rm.
+   * BranchWritePC(PC + 2*table). Rn=PC uses Align(PC,4) as the table
+   * base; TBH with Rn=PC is UNPREDICTABLE. Rm=PC rejected. */
+  if ((hw1 & 0xFFF0u) == 0xE8D0u && (hw2 & 0xFFE0u) == 0xF000u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    int tbh = (hw2 & 0x10u) != 0;
+    if (rm == MANGO_REG_PC || (tbh && rn == MANGO_REG_PC)) {
+      return -1;
+    }
+    out->op = MANGO_OP_TBB;
+    out->rn = rn;
+    out->rm = rm;
+    out->b = tbh;
+    return 0;
+  }
+
 
   /* Q-OTTD-0f: MVN.W Rd,#<const> modified-imm (op=0011, Rn=15, S=0).
    * Guest f46f 5207 = mvn.w r2,#0x21c0 (ThumbExpandImm(0xD07)=0x21C0; NOT #0x87000 /

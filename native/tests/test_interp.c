@@ -3299,6 +3299,94 @@ static int test_t32_rsb_w_imm1(void) {
   return 0;
 }
 
+static int test_t32_tbb_pc(void) {
+  /* Q-OTTD-0an: tbb [pc, r2] = e8df f002. Table base is Align(PC,4) = 4.
+   * Target is (addr+4) + 2*byte. Thumb stays set. NZCV unchanged.
+   * TBH [pc, ...] and Rm=PC stay closed. */
+  uint8_t mem_buf[32];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  static const uint16_t kProg[] = {0xE8DFu, 0xF002u};
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+  mem_buf[4] = 1; /* r2=0 → pc 4+2 */
+  mem_buf[5] = 4; /* r2=1 → pc 4+8 */
+  mem_buf[7] = 6; /* r2=3 → pc 4+12, OpenTTD's index */
+
+  MangoInsn di;
+  if (mango_decode_t32(0xE8DFu, 0xF002u, &di) != 0 || di.op != MANGO_OP_TBB ||
+      di.rn != MANGO_REG_PC || di.rm != 2 || di.b != 0) {
+    fprintf(stderr, "FAIL(t32_tbb): decode op=%d rn=%u rm=%u b=%d\n", di.op, di.rn, di.rm, di.b);
+    return 1;
+  }
+  if (mango_decode_t32(0xE8DFu, 0xF012u, &di) == 0 || mango_decode_t32(0xE8DFu, 0xF00Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_tbb): TBH [pc] or Rm=PC decoded\n");
+    return 1;
+  }
+
+  struct {
+    uint32_t idx, want;
+  } cases[] = {
+      {0u, 6u},
+      {1u, 12u},
+      {3u, 16u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C;
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    cpu.r[2] = cases[c].idx;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, cases[c].want, 4);
+    uint32_t nzcv_after = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[MANGO_REG_PC] != cases[c].want || cpu.r[2] != cases[c].idx ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0 || nzcv_after != nzcv) {
+      fprintf(stderr, "FAIL(t32_tbb#%u): rc=%d pc=%x t=%u nzcv %x->%x\n", c, rc,
+              cpu.r[MANGO_REG_PC], (cpu.cpsr & MANGO_CPSR_T) != 0, nzcv, nzcv_after);
+      return 1;
+    }
+  }
+
+  /* tbb [r1, r2]: base is r1, not PC. Byte at 20+1 = 2 → target 4+4 = 8. */
+  static const uint16_t kReg[] = {0xE8D1u, 0xF002u};
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kReg, 2);
+  mem_buf[21] = 2;
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[1] = 20u;
+  cpu.r[2] = 1u;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 8u, 4);
+  if (rc != 0 || cpu.r[MANGO_REG_PC] != 8u || (cpu.cpsr & MANGO_CPSR_T) == 0) {
+    fprintf(stderr, "FAIL(t32_tbb reg): rc=%d pc=%x\n", rc, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+
+  /* tbh [r1, r2, lsl #1] = e8d1 f012. Halfword at 20+2*1. Value 3 → target 4+6. */
+  static const uint16_t kTbh[] = {0xE8D1u, 0xF012u};
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kTbh, 2);
+  mem_buf[22] = 3;
+  mem_buf[23] = 0;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[1] = 20u;
+  cpu.r[2] = 1u;
+  rc = mango_interp_run(&cpu, &mem, 10u, 4);
+  if (rc != 0 || cpu.r[MANGO_REG_PC] != 10u || (cpu.cpsr & MANGO_CPSR_T) == 0) {
+    fprintf(stderr, "FAIL(t32_tbh): rc=%d pc=%x\n", rc, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  if (mango_decode_t32(0xE8D1u, 0xF012u, &di) != 0 || di.op != MANGO_OP_TBB || di.b != 1 ||
+      di.rn != 1 || di.rm != 2) {
+    fprintf(stderr, "FAIL(t32_tbh): decode op=%d b=%d\n", di.op, di.b);
+    return 1;
+  }
+  printf("ok: T32 TBB [pc, r2] and TBH (Q-OTTD-0an)\n");
+  return 0;
+}
+
 
 static int test_t32_mov_w_modimm_0(void) {
   /* Q-OTTD-0d: mov.w r8,#0 = f04f 0800. S=0 leaves NZCV. */
@@ -9326,6 +9414,7 @@ int main(void) {
   failures += test_t32_adds_w_imm0();
   failures += test_t32_orr_w_imm1();
   failures += test_t32_rsb_w_imm1();
+  failures += test_t32_tbb_pc();
   failures += test_t32_mov_w_modimm_0();
   failures += test_t32_mov_w_modimm_25();
   failures += test_t32_sub_w_modimm_sp();

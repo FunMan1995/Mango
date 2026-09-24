@@ -1653,6 +1653,31 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
         }
 
+        case MANGO_OP_TBB: {
+          /* PC for the branch is addr+4. Rn=PC reads Align(that, 4).
+           * Stay in Thumb: the offset is a halfword count, not an
+           * interworking address. */
+          uint32_t pc = addr + 4u;
+          uint32_t base = insn.rn == MANGO_REG_PC ? (pc & ~3u) : cpu->r[insn.rn];
+          uint32_t idx = cpu->r[insn.rm];
+          uint32_t halfwords;
+          if (insn.b) {
+            uint32_t eaddr = base + (idx << 1);
+            if (mango_check_half_access(mem, eaddr) != 0) {
+              return -1;
+            }
+            halfwords = mango_load_u16_le(mango_mem_at(mem, eaddr));
+          } else {
+            uint32_t eaddr = base + idx;
+            if (mango_check_byte_access(mem, eaddr) != 0) {
+              return -1;
+            }
+            halfwords = mango_mem_at(mem, eaddr)[0];
+          }
+          mango_alu_write_pc(cpu, pc + halfwords * 2u, stop_addr, &next_addr);
+          break;
+        }
+
         default:
           return -1;
       }
