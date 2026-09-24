@@ -162,3 +162,15 @@ target_link_libraries(mango_host_droidzebra_drive PRIVATE mango_core m z)
 if(PNG_FOUND)
   target_link_libraries(mango_host_droidzebra_drive PRIVATE PNG::PNG)
 endif()
+
+# Host-only CrossWords (xw4) drive helper for Test Lab (not a ctest). Loads
+# armeabi libxwjni.so (explicit Java_* initGlobals/initJNI/board_*; no JNI_OnLoad).
+add_executable(mango_host_crosswords_drive
+  src/native_bridge_shim.c
+  tests/host_crosswords_drive.c
+)
+target_include_directories(mango_host_crosswords_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_crosswords_drive PRIVATE mango_core m z pthread)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_crosswords_drive PRIVATE PNG::PNG)
+endif()

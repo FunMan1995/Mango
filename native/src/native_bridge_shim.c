@@ -61,6 +61,7 @@
 #define MANGO_JNI_CALL_OBJECT_METHOD 34
 #define MANGO_JNI_CALL_BOOLEAN_METHOD 37
 #define MANGO_JNI_CALL_INT_METHOD 49
+#define MANGO_JNI_CALL_LONG_METHOD 52
 #define MANGO_JNI_CALL_FLOAT_METHOD 55
 #define MANGO_JNI_CALL_VOID_METHOD 61
 #define MANGO_JNI_GET_FIELD_ID 94
@@ -73,6 +74,7 @@
 #define MANGO_JNI_CALL_STATIC_OBJECT_METHOD 114
 #define MANGO_JNI_CALL_STATIC_BOOLEAN_METHOD 117
 #define MANGO_JNI_CALL_STATIC_INT_METHOD 129
+#define MANGO_JNI_CALL_STATIC_LONG_METHOD 132
 #define MANGO_JNI_CALL_STATIC_VOID_METHOD 141
 #define MANGO_JNI_GET_STATIC_FIELD_ID 144
 #define MANGO_JNI_GET_STATIC_OBJECT_FIELD 145
@@ -84,8 +86,11 @@
 #define MANGO_JNI_GET_ARRAY_LENGTH 171
 #define MANGO_JNI_NEW_OBJECT_ARRAY 172
 #define MANGO_JNI_GET_OBJECT_ARRAY_ELEMENT 173
+#define MANGO_JNI_NEW_BYTE_ARRAY 176
 #define MANGO_JNI_NEW_INT_ARRAY 179
+#define MANGO_JNI_GET_BYTE_ARRAY_ELEMENTS 184
 #define MANGO_JNI_GET_INT_ARRAY_ELEMENTS 187
+#define MANGO_JNI_RELEASE_BYTE_ARRAY_ELEMENTS 192
 #define MANGO_JNI_RELEASE_INT_ARRAY_ELEMENTS 195
 #define MANGO_JNI_REGISTER_NATIVES 215
 #define MANGO_JNI_GET_JAVA_VM 219
@@ -972,7 +977,9 @@ typedef enum {
   MANGO_MID_STORE_LOAD_FLOAT,
   MANGO_MID_STORE_SAVE_FLOAT,
   MANGO_MID_STORE_LOAD_STRING,
-  MANGO_MID_STORE_SAVE_STRING
+  MANGO_MID_STORE_SAVE_STRING,
+  /* CrossWords Q0 (research/64): GamePtr.ptr ()I → guest JNIState* */
+  MANGO_MID_GAMEPTR_PTR
 } MangoMidKind;
 
 typedef struct {
@@ -1004,6 +1011,31 @@ typedef struct {
   int length;
   const char* items[MANGO_HOST_STRARR_MAX];
 } MangoHostStringArray;
+
+/* CrossWords Q0: soft GamePtr jobject — CallIntMethod("ptr") returns guest
+ * JNIState* from initJNI (not soft 1). Layout must match host_crosswords_drive. */
+#define MANGO_HOST_GAMEPTR_MAGIC 0x47505452u /* 'GPTR' */
+typedef struct {
+  uint32_t magic;
+  uint32_t ptr; /* guest address of JNIState from initJNI */
+} MangoHostGamePtr;
+
+/* Host byte[] for dict payloads (fixtures/crosswords/files/*.xwd). */
+#define MANGO_HOST_BYTEARR_MAGIC 0x4a425954u /* 'JBYT' */
+typedef struct {
+  uint32_t magic;
+  int length;
+  const uint8_t* data;
+} MangoHostByteArray;
+
+/* Host Object[] (e.g. byte[][] dicts). Items are host pointers interned as handles. */
+#define MANGO_HOST_OBJARR_MAGIC 0x4a4f424au /* 'JOBJ' */
+#define MANGO_HOST_OBJARR_MAX 16
+typedef struct {
+  uint32_t magic;
+  int length;
+  void* items[MANGO_HOST_OBJARR_MAX];
+} MangoHostObjectArray;
 
 static MangoJniMethod g_jni_methods[MANGO_JNIMETHOD_MAX];
 static MangoBitmap g_bitmaps[MANGO_BITMAP_MAX];
@@ -1061,6 +1093,11 @@ static MangoMidKind mango_classify_png_mid(const char* name, const char* sig) {
   if (strcmp(name, "saveString") == 0 && sig && strstr(sig, "String") != NULL &&
       strstr(sig, ")V") != NULL) {
     return MANGO_MID_STORE_SAVE_STRING;
+  }
+  /* CrossWords GamePtr.ptr — pin uses ()I; newer trees use ()J. */
+  if (strcmp(name, "ptr") == 0 && sig &&
+      (strcmp(sig, "()I") == 0 || strcmp(sig, "()J") == 0)) {
+    return MANGO_MID_GAMEPTR_PTR;
   }
   return MANGO_MID_UNKNOWN;
 }
@@ -1570,10 +1607,44 @@ static uint32_t mango_jni_call_store(MangoLoadedLibrary* lib, MangoCpu* cpu, Man
   }
 }
 
+/* CrossWords Q0: GamePtr.ptr → guest JNIState* stashed in host sentinel. */
+static uint32_t mango_jni_call_gameptr(MangoLoadedLibrary* lib, MangoCpu* cpu, MangoJniMethod* mid,
+                                       int form) {
+  (void)form;
+  if (!mid || mid->kind != MANGO_MID_GAMEPTR_PTR) {
+    return 0;
+  }
+  void* p = mango_handle_lookup(cpu->r[1]);
+  if (!p) {
+    cpu->r[0] = 0;
+    fprintf(stderr, "mango: GamePtr.ptr null jobject\n");
+    return 1;
+  }
+  uintptr_t up = (uintptr_t)p;
+  /* Never treat guest-dummy handles as host GamePtr. */
+  if (up >= (uintptr_t)4096u && up < (uintptr_t)lib->guest_mem_size) {
+    cpu->r[0] = 0;
+    fprintf(stderr, "mango: GamePtr.ptr guest-dummy jobject\n");
+    return 1;
+  }
+  MangoHostGamePtr* gp = (MangoHostGamePtr*)p;
+  if (gp->magic != MANGO_HOST_GAMEPTR_MAGIC) {
+    cpu->r[0] = 0;
+    fprintf(stderr, "mango: GamePtr.ptr bad magic %08x\n", gp->magic);
+    return 1;
+  }
+  cpu->r[0] = gp->ptr;
+  fprintf(stderr, "mango: GamePtr.ptr -> 0x%x\n", gp->ptr);
+  return 1;
+}
+
 static uint32_t mango_jni_call_host(MangoLoadedLibrary* lib, MangoCpu* cpu, MangoJniMethod* mid,
                                     int form) {
   if (!mid || mid->kind == MANGO_MID_UNKNOWN) {
     return 0;
+  }
+  if (mango_jni_call_gameptr(lib, cpu, mid, form)) {
+    return 1;
   }
   if (mango_jni_call_png(lib, cpu, mid, form)) {
     return 1;
@@ -4545,7 +4616,71 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
           break;
         }
       }
+      /* CrossWords CurGameInfo soft ints via GetFieldID name_addr|1 handle. */
+      if (fn == MANGO_JNI_GET_INT_FIELD || fn == MANGO_JNI_GET_STATIC_INT_FIELD) {
+        void* fp = mango_handle_lookup(cpu->r[2]);
+        uintptr_t fu = (uintptr_t)fp;
+        if (fp && (fu & 1u)) {
+          const char* fname = mango_guest_cstr(lib, (uint32_t)(fu & ~1u));
+          if (fname) {
+            if (strcmp(fname, "boardSize") == 0) {
+              cpu->r[0] = 15;
+              break;
+            }
+            if (strcmp(fname, "nPlayers") == 0) {
+              cpu->r[0] = 1;
+              break;
+            }
+            if (strcmp(fname, "gameID") == 0) {
+              /* Non-zero avoids makeGameID → getCurSeconds spin (research/64). */
+              cpu->r[0] = 0x51515253u;
+              break;
+            }
+            if (strcmp(fname, "gameSeconds") == 0 || strcmp(fname, "forceChannel") == 0 ||
+                strcmp(fname, "dictLang") == 0 || strcmp(fname, "traySize") == 0 ||
+                strcmp(fname, "bingoMin") == 0 || strcmp(fname, "robotIQ") == 0 ||
+                strcmp(fname, "secondsUsed") == 0) {
+              cpu->r[0] = 0;
+              break;
+            }
+          }
+        }
+      }
       cpu->r[0] = 1;
+      break;
+    }
+    case MANGO_JNI_CALL_LONG_METHOD:
+    case MANGO_JNI_CALL_LONG_METHOD + 1:
+    case MANGO_JNI_CALL_LONG_METHOD + 2:
+    case MANGO_JNI_CALL_STATIC_LONG_METHOD:
+    case MANGO_JNI_CALL_STATIC_LONG_METHOD + 1:
+    case MANGO_JNI_CALL_STATIC_LONG_METHOD + 2: {
+      /* Soft jlong in r0:r1 (little-endian softfp/AAPCS). CrossWords
+       * Utils.getCurSeconds ()J — non-zero so makeGameID can finish. */
+      {
+        void* mp = mango_handle_lookup(cpu->r[2]);
+        MangoJniMethod* mid = mango_jni_method_from_mid(cpu->r[2]);
+        const char* mname = mid ? mid->name : NULL;
+        uint32_t lo = 1u;
+        uint32_t hi = 0u;
+        if (mname && strcmp(mname, "getCurSeconds") == 0) {
+          lo = (uint32_t)time(NULL);
+          if (lo == 0) lo = 1u;
+          hi = 0u;
+          fprintf(stderr, "mango: Call*Long getCurSeconds -> %u\n", lo);
+        } else if (mname && strcmp(mname, "ptr") == 0) {
+          /* GamePtr.ptr ()J on newer trees — reuse GamePtr host path. */
+          if (mid && mid->kind == MANGO_MID_GAMEPTR_PTR &&
+              mango_jni_call_host(lib, cpu, mid, 0)) {
+            /* call_host set r0; zero-extend to jlong */
+            cpu->r[1] = 0;
+            break;
+          }
+        }
+        (void)mp;
+        cpu->r[0] = lo;
+        cpu->r[1] = hi;
+      }
       break;
     }
     case MANGO_JNI_CALL_FLOAT_METHOD:
@@ -4638,10 +4773,28 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       {
         void* p = mango_handle_lookup(cpu->r[1]);
         if (p) {
+          uintptr_t up = (uintptr_t)p;
+          /* Dummy jobjects may be guest heap addrs interned as handles — never
+           * deref those as host MangoHostStringArray (CrossWords initGlobals). */
+          if (up >= (uintptr_t)4096u && up < (uintptr_t)lib->guest_mem_size) {
+            cpu->r[0] = 0;
+            break;
+          }
           MangoHostStringArray* sa = (MangoHostStringArray*)p;
           if (sa->magic == MANGO_HOST_STRARR_MAGIC && sa->length >= 0 &&
               sa->length <= MANGO_HOST_STRARR_MAX) {
             cpu->r[0] = (uint32_t)sa->length;
+            break;
+          }
+          MangoHostObjectArray* oa = (MangoHostObjectArray*)p;
+          if (oa->magic == MANGO_HOST_OBJARR_MAGIC && oa->length >= 0 &&
+              oa->length <= MANGO_HOST_OBJARR_MAX) {
+            cpu->r[0] = (uint32_t)oa->length;
+            break;
+          }
+          MangoHostByteArray* ba = (MangoHostByteArray*)p;
+          if (ba->magic == MANGO_HOST_BYTEARR_MAGIC && ba->length >= 0) {
+            cpu->r[0] = (uint32_t)ba->length;
             break;
           }
         }
@@ -4654,11 +4807,21 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
       int idx = (int)cpu->r[2];
       cpu->r[0] = 0;
       if (p) {
+        uintptr_t up = (uintptr_t)p;
+        if (up >= (uintptr_t)4096u && up < (uintptr_t)lib->guest_mem_size) {
+          break;
+        }
         MangoHostStringArray* sa = (MangoHostStringArray*)p;
         if (sa->magic == MANGO_HOST_STRARR_MAGIC && idx >= 0 && idx < sa->length &&
             idx < MANGO_HOST_STRARR_MAX && sa->items[idx]) {
           /* Host char* doubles as fake jstring (mango_fake_jstring_chars). */
           cpu->r[0] = mango_handle_intern((void*)sa->items[idx]);
+          break;
+        }
+        MangoHostObjectArray* oa = (MangoHostObjectArray*)p;
+        if (oa->magic == MANGO_HOST_OBJARR_MAGIC && idx >= 0 && idx < oa->length &&
+            idx < MANGO_HOST_OBJARR_MAX && oa->items[idx]) {
+          cpu->r[0] = mango_handle_intern(oa->items[idx]);
         }
       }
       break;
@@ -4666,6 +4829,36 @@ static void mango_jni_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env, u
     case MANGO_JNI_NEW_OBJECT_ARRAY:
       /* Soft: return dummy; Lab builds String[] on host. */
       cpu->r[0] = mango_dummy_jobject(lib);
+      break;
+    case MANGO_JNI_NEW_BYTE_ARRAY: {
+      /* Soft empty byte[]; Lab prefers host MangoHostByteArray sentinels. */
+      cpu->r[0] = mango_dummy_jobject(lib);
+      break;
+    }
+    case MANGO_JNI_GET_BYTE_ARRAY_ELEMENTS: {
+      void* p = mango_handle_lookup(cpu->r[1]);
+      cpu->r[0] = 0;
+      if (p) {
+        uintptr_t up = (uintptr_t)p;
+        if (up >= (uintptr_t)4096u && up < (uintptr_t)lib->guest_mem_size) {
+          break;
+        }
+        MangoHostByteArray* ba = (MangoHostByteArray*)p;
+        if (ba->magic == MANGO_HOST_BYTEARR_MAGIC && ba->data && ba->length > 0) {
+          uint32_t ga = mango_guest_alloc(lib, (uint32_t)ba->length);
+          if (ga) {
+            memcpy(lib->guest_mem + ga, ba->data, (size_t)ba->length);
+            cpu->r[0] = ga;
+            fprintf(stderr, "mango: GetByteArrayElements host %d bytes -> guest 0x%x\n",
+                    ba->length, ga);
+          }
+        }
+      }
+      break;
+    }
+    case MANGO_JNI_RELEASE_BYTE_ARRAY_ELEMENTS:
+      /* Guest copy from GetByteArrayElements is not freed (arena). */
+      cpu->r[0] = 0;
       break;
     case MANGO_JNI_NEW_INT_ARRAY: {
       int n = (int)cpu->r[1];
