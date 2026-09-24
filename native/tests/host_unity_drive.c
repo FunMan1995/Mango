@@ -95,7 +95,9 @@ static int resolve_libmain(const char* arg, char* out, size_t out_sz) {
 }
 
 static int capture_stderr_begin(int* saved_fd, char* log_path, size_t log_path_sz) {
-  if (snprintf(log_path, log_path_sz, "/tmp/mango_host_unity_drive_XXXXXX") >= (int)log_path_sz) {
+  const char* tmpdir = getenv("TMPDIR");
+  if (tmpdir == NULL || tmpdir[0] == '\0') tmpdir = "/tmp";
+  if (snprintf(log_path, log_path_sz, "%s/mango_host_unity_drive_XXXXXX", tmpdir) >= (int)log_path_sz) {
     return -1;
   }
   int fd = mkstemp(log_path);
@@ -214,7 +216,7 @@ int main(int argc, char** argv) {
   fprintf(stderr, "mango_host_unity_drive: libmain=%s\n", libmain);
 
   int saved_err = -1;
-  char log_path[64];
+  char log_path[PATH_MAX];
   if (capture_stderr_begin(&saved_err, log_path, sizeof(log_path)) != 0) {
     fprintf(stderr, "mango_host_unity_drive: could not capture stderr\n");
     return 1;

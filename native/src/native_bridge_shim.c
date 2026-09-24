@@ -1021,7 +1021,7 @@ typedef struct {
   uint32_t ptr; /* guest address of JNIState from initJNI */
 } MangoHostGamePtr;
 
-/* Host byte[] for dict payloads (fixtures/crosswords/files/*.xwd). */
+/* Host byte[] for dict payloads (crossword .xwd files under the fixture tree). */
 #define MANGO_HOST_BYTEARR_MAGIC 0x4a425954u /* 'JBYT' */
 typedef struct {
   uint32_t magic;
@@ -1992,7 +1992,6 @@ static void* mango_load_library(const char* libpath, int flag);
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env);
 static const char* mango_guest_cstr(MangoLoadedLibrary* lib, uint32_t addr);
 static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n);
-static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h);
 static uint32_t mango_guest_sdl_surface_bpp(MangoLoadedLibrary* lib, uint32_t w, uint32_t h,
                                            uint32_t bpp);
 static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path,
@@ -5562,10 +5561,6 @@ static uint32_t mango_guest_sdl_surface_bpp(MangoLoadedLibrary* lib, uint32_t w,
   lib->guest_mem[surf + 39u] = (uint8_t)((h >> 8) & 0xffu);
   mango_store_u32_guest(lib->guest_mem, surf + 56u, 1u);
   return surf;
-}
-
-static uint32_t mango_guest_sdl_surface(MangoLoadedLibrary* lib, uint32_t w, uint32_t h) {
-  return mango_guest_sdl_surface_bpp(lib, w, h, 32u);
 }
 
 static int16_t mango_load_i16_guest(const uint8_t* mem, uint32_t addr) {
