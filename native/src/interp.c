@@ -65,6 +65,7 @@ static uint32_t mango_read_reg(const MangoCpu* cpu, uint32_t insn_addr, uint32_t
   return cpu->r[reg];
 }
 
+/* BXWritePC: BX/BLX/LDR-to-PC/LDM-PC interworking from bit0. */
 static void mango_branch_to(MangoCpu* cpu, uint32_t dest, uint32_t stop_addr, uint32_t* next_addr) {
   if (dest == stop_addr && (dest & 1u)) {
     *next_addr = dest;
@@ -77,13 +78,33 @@ static void mango_branch_to(MangoCpu* cpu, uint32_t dest, uint32_t stop_addr, ui
   }
 }
 
+/* ALUWritePC / BranchWritePC for data-processing writes to PC (MOV/ADD/…).
+ * ARMv5TE Thumb ignores bit0 and stays in Thumb — required for
+ * libgcc __gnu_thumb1_case_si (`mov pc, lr`) whose jump-table targets are
+ * even halfword addresses. ARMv7 BXWritePC on that pattern would clear T and
+ * A32-decode Thumb text (Tux Rider Q1 @ 0x7e3fc). Loads/BX still use
+ * mango_branch_to. */
+static void mango_alu_write_pc(MangoCpu* cpu, uint32_t dest, uint32_t stop_addr,
+                               uint32_t* next_addr) {
+  
+  if (dest == stop_addr && (dest & 1u)) {
+    *next_addr = dest;
+    return;
+  }
+  if (cpu->cpsr & MANGO_CPSR_T) {
+    *next_addr = dest & ~1u;
+  } else {
+    *next_addr = dest & ~3u;
+  }
+}
+
 static void mango_write_rd(MangoCpu* cpu, uint32_t rd, uint32_t value, uint32_t stop_addr,
                            uint32_t* next_addr) {
   if (rd != MANGO_REG_PC) {
     cpu->r[rd] = value;
     return;
   }
-  mango_branch_to(cpu, value, stop_addr, next_addr);
+  mango_alu_write_pc(cpu, value, stop_addr, next_addr);
 }
 
 static uint64_t mango_vfp_get_d(const MangoCpu* cpu, uint32_t d) {
@@ -771,8 +792,13 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
               return -1;
             }
             if (insn.op == MANGO_OP_LDR) {
-              mango_write_rd(cpu, insn.rd, mango_load_u32_le(mem->bytes + eaddr), stop_addr,
-                             &next_addr);
+              uint32_t loaded = mango_load_u32_le(mem->bytes + eaddr);
+              /* LoadWritePC: interwork from bit0 (unlike ALUWritePC). */
+              if (insn.rd == MANGO_REG_PC) {
+                mango_branch_to(cpu, loaded, stop_addr, &next_addr);
+              } else {
+                cpu->r[insn.rd] = loaded;
+              }
             } else {
               mango_store_u32_le(mem->bytes + eaddr, cpu->r[insn.rd]);
             }

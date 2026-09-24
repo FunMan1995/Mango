@@ -2199,6 +2199,47 @@ static int test_thumb_mov_add_bx(void) {
   return 0;
 }
 
+/* Tux Rider Q1 / libgcc __gnu_thumb1_case_si: Thumb `mov pc, lr` with an even
+ * destination must keep CPSR.T (ARMv5TE ALUWritePC). BXWritePC would clear T
+ * and A32-fetch the Thumb stream at the case label. */
+static int test_thumb_mov_pc_lr_keeps_t(void) {
+  /* 0: mov pc, r1 (high-reg MOV, Rd=PC Rm=R1) encoding 0x468F
+   *    010001 10 D=1 Rm=0001 Rdlo=111 → Rd=15, Rm=1 → 0x468F
+   * 2: movs r0, #5
+   * 4: bx r2 */
+  static const uint16_t kProg[] = {
+      0x468Fu, /* mov pc, r1 */
+      0x2005u, /* movs r0, #5 */
+      0x4710u, /* bx r2 */
+  };
+
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+
+  MangoCpu cpu;
+  for (int i = 0; i < 16; i++) {
+    cpu.r[i] = 0;
+  }
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[1] = 2u;            /* even Thumb target (case-table style) */
+  cpu.r[2] = 0xCAFE0000u;   /* bx sentinel (even → leaves Thumb, fine) */
+
+  int rc = mango_interp_run(&cpu, &mem, 0xCAFE0000u, 100);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL(thumb_mov_pc_lr_keeps_t): run returned %d pc=0x%x cpsr=0x%x\n",
+            rc, cpu.r[MANGO_REG_PC], cpu.cpsr);
+    return 1;
+  }
+  if (cpu.r[0] != 5u) {
+    fprintf(stderr, "FAIL(thumb_mov_pc_lr_keeps_t): r0=%u want 5 (Thumb body skipped?)\n",
+            cpu.r[0]);
+    return 1;
+  }
+  printf("ok: thumb mov pc, Rm even dest keeps T (case_si / Q1)\n");
+  return 0;
+}
+
 static int test_thumb_push_pop(void) {
   static const uint16_t kProg[] = {
       0xB510u, /* push {r4, lr} */
@@ -8694,6 +8735,7 @@ int main(void) {
   failures += test_ldrd_strd_roundtrip();
   failures += test_thumb_ldmia_wb();
   failures += test_thumb_mov_add_bx();
+  failures += test_thumb_mov_pc_lr_keeps_t();
   failures += test_thumb_push_pop();
   failures += test_arm_bx_into_thumb();
   failures += test_thumb_bl();
