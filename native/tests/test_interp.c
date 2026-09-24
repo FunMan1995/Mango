@@ -9171,6 +9171,101 @@ static int test_t32_adc_w_imm(void) {
   return 0;
 }
 
+static int test_t32_sbcs_w_imm0(void) {
+  /* Q-OTTD-0cb: sbcs r3, r5, #0 = f175 0300 (llvm-mc [75,f1,00,03]).
+   * r3 = r5 - NOT(C). Flags come from that subtract. */
+  static const uint16_t kProg[] = {0xF175u, 0x0300u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t r5, extra, want, nzcv;
+  } cases[] = {
+      {10u, MANGO_CPSR_C, 10u, MANGO_CPSR_C},
+      {0u, MANGO_CPSR_C, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0u, 0u, 0xffffffffu, MANGO_CPSR_N},
+      {1u, 0u, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0x80000000u, 0u, 0x7fffffffu, MANGO_CPSR_C | MANGO_CPSR_V},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xF175u, 0x0300u, &di) != 0 || di.op != MANGO_OP_SBC || di.rd != 3 ||
+      di.rn != 5 || di.is_imm != 1 || di.sets_flags != 1 || di.imm != 0u) {
+    fprintf(stderr, "FAIL(t32_sbcs_w_imm0): decode op=%d rd=%u rn=%u imm=%u flags=%d\n", di.op, di.rd,
+            di.rn, di.imm, di.sets_flags);
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | cases[c].extra;
+    cpu.r[5] = cases[c].r5;
+    cpu.r[3] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[3] != cases[c].want || cpu.r[5] != cases[c].r5 || nzcv != cases[c].nzcv) {
+      fprintf(stderr, "FAIL(t32_sbcs_w_imm0#%u): rc=%d r3=%x want %x r5=%x nzcv=%x want %x\n", c, rc,
+              cpu.r[3], cases[c].want, cpu.r[5], nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+  if (mango_decode_t32(0xF165u, 0x0300u, &di) == 0 || mango_decode_t32(0xF175u, 0x0F00u, &di) == 0 ||
+      mango_decode_t32(0xF17Fu, 0x0300u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_sbcs_w_imm0): SBC or PC should stay closed\n");
+    return 1;
+  }
+  printf("ok: T32 SBCS.W r3, r5, #0 (Q-OTTD-0cb)\n");
+  return 0;
+}
+
+static int test_t32_sbcs_w_reg(void) {
+  /* Q-OTTD-0cc: sbcs.w r1, r3, r5 = eb73 0105.
+   * r1 = r3 - r5 - NOT(C). */
+  static const uint16_t kProg[] = {0xEB73u, 0x0105u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t r3, r5, extra, want, nzcv;
+  } cases[] = {
+      {10u, 3u, MANGO_CPSR_C, 7u, MANGO_CPSR_C},
+      {3u, 3u, MANGO_CPSR_C, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {3u, 3u, 0u, 0xffffffffu, MANGO_CPSR_N},
+      {0u, 1u, MANGO_CPSR_C, 0xffffffffu, MANGO_CPSR_N},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xEB73u, 0x0105u, &di) != 0 || di.op != MANGO_OP_SBC || di.rd != 1 ||
+      di.rn != 3 || di.rm != 5 || di.is_imm != 0 || di.sets_flags != 1 || di.shift_amount != 0) {
+    fprintf(stderr, "FAIL(t32_sbcs_w_reg): decode op=%d rd=%u rn=%u rm=%u\n", di.op, di.rd, di.rn,
+            di.rm);
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | cases[c].extra;
+    cpu.r[3] = cases[c].r3;
+    cpu.r[5] = cases[c].r5;
+    cpu.r[1] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[1] != cases[c].want || cpu.r[3] != cases[c].r3 || cpu.r[5] != cases[c].r5 ||
+        nzcv != cases[c].nzcv) {
+      fprintf(stderr, "FAIL(t32_sbcs_w_reg#%u): rc=%d r1=%x want %x nzcv=%x want %x\n", c, rc,
+              cpu.r[1], cases[c].want, nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+  if (mango_decode_t32(0xEB63u, 0x0105u, &di) == 0 || mango_decode_t32(0xEB73u, 0x0F05u, &di) == 0 ||
+      mango_decode_t32(0xEB7Fu, 0x0105u, &di) == 0 || mango_decode_t32(0xEB73u, 0x010Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_sbcs_w_reg): S=0 or PC should stay closed\n");
+    return 1;
+  }
+  printf("ok: T32 SBCS.W r1, r3, r5 (Q-OTTD-0cc)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -11509,6 +11604,8 @@ int main(void) {
   failures += test_t32_ldrh_w_reg_lsl1();
   failures += test_t32_adc_w_reg();
   failures += test_t32_adc_w_imm();
+  failures += test_t32_sbcs_w_imm0();
+  failures += test_t32_sbcs_w_reg();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();

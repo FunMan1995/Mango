@@ -1902,6 +1902,59 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0cb: SBCS.W Rd,Rn,#<const> modified-imm (op=1011, S=1).
+   * SQTable::SQTable f175 0300 = sbcs r3, r5, #0
+   * (llvm-mc [75,f1,00,03]). r3 = r5 - imm - NOT(C), and NZCV update.
+   * SBC (S=0, f165) stays closed. Reject Rd/Rn=PC. */
+  if ((hw1 & 0xFBE0u) == 0xF160u && (hw1 & 0x10u) != 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_SBC;
+    out->rd = rd;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->sets_flags = 1;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0cc: SBCS.W Rd,Rn,Rm{,shift} register (op=0110, S=1).
+   * SQTable::SQTable eb73 0105 = sbcs.w r1, r3, r5
+   * (llvm-mc). r1 = r3 - r5 - NOT(C). SBC register (S=0) stays
+   * closed. Reject Rd/Rn/Rm=PC and a register shift. */
+  if ((hw1 & 0xFFE0u) == 0xEB60u && (hw1 & 0x10u) != 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_SBC;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 1;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0be: SUB.W Rd,Rn,Rm{,shift} register, S=0.
    * OpenTTD eba9 7cec = sub.w r12,r9,r12,asr #31 (llvm-mc [a9,eb,ec,7c]).
    * CMP.W register (Rd=15) is Q-OTTD-0bw. SUBS register is Q-OTTD-0bx.
