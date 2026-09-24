@@ -63,11 +63,20 @@ static int capture_stderr_end(int saved_fd, const char* log_path, int* saw_stop)
   FILE* f = fopen(log_path, "r");
   if (!f) { unlink(log_path); return -1; }
   char buf[4096];
+  char window[4096 + 32];
+  size_t carry = 0;
   size_t n;
+  const char needle[] = "mango: interp stop";
+  const size_t nlen = sizeof(needle) - 1u;
   *saw_stop = 0;
   while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    size_t total;
     fwrite(buf, 1, n, stderr);
-    if (memmem(buf, n, "mango: interp stop", 18) != NULL) *saw_stop = 1;
+    memcpy(window + carry, buf, n);
+    total = carry + n;
+    if (memmem(window, total, needle, nlen) != NULL) *saw_stop = 1;
+    carry = total >= nlen ? nlen - 1u : total;
+    if (carry != 0) memmove(window, window + total - carry, carry);
   }
   fclose(f);
   unlink(log_path);

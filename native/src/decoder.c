@@ -1851,9 +1851,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0r: MOV.W Rd,Rm{,shift} register — ORR with Rn=15, S=0.
    * Primary ea4f 7ad0 = mov.w sl,r0,lsr#31; sib ea4f 0847 lsl#1.
-   * Require Rn==15 so ORR Rn≠15 (ea41…) stays uncover. Do NOT open
-   * MOVS (EA5F), ORR Rn≠15, or MVN-reg (EA6F). Reject Rd/Rm=PC.
-   * Shift fields identical to ADD.W reg 0l. */
+   * Rn==15 only. ORR Rn≠15 is Q-OTTD-0aw. Do NOT open MOVS (EA5F)
+   * or MVN-reg (EA6F). Reject Rd/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) == 0 &&
       (hw2 & 0x8000u) == 0) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -1865,6 +1864,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     }
     out->op = MANGO_OP_MOV;
     out->rd = rd;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0aw: ORR.W Rd,Rn,Rm{,shift} register, S=0, Rn≠15.
+   * OpenTTD ea41 1383 = orr.w r3,r1,r3,lsl #6 (llvm-mc [41,ea,83,13]).
+   * Rn=15 stays MOV.W. ORRS (EA5x) stays closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) != 0xFu && (hw1 & 0x10u) == 0 &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_ORR;
+    out->rd = rd;
+    out->rn = rn;
     out->rm = rm;
     out->is_imm = 0;
     out->sets_flags = 0;
@@ -2026,6 +2050,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->sets_flags = 0;
     out->imm = imm;
     out->shift_amount = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0au: BIC/BICS.W register with a shifted Rm.
+   * OpenTTD ea37 0720 = bics.w r7,r7,r0,asr #32 (llvm-mc [37,ea,20,07]).
+   * imm2:imm3 of 0 with type ASR is ASR #32 (sign fill). S from hw1 bit 4.
+   * Immediate BICS (f036) stays closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA20u && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_BIC;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = (hw1 >> 4) & 1u;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
     return 0;
   }
 
@@ -2774,23 +2823,22 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0b: T32 MUL (DDI0597 T2) Ra=15 op2=0000 — Rd = Rn * Rm, S=0.
-   * Reuse MANGO_OP_MUL (rm*rs multiplicands; sets_flags=0). Not MLA/MLS. */
-  if ((hw1 & 0xFFF0u) == 0xFB00u && (hw2 & 0xF0F0u) == 0xF000u) {
+  /* Q-OTTD-0b / 0av: T32 MUL (Ra=15) and MLA (Ra≠15), op2=0000, S=0.
+   * mul.w r1,r1,r4 = fb01 f104. OpenTTD fb01 3102 = mla r1,r1,r2,r3
+   * (Rd = Rn*Rm + Ra). MLS (op2=0001) stays closed. */
+  if ((hw1 & 0xFFF0u) == 0xFB00u && (hw2 & 0x00F0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t ra = (hw2 >> 12) & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
-    if (ra != 0xFu) {
-      return -1; /* MLA/MLS — out of scope */
-    }
     if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
       return -1;
     }
-    out->op = MANGO_OP_MUL;
+    out->op = (ra == 0xFu) ? MANGO_OP_MUL : MANGO_OP_MLA;
     out->rd = rd;
     out->rm = rn; /* multiplicand Rn → interp rm lane */
     out->rs = rm; /* multiplicand Rm → interp rs lane */
+    out->rn = (ra == 0xFu) ? 0u : ra;
     out->sets_flags = 0;
     return 0;
   }
@@ -2865,6 +2913,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rn = rn;
     out->imm = lsb;
     out->rs = widthm1;
+    return 0;
+  }
+
+  /* Q-OTTD-0ax: T32 LSL.W Rd,Rn,Rm (shift amount in Rm, low 8 bits).
+   * OpenTTD fa08 f204 = lsl.w r2,r8,r4 (llvm-mc [08,fa,04,f2]).
+   * Reuse MANGO_OP_MOV + shift_by_reg, S=0 so NZCV hold. LSR/ASR/ROR.W
+   * (FA2x/FA4x/FA6x) and LSLS stay closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFA00u && (hw2 & 0xF0F0u) == 0xF000u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->rm = rn;
+    out->rs = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_by_reg = 1;
     return 0;
   }
 

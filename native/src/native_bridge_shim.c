@@ -283,7 +283,11 @@
 #define MANGO_LIBC_CHDIR 175
 /* OpenTTD usererror → vseprintf → vsnprintf. Without this the message stays empty. */
 #define MANGO_LIBC_VSNPRINTF 176
-#define MANGO_LIBC_COUNT 177
+/* OpenTTD lang scan: strrchr(name, '.') then strcmp with ".lng". */
+#define MANGO_LIBC_STRCHR 177
+#define MANGO_LIBC_STRRCHR 178
+#define MANGO_LIBC_STRSTR 179
+#define MANGO_LIBC_COUNT 180
 #define MANGO_TSD_KEYS 16
 
 /* Soft OpenSLES vtable methods (heap thunks; not PLT-imported by name). */
@@ -531,6 +535,9 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "getcwd",
     "chdir",
     "vsnprintf",
+    "strchr",
+    "strrchr",
+    "strstr",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -3000,6 +3007,24 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       const char* a = mango_guest_cstr(lib, r0);
       const char* b = mango_guest_cstr(lib, r1);
       cpu->r[0] = (a && b) ? (uint32_t)strncasecmp(a, b, r2) : (uint32_t)-1;
+      break;
+    }
+    case MANGO_LIBC_STRCHR:
+    case MANGO_LIBC_STRRCHR: {
+      const char* s = mango_guest_cstr(lib, r0);
+      const char* p = NULL;
+      if (s) {
+        int c = (int)(r1 & 0xFFu);
+        p = (fn == MANGO_LIBC_STRRCHR) ? strrchr(s, c) : strchr(s, c);
+      }
+      cpu->r[0] = p ? r0 + (uint32_t)(p - s) : 0;
+      break;
+    }
+    case MANGO_LIBC_STRSTR: {
+      const char* h = mango_guest_cstr(lib, r0);
+      const char* n = mango_guest_cstr(lib, r1);
+      const char* p = (h && n) ? strstr(h, n) : NULL;
+      cpu->r[0] = p ? r0 + (uint32_t)(p - h) : 0;
       break;
     }
     case MANGO_LIBC_STRCPY: {
