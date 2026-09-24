@@ -3545,7 +3545,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0ax: T32 LSL.W Rd,Rn,Rm (shift amount in Rm, low 8 bits).
    * OpenTTD fa08 f204 = lsl.w r2,r8,r4 (llvm-mc [08,fa,04,f2]).
    * Reuse MANGO_OP_MOV + shift_by_reg, S=0 so NZCV hold. ASR.W is
-   * Q-OTTD-0bh. LSR/ROR.W (FA2x/FA6x) and LSLS/ASRS stay closed.
+   * Q-OTTD-0bh. LSLS is Q-OTTD-0cl. LSR/ROR.W and ASRS stay closed.
    * Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFF0u) == 0xFA00u && (hw2 & 0xF0F0u) == 0xF000u) {
     uint32_t rn = hw1 & 0xFu;
@@ -3560,6 +3560,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rs = rm;
     out->is_imm = 0;
     out->sets_flags = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_by_reg = 1;
+    return 0;
+  }
+
+  /* Q-OTTD-0cl: T32 LSLS.W Rd,Rn,Rm. AddInstruction fa13 f601 =
+   * lsls.w r6, r3, r1 (llvm-mc [13,fa,01,f6]). Amount is Rm[7:0].
+   * NZ from the result, C from the shifter, V unchanged. Amount 0
+   * leaves C alone. ASRS stays closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFA10u && (hw2 & 0xF0F0u) == 0xF000u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->rm = rn;
+    out->rs = rm;
+    out->is_imm = 0;
+    out->sets_flags = 1;
     out->shift_type = 0; /* LSL */
     out->shift_by_reg = 1;
     return 0;
