@@ -2939,12 +2939,32 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0bi: T32 SMULxy. SDL fb12 f000 = smulbb r0,r2,r0
+   * (llvm-mc [12,fb,00,f0]). 16x16 signed, N=hw2 bit5, M=hw2 bit4.
+   * Ra=15. SMLAxy (Ra≠15) stays closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFB10u && (hw2 & 0xF0C0u) == 0xF000u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_SMUL;
+    out->rd = rd;
+    out->rm = rn;
+    out->rs = rm;
+    out->b = (int)((hw2 >> 5) & 1u);
+    out->u = (int)((hw2 >> 4) & 1u);
+    out->sets_flags = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0o: T32 UXTH.W Rd,Rm{,ROR#} — Rn=15 no accumulate.
    * Guest fa1f fa81 = uxth.w r10,r1 (rot=0); sib fa1f fa8a = uxth.w r10,r10.
    * Encoding (hw2): 1111 | Rd | 10 | rotate | Rm — rot in bits[5:4];
    * bits[7:6] fixed 10. imm=((hw2>>4)&3)*8 (execute already RORs).
-   * Map → XTEND u=1 b=1 rn=15. Do NOT open UXTB.W/SXTH.W/SXTB.W
-   * (FA5F/FA0F/FA4F) or accumulate Rn≠15 this bite. Reject Rd/Rm=PC. */
+   * Map → XTEND u=1 b=1 rn=15. UXTB.W is Q-OTTD-0bg. SXTH.W/SXTB.W
+   * (FA0F/FA4F) and accumulate Rn≠15 stay closed. Reject Rd/Rm=PC. */
   if (hw1 == 0xFA1Fu && (hw2 & 0xF0C0u) == 0xF080u) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -2958,6 +2978,26 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->imm = ((hw2 >> 4) & 3u) * 8u;
     out->u = 1;
     out->b = 1; /* halfword */
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bg: T32 UXTB.W Rd,Rm{,ROR#} — Rn=15, unsigned byte.
+   * SDL fa5f f588 = uxtb.w r5,r8 (llvm-mc [5f,fa,88,f5]); sib fa5f fb86.
+   * Same hw2 shape as UXTH.W. b=0. SXTH/SXTB and Rn≠15 stay closed. */
+  if (hw1 == 0xFA5Fu && (hw2 & 0xF0C0u) == 0xF080u) {
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_XTEND;
+    out->rd = rd;
+    out->rm = rm;
+    out->rn = 15u;
+    out->imm = ((hw2 >> 4) & 3u) * 8u;
+    out->u = 1;
+    out->b = 0; /* byte */
     out->sets_flags = 0;
     return 0;
   }
@@ -3014,8 +3054,9 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0ax: T32 LSL.W Rd,Rn,Rm (shift amount in Rm, low 8 bits).
    * OpenTTD fa08 f204 = lsl.w r2,r8,r4 (llvm-mc [08,fa,04,f2]).
-   * Reuse MANGO_OP_MOV + shift_by_reg, S=0 so NZCV hold. LSR/ASR/ROR.W
-   * (FA2x/FA4x/FA6x) and LSLS stay closed. Reject Rd/Rn/Rm=PC. */
+   * Reuse MANGO_OP_MOV + shift_by_reg, S=0 so NZCV hold. ASR.W is
+   * Q-OTTD-0bh. LSR/ROR.W (FA2x/FA6x) and LSLS/ASRS stay closed.
+   * Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFF0u) == 0xFA00u && (hw2 & 0xF0F0u) == 0xF000u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -3030,6 +3071,27 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->is_imm = 0;
     out->sets_flags = 0;
     out->shift_type = 0; /* LSL */
+    out->shift_by_reg = 1;
+    return 0;
+  }
+
+  /* Q-OTTD-0bh: T32 ASR.W Rd,Rn,Rm. SDL fa41 f20b = asr.w r2,r1,r11
+   * (llvm-mc [41,fa,0b,f2]). Amount is Rm[7:0]. S=0. ASRS (FA5x) and
+   * LSR/ROR.W stay closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFA40u && (hw2 & 0xF0F0u) == 0xF000u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->rm = rn;
+    out->rs = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = 2; /* ASR */
     out->shift_by_reg = 1;
     return 0;
   }
