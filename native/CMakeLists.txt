@@ -87,3 +87,15 @@ target_link_libraries(mango_host_openttd_drive PRIVATE mango_core m)
 if(PNG_FOUND)
   target_link_libraries(mango_host_openttd_drive PRIVATE PNG::PNG)
 endif()
+
+# Host-only Tux Rider drive helper for Test Lab (not a ctest). Loads
+# armeabi libtuxrider.so (JNI_OnLoad + RegisterNatives resize/render).
+add_executable(mango_host_tuxrider_drive
+  src/native_bridge_shim.c
+  tests/host_tuxrider_drive.c
+)
+target_include_directories(mango_host_tuxrider_drive PRIVATE tests/fake_jni)
+target_link_libraries(mango_host_tuxrider_drive PRIVATE mango_core m)
+if(PNG_FOUND)
+  target_link_libraries(mango_host_tuxrider_drive PRIVATE PNG::PNG)
+endif()

@@ -1,6 +1,9 @@
 /* Must come before any system header, see mango/native_bridge.h for why. */
 #ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
 #endif
 
 /* Implements native/include/mango/native_bridge.h, exported as "NativeBridgeItf". */
@@ -12,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
 #ifndef ANDROID
@@ -225,7 +230,11 @@
 #define MANGO_LIBC_SDL_SET_VIDEO_MODE 141
 #define MANGO_LIBC_SDL_SET_COLOR_KEY 142
 #define MANGO_LIBC_DRAW_TEXT 143
-#define MANGO_LIBC_COUNT 144
+#define MANGO_LIBC_GETENV 144
+#define MANGO_LIBC_STAT 145
+#define MANGO_LIBC_LSTAT 146
+#define MANGO_LIBC_ACCESS 147
+#define MANGO_LIBC_COUNT 148
 #define MANGO_TSD_KEYS 16
 
 #define MANGO_AS_SIZE 0x4000000u
@@ -270,6 +279,10 @@ typedef struct MangoLoadedLibrary {
   uint32_t heap_used;
   uint32_t guest_errno_addr;
   uint32_t page_size_addr;
+  uint32_t ctype_addr;       /* pointer cell → bionic _ctype_ table */
+  uint32_t tolower_tab_addr; /* pointer cell → _tolower_tab_ */
+  uint32_t toupper_tab_addr; /* pointer cell → _toupper_tab_ */
+  uint32_t environ_addr;     /* pointer cell → char** environ (NULL-terminated) */
   uint32_t load_bias;
   uint32_t stub_addr;
   void* host_vm;
@@ -429,6 +442,10 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "SDL_SetVideoMode",
     "SDL_SetColorKey",
     "draw_text",
+    "getenv",
+    "stat",
+    "lstat",
+    "access",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -711,6 +728,109 @@ static int mango_host_resolve_path(MangoLoadedLibrary* lib, const char* path,
   return 0;
 }
 
+/* Map guest path → host path for stat/lstat/access (fopen search order, but
+ * existence via F_OK so write-only probes still resolve under asset root). */
+static int mango_host_map_path(MangoLoadedLibrary* lib, const char* path, char* out,
+                               size_t outsz) {
+  const char* root;
+  if (!path || !out || outsz == 0) {
+    return 0;
+  }
+  if (access(path, F_OK) == 0) {
+    snprintf(out, outsz, "%s", path);
+    return 1;
+  }
+  if (lib && lib->path[0] && strrchr(lib->path, '/')) {
+    const char* slash = strrchr(lib->path, '/');
+    int dlen = (int)(slash - lib->path);
+    snprintf(out, outsz, "%.*s/../gamedata/%s", dlen, lib->path, path);
+    if (access(out, F_OK) == 0) {
+      return 1;
+    }
+    snprintf(out, outsz, "%.*s/../%s", dlen, lib->path, path);
+    if (access(out, F_OK) == 0) {
+      return 1;
+    }
+  }
+  root = getenv("MANGO_ASSET_ROOT");
+  if (root && root[0]) {
+    snprintf(out, outsz, "%s/%s", root, path);
+    if (access(out, F_OK) == 0) {
+      return 1;
+    }
+  }
+  /* Fall back to as-is so host errno (ENOENT) is meaningful. */
+  snprintf(out, outsz, "%s", path);
+  return 1;
+}
+
+/* Pack host struct stat into bionic armeabi layout (96 bytes). */
+static void mango_store_bionic_stat(uint8_t* mem, uint32_t addr, const struct stat* st) {
+  memset(mem + addr, 0, 96);
+  /* st_dev u64 @0 */
+  {
+    uint64_t v = (uint64_t)st->st_dev;
+    memcpy(mem + addr + 0, &v, 8);
+  }
+  /* __st_ino u32 @12 */
+  {
+    uint32_t v = (uint32_t)st->st_ino;
+    memcpy(mem + addr + 12, &v, 4);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_mode;
+    memcpy(mem + addr + 16, &v, 4);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_nlink;
+    memcpy(mem + addr + 20, &v, 4);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_uid;
+    memcpy(mem + addr + 24, &v, 4);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_gid;
+    memcpy(mem + addr + 28, &v, 4);
+  }
+  {
+    uint64_t v = (uint64_t)st->st_rdev;
+    memcpy(mem + addr + 32, &v, 8);
+  }
+  {
+    int64_t v = (int64_t)st->st_size;
+    memcpy(mem + addr + 44, &v, 8);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_blksize;
+    memcpy(mem + addr + 52, &v, 4);
+  }
+  {
+    uint64_t v = (uint64_t)st->st_blocks;
+    memcpy(mem + addr + 56, &v, 8);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_atime;
+    memcpy(mem + addr + 64, &v, 4);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_mtime;
+    memcpy(mem + addr + 72, &v, 4);
+  }
+  {
+    uint32_t v = (uint32_t)st->st_ctime;
+    memcpy(mem + addr + 80, &v, 4);
+  }
+  {
+    uint64_t v = (uint64_t)st->st_ino;
+    memcpy(mem + addr + 88, &v, 8);
+  }
+}
+
+static void mango_set_guest_errno(MangoLoadedLibrary* lib, int err) {
+  mango_store_u32_guest(lib->guest_mem, lib->guest_errno_addr, (uint32_t)err);
+}
+
 #ifndef ANDROID
 /* Decode PNG via host libpng. Meritous assets are 8-bit grayscale → out_bpp=1;
  * other PNGs expand to RGBA8888 → out_bpp=4. */
@@ -982,6 +1102,132 @@ static void mango_write_jni_thunk(uint8_t* mem, uint32_t addr, uint32_t imm) {
   mango_store_u32_guest(mem, addr + 12u, 0xE1A00000u);
 }
 
+
+/* Bionic/BSD ctype class bits (Android <ctype.h>). Tcl indexes
+ * _ctype_[ch+1] and masks _ISspace=0x08 — never bind OBJECT imports to stub. */
+#define MANGO_CTYPE_U 0x01u
+#define MANGO_CTYPE_L 0x02u
+#define MANGO_CTYPE_N 0x04u
+#define MANGO_CTYPE_S 0x08u
+#define MANGO_CTYPE_P 0x10u
+#define MANGO_CTYPE_C 0x20u
+#define MANGO_CTYPE_X 0x40u
+#define MANGO_CTYPE_B 0x80u
+
+static uint8_t mango_ctype_class(int ch) {
+  if (ch < 0 || ch > 255) {
+    return 0;
+  }
+  if (ch == '\t' || ch == '\n' || ch == '\v' || ch == '\f' || ch == '\r') {
+    return (uint8_t)(MANGO_CTYPE_C | MANGO_CTYPE_S | (ch == '\t' ? MANGO_CTYPE_B : 0));
+  }
+  if (ch == ' ') {
+    return (uint8_t)(MANGO_CTYPE_S | MANGO_CTYPE_B);
+  }
+  if (ch >= '0' && ch <= '9') {
+    uint8_t x = (ch <= '9') ? MANGO_CTYPE_X : 0; /* digits are hex too for 0-9 */
+    (void)x;
+    return (uint8_t)(MANGO_CTYPE_N | MANGO_CTYPE_X);
+  }
+  if (ch >= 'A' && ch <= 'Z') {
+    uint8_t bits = (uint8_t)MANGO_CTYPE_U;
+    if ((ch >= 'A' && ch <= 'F')) {
+      bits = (uint8_t)(bits | MANGO_CTYPE_X);
+    }
+    return bits;
+  }
+  if (ch >= 'a' && ch <= 'z') {
+    uint8_t bits = (uint8_t)MANGO_CTYPE_L;
+    if ((ch >= 'a' && ch <= 'f')) {
+      bits = (uint8_t)(bits | MANGO_CTYPE_X);
+    }
+    return bits;
+  }
+  if (ch < 0x20 || ch == 0x7f) {
+    return (uint8_t)MANGO_CTYPE_C;
+  }
+  /* printable punctuation / symbol */
+  return (uint8_t)MANGO_CTYPE_P;
+}
+
+static void mango_init_ctype_tables(MangoLoadedLibrary* lib) {
+  uint8_t* mem = lib->guest_mem;
+  uint32_t base = lib->heap_base + lib->heap_used;
+  uint32_t ctype_tab;
+  uint32_t tolower_tab;
+  uint32_t toupper_tab;
+  uint32_t ctype_cell;
+  uint32_t tolower_cell;
+  uint32_t toupper_cell;
+  int c;
+
+  /* Classic 1+256 layout: index 0 = EOF slot; Tcl uses table[ch+1]. */
+  ctype_tab = base;
+  mem[ctype_tab + 0u] = 0;
+  for (c = 0; c < 256; c++) {
+    mem[ctype_tab + 1u + (uint32_t)c] = mango_ctype_class(c);
+  }
+  base = (ctype_tab + 257u + 3u) & ~3u;
+
+  tolower_tab = base;
+  mem[tolower_tab + 0u] = (uint8_t)0xff;
+  mem[tolower_tab + 1u] = (uint8_t)0xff; /* -1 as int16 LE */
+  for (c = 0; c < 256; c++) {
+    int16_t v = (int16_t)((c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c);
+    uint32_t off = tolower_tab + 2u + (uint32_t)c * 2u;
+    mem[off] = (uint8_t)(v & 0xff);
+    mem[off + 1u] = (uint8_t)((v >> 8) & 0xff);
+  }
+  base = (tolower_tab + 2u * 257u + 3u) & ~3u;
+
+  toupper_tab = base;
+  mem[toupper_tab + 0u] = (uint8_t)0xff;
+  mem[toupper_tab + 1u] = (uint8_t)0xff;
+  for (c = 0; c < 256; c++) {
+    int16_t v = (int16_t)((c >= 'a' && c <= 'z') ? (c - 'a' + 'A') : c);
+    uint32_t off = toupper_tab + 2u + (uint32_t)c * 2u;
+    mem[off] = (uint8_t)(v & 0xff);
+    mem[off + 1u] = (uint8_t)((v >> 8) & 0xff);
+  }
+  base = (toupper_tab + 2u * 257u + 3u) & ~3u;
+
+  /* BSD/bionic expose _ctype_ as a POINTER object (char *). GLOB_DAT binds
+   * GOT to that cell; guest does ldr/ldr to obtain the table base. Returning
+   * the table address itself made the second ldr read table bytes as a VA
+   * (0x20202000 from control-class 0x20 bytes). */
+  ctype_cell = base;
+  mango_store_u32_guest(mem, ctype_cell, ctype_tab);
+  tolower_cell = ctype_cell + 4u;
+  mango_store_u32_guest(mem, tolower_cell, tolower_tab);
+  toupper_cell = tolower_cell + 4u;
+  mango_store_u32_guest(mem, toupper_cell, toupper_tab);
+  base = toupper_cell + 4u;
+
+  lib->ctype_addr = ctype_cell;
+  lib->tolower_tab_addr = tolower_cell;
+  lib->toupper_tab_addr = toupper_cell;
+
+  /* environ: char ** — empty list (single NULL). TclSetupEnv walks it. */
+  {
+    uint32_t env_array = base;
+    mango_store_u32_guest(mem, env_array, 0); /* NULL terminator */
+    base = env_array + 4u;
+    lib->environ_addr = base;
+    mango_store_u32_guest(mem, lib->environ_addr, env_array);
+    base = lib->environ_addr + 4u;
+  }
+
+  lib->heap_used = base - lib->heap_base;
+
+  /* Sanity: space has _S bit; colon does not (Tcl list path separator walk). */
+  if ((mem[ctype_tab + 1u + (uint32_t)' '] & MANGO_CTYPE_S) == 0 ||
+      (mem[ctype_tab + 1u + (uint32_t)':'] & MANGO_CTYPE_S) != 0) {
+    fprintf(stderr, "mango: ctype table sanity failed space=%u colon=%u\n",
+            (unsigned)mem[ctype_tab + 1u + (uint32_t)' '],
+            (unsigned)mem[ctype_tab + 1u + (uint32_t)':']);
+  }
+}
+
 static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
   uint32_t base = MANGO_LIB_CAP;
   uint32_t vm_table = base + 4u;
@@ -1008,6 +1254,10 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
     lib->heap_used = first->heap_used;
     lib->guest_errno_addr = first->guest_errno_addr;
     lib->page_size_addr = first->page_size_addr;
+    lib->ctype_addr = first->ctype_addr;
+    lib->tolower_tab_addr = first->tolower_tab_addr;
+    lib->toupper_tab_addr = first->toupper_tab_addr;
+    lib->environ_addr = first->environ_addr;
     lib->stack_top = first->stack_top;
     lib->host_vm = first->host_vm;
     return 0;
@@ -1023,6 +1273,7 @@ static int mango_setup_guest_jni(MangoLoadedLibrary* lib) {
   lib->page_size_addr = heap + 8u;
   mango_store_u32_guest(mem, heap + 4u, 0xA5A5A5A5u);
   mango_store_u32_guest(mem, heap + 8u, 4096u); /* bionic __page_size */
+  mango_init_ctype_tables(lib); /* bump heap_used for _ctype_ / case tabs */
   lib->stack_top = need - 16u;
   lib->host_vm = NULL;
   mango_store_u32_guest(mem, base, vm_table);
@@ -1064,6 +1315,19 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
     /* Bionic data symbol; Boehm GC reads *(__page_size). Must not be the
      * mov-r0-#0 stub (that made GC_page_size=0xe3a00000 → Bad GET_MEM arg). */
     return lib->page_size_addr;
+  }
+  if (strcmp(name, "_ctype_") == 0) {
+    /* Pointer cell → table; never stub_addr (research/43). */
+    return lib->ctype_addr;
+  }
+  if (strcmp(name, "_tolower_tab_") == 0) {
+    return lib->tolower_tab_addr;
+  }
+  if (strcmp(name, "_toupper_tab_") == 0) {
+    return lib->toupper_tab_addr;
+  }
+  if (strcmp(name, "environ") == 0) {
+    return lib->environ_addr;
   }
   if (strcmp(name, "eglGetError") == 0) {
     name = "eglGetError";
@@ -2402,6 +2666,59 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     }
     case MANGO_LIBC_MIX_PLAYING: {
       cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_GETENV: {
+      const char* key = mango_guest_cstr(lib, r0);
+      const char* val = (key && key[0]) ? getenv(key) : NULL;
+      cpu->r[0] = val ? mango_guest_strdup(lib, val) : 0;
+      break;
+    }
+    case MANGO_LIBC_STAT:
+    case MANGO_LIBC_LSTAT: {
+      const char* path = mango_guest_cstr(lib, r0);
+      char host[768];
+      struct stat st;
+      int rc;
+      if (!path || !mango_guest_range_ok(lib, r1, 96u)) {
+        mango_set_guest_errno(lib, EFAULT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (!mango_host_map_path(lib, path, host, sizeof(host))) {
+        mango_set_guest_errno(lib, ENOENT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      rc = (fn == MANGO_LIBC_LSTAT) ? lstat(host, &st) : stat(host, &st);
+      if (rc != 0) {
+        mango_set_guest_errno(lib, errno);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      mango_store_bionic_stat(lib->guest_mem, r1, &st);
+      cpu->r[0] = 0;
+      break;
+    }
+    case MANGO_LIBC_ACCESS: {
+      const char* path = mango_guest_cstr(lib, r0);
+      char host[768];
+      int rc;
+      if (!path) {
+        mango_set_guest_errno(lib, EFAULT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      if (!mango_host_map_path(lib, path, host, sizeof(host))) {
+        mango_set_guest_errno(lib, ENOENT);
+        cpu->r[0] = (uint32_t)-1;
+        break;
+      }
+      rc = access(host, (int)r1);
+      if (rc != 0) {
+        mango_set_guest_errno(lib, errno);
+      }
+      cpu->r[0] = (uint32_t)rc;
       break;
     }
     default:
