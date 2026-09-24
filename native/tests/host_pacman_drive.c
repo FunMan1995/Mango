@@ -21,12 +21,14 @@ extern struct NativeBridgeCallbacks NativeBridgeItf;
 /*
  * Host Pacman drive — Test Lab local (PRIMARY lock research/46).
  * Flow: load libpacman.so → Java_* init(w,h,PngManager,AssetManager,StoreManager)
- * → a few step frames (optional actionDown/Move/Up) → capture stderr for first
- * mango: interp stop. Exit 1 if stop seen; 0 if clean.
+ * → step frames first (setMenu via STATE_AFTER_LOADING) → optional tap
+ * (MANGO_PACMAN_TAP=1) → more steps → capture stderr for first mango: interp stop.
+ * Exit 1 if stop seen; 0 if clean.
  *
  * Prefer libs/armeabi/libpacman.so.
  * Set MANGO_ASSET_ROOT to extracted assets/ (levels/textures/audio/shaders).
  * Frame count: MANGO_PACMAN_FRAMES (default 3).
+ * Tap after steps: MANGO_PACMAN_TAP=1 (default off — tap before setMenu faults).
  *
  * JNI shortys (dex; env/thiz omitted from shorty like LW):
  *   init VIILLL · step V · stop Z · free V · action{Down,Move,Up} VFF
@@ -199,22 +201,38 @@ int main(int argc, char** argv) {
   }
   fprintf(stderr, "mango_host_pacman_drive: MANGO_PACMAN_FRAMES=%d\n", nframes);
 
-  /* Optional: one tap near center before stepping (may help enter gameplay). */
-  if (action_down) {
-    fprintf(stderr, "mango_host_pacman_drive: calling actionDown(320,240)\n");
-    ((mango_action_fn)action_down)(env, thiz, 320.0f, 240.0f);
-    fprintf(stderr, "mango_host_pacman_drive: actionDown returned\n");
-  }
-  if (action_up) {
-    fprintf(stderr, "mango_host_pacman_drive: calling actionUp(320,240)\n");
-    ((mango_action_fn)action_up)(env, thiz, 320.0f, 240.0f);
-    fprintf(stderr, "mango_host_pacman_drive: actionUp returned\n");
-  }
-
+  /* Step first: Engine STATE_AFTER_LOADING → setMenu(mainMenu) on first step
+   * (research/51 MODE/RUNTIME). Tap before setMenu left currentMenu NULL and
+   * actionDown LDR'd ELF magic as vtable @ pc=0x1019c. */
   for (int frame = 0; frame < nframes; frame++) {
     fprintf(stderr, "mango_host_pacman_drive: calling step %d\n", frame);
     ((mango_void_fn)step)(env, thiz);
     fprintf(stderr, "mango_host_pacman_drive: step %d returned\n", frame);
+  }
+
+  /* Optional tap after steps once currentMenu is live (MANGO_PACMAN_TAP=1). */
+  const char* tap_env = getenv("MANGO_PACMAN_TAP");
+  int do_tap = tap_env && tap_env[0] == '1' && tap_env[1] == '\0';
+  fprintf(stderr, "mango_host_pacman_drive: MANGO_PACMAN_TAP=%s\n",
+          do_tap ? "1" : (tap_env && tap_env[0] ? tap_env : "0"));
+  if (do_tap) {
+    if (action_down) {
+      fprintf(stderr, "mango_host_pacman_drive: calling actionDown(320,240)\n");
+      ((mango_action_fn)action_down)(env, thiz, 320.0f, 240.0f);
+      fprintf(stderr, "mango_host_pacman_drive: actionDown returned\n");
+    }
+    if (action_up) {
+      fprintf(stderr, "mango_host_pacman_drive: calling actionUp(320,240)\n");
+      ((mango_action_fn)action_up)(env, thiz, 320.0f, 240.0f);
+      fprintf(stderr, "mango_host_pacman_drive: actionUp returned\n");
+    }
+    /* A few more frames after tap (mirror init → step×N → tap → more steps). */
+    int post = nframes > 0 ? nframes : 1;
+    for (int frame = 0; frame < post; frame++) {
+      fprintf(stderr, "mango_host_pacman_drive: calling post-tap step %d\n", frame);
+      ((mango_void_fn)step)(env, thiz);
+      fprintf(stderr, "mango_host_pacman_drive: post-tap step %d returned\n", frame);
+    }
   }
 
   if (stop) {
