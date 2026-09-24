@@ -624,6 +624,18 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
           break;
         }
 
+        case MANGO_OP_ORN: {
+          MangoOp2 op2 = mango_eval_operand2(cpu, addr, &insn);
+          uint32_t lhs = mango_read_reg(cpu, addr, insn.rn);
+          uint32_t result = lhs | ~op2.value;
+          mango_write_rd(cpu, insn.rd, result, stop_addr, &next_addr);
+          if (insn.sets_flags) {
+            mango_set_nzcv(cpu,
+                           mango_flags_for_logical(cpu->cpsr, result, op2.carry, op2.update_c));
+          }
+          break;
+        }
+
         case MANGO_OP_MVN: {
           MangoOp2 op2 = mango_eval_operand2(cpu, addr, &insn);
           uint32_t result = ~op2.value;

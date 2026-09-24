@@ -1875,8 +1875,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0r: MOV.W Rd,Rm{,shift} register — ORR with Rn=15, S=0.
    * Primary ea4f 7ad0 = mov.w sl,r0,lsr#31; sib ea4f 0847 lsl#1.
-   * Rn==15 only. ORR Rn≠15 is Q-OTTD-0aw. Do NOT open MOVS (EA5F)
-   * or MVN-reg (EA6F). Reject Rd/Rm=PC. */
+   * Rn==15 only. ORR Rn≠15 is Q-OTTD-0aw. Do NOT open MOVS (EA5F).
+   * MVN register is Q-OTTD-0bl (EA6F). Reject Rd/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEA40u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) == 0 &&
       (hw2 & 0x8000u) == 0) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -1888,6 +1888,56 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     }
     out->op = MANGO_OP_MOV;
     out->rd = rd;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bl: MVN.W Rd,Rm{,shift} register — ORN with Rn=15, S=0.
+   * MD5 ea6f 0a02 = mvn.w r10,r2 (llvm-mc [6f,ea,02,0a]).
+   * ea6f 70d1 = mvn.w r0,r1,lsr #31. MVNS (EA7F) stays closed.
+   * ORN (Rn≠15) is Q-OTTD-0bm. Reject Rd/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA60u && (hw1 & 0xFu) == 0xFu && (hw1 & 0x10u) == 0 &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MVN;
+    out->rd = rd;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0bm: ORN.W Rd,Rn,Rm{,shift}, Rn≠15, S=0.
+   * MD5 ea63 0101 = orn r1,r3,r1 (llvm-mc [63,ea,01,01]).
+   * Rd = Rn | ~Rm. ORNS (EA7x, Rn≠15) stays closed. Rn=15 is MVN.
+   * Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA60u && (hw1 & 0xFu) != 0xFu && (hw1 & 0x10u) == 0 &&
+      (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_ORN;
+    out->rd = rd;
+    out->rn = rn;
     out->rm = rm;
     out->is_imm = 0;
     out->sets_flags = 0;
@@ -2666,6 +2716,38 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rn = rn;
     out->is_imm = 1;
     out->imm = imm8; /* byte offset, not shifted */
+    out->p = p;
+    out->u = u;
+    out->w = w;
+    return 0;
+  }
+
+  /* Q-OTTD-0bn: T32 LDRSH.W Rt,[Rn,#±imm8]!? T4 — F930 class, bit11=1.
+   * NWidget f934 ec04 = ldrsh.w lr,[r4,#-4] (P=1 U=0 W=0). Sibling
+   * f934 3c04 = ldrsh.w r3,[r4,#-4]. Mirror 0ab LDRH imm8; reuse
+   * MANGO_OP_LDRSH (sign-extend). Distinct from F9B0 imm12. Reject
+   * LDRSHT (P=0 W=0), Rt/Rn=PC, and writeback into Rt. */
+  if ((hw1 & 0xFFF0u) == 0xF930u && (hw2 & 0x0800u) != 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw2 >> 10) & 1u);
+    int u = (int)((hw2 >> 9) & 1u);
+    int w = (int)((hw2 >> 8) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* LDRSHT */
+    }
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (w && rt == rn) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDRSH;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm8;
     out->p = p;
     out->u = u;
     out->w = w;
