@@ -2175,11 +2175,10 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
-  /* Q-OTTD-0q: BIC.W Rd,Rn,#<const> modified-imm (op=0001, S=0).
-   * Primary f026 0603 = bic.w r6,r6,#3; sibling f026 060f = bic.w r6,r6,#15;
-   * drive f027 071f = bic.w r7,r7,#31. Do not open BICS (S=1) / BIC register this bite.
-   * Reject Rd=PC / Rn=PC. */
-  if ((hw1 & 0xFBE0u) == 0xF020u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+  /* Q-OTTD-0q / 0bu: BIC/BICS.W Rd,Rn,#<const> modified-imm.
+   * S=0 f026 0603 = bic.w r6,r6,#3. S=1 f03a 0302 = bics r3,r10,#2.
+   * S is hw1 bit 4. BIC register is 0au. Reject Rd=PC / Rn=PC. */
+  if ((hw1 & 0xFBE0u) == 0xF020u && (hw2 & 0x8000u) == 0) {
     uint32_t i = (hw1 >> 10) & 1u;
     uint32_t rn = hw1 & 0xFu;
     uint32_t imm3 = (hw2 >> 12) & 7u;
@@ -2197,7 +2196,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rd = rd;
     out->rn = rn;
     out->is_imm = 1;
-    out->sets_flags = 0;
+    out->sets_flags = (int)((hw1 >> 4) & 1u);
     out->imm = imm;
     out->shift_amount = 0;
     return 0;
@@ -2206,7 +2205,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0au: BIC/BICS.W register with a shifted Rm.
    * OpenTTD ea37 0720 = bics.w r7,r7,r0,asr #32 (llvm-mc [37,ea,20,07]).
    * imm2:imm3 of 0 with type ASR is ASR #32 (sign fill). S from hw1 bit 4.
-   * Immediate BICS (f036) stays closed. Reject Rd/Rn/Rm=PC. */
+   * Immediate BICS is Q-OTTD-0bu. Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEA20u && (hw2 & 0x8000u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;

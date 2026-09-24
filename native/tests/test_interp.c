@@ -4342,8 +4342,11 @@ static int test_t32_bics_w_asr32(void) {
             di.op, di.rd, di.rn, di.rm, di.sets_flags, di.shift_type, di.shift_amount);
     return 1;
   }
-  if (mango_decode_t32(0xF036u, 0x0603u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_bics_asr32): immediate BICS decoded\n");
+  /* f036 0603 = bics.w r6,r6,#3 is Q-OTTD-0bu */
+  if (mango_decode_t32(0xF036u, 0x0603u, &di) != 0 || di.op != MANGO_OP_BIC || di.is_imm != 1 ||
+      di.sets_flags != 1 || di.imm != 3u) {
+    fprintf(stderr, "FAIL(t32_bics_asr32): immediate BICS op=%d s=%d imm=%u\n", di.op, di.sets_flags,
+            di.imm);
     return 1;
   }
   if (mango_decode_t32(0xEA3Fu, 0x0720u, &di) == 0) {
@@ -8728,11 +8731,13 @@ static int test_t32_bic_w_modimm_15(void) {
 }
 
 static int test_t32_bic_w_modimm_reject(void) {
-  /* BICS S=1, Rd/Rn=PC, ORN contrasts, LDR.W reg LSL#2; AND cleared by 0ac. */
+  /* Rd/Rn=PC, ORN contrasts, LDR.W reg LSL#2; AND cleared by 0ac.
+   * Immediate BICS is Q-OTTD-0bu. */
   MangoInsn di;
-  /* f036 0603 = bics.w r6,r6,#3 — S=1 out of minimal */
-  if (mango_decode_t32(0xF036u, 0x0603u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_bic_w_reject): BICS f0360603 decoded as op=%d\n", di.op);
+  if (mango_decode_t32(0xF036u, 0x0603u, &di) != 0 || di.op != MANGO_OP_BIC || di.sets_flags != 1 ||
+      di.imm != 3u) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): BICS f0360603 op=%d s=%d imm=%u\n", di.op,
+            di.sets_flags, di.imm);
     return 1;
   }
   /* f02f 0603 = bic.w r6,pc,#3 — Rn=PC */
@@ -8774,11 +8779,57 @@ static int test_t32_bic_w_modimm_reject(void) {
     fprintf(stderr, "FAIL(t32_bic_w_reject): LDR.W reg f8555021 want LDR sh=2\n");
     return 1;
   }
-  printf("ok: T32 BIC.W reject BICS/PC/ORN; AND cleared by 0ac; A32 BIC+DMB ok (Q-OTTD-0q)\n");
+  printf("ok: T32 BIC.W reject PC/ORN; BICS imm is 0bu; AND cleared by 0ac; A32 BIC+DMB ok (Q-OTTD-0q)\n");
   return 0;
 }
 
 
+
+static int test_t32_bics_w_imm2(void) {
+  /* Q-OTTD-0bu: bics r3, r10, #2 = f03a 0302. r3 = r10 & ~2. NZ update,
+   * C/V hold for an unrotated immediate. r10 unchanged. */
+  static const uint16_t kProg[] = {0xF03Au, 0x0302u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xF03Au, 0x0302u, &di) != 0 || di.op != MANGO_OP_BIC || di.rd != 3 ||
+      di.rn != 10 || di.is_imm != 1 || di.sets_flags != 1 || di.imm != 2u) {
+    fprintf(stderr, "FAIL(t32_bics_imm2): decode op=%d rd=%u rn=%u s=%d imm=%u\n", di.op, di.rd,
+            di.rn, di.sets_flags, di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xF02Au, 0x0302u, &di) != 0 || di.sets_flags != 0 || di.imm != 2u) {
+    fprintf(stderr, "FAIL(t32_bics_imm2): S=0 bic.w s=%d imm=%u\n", di.sets_flags, di.imm);
+    return 1;
+  }
+
+  struct {
+    uint32_t rn, want, cpsr_in, nzcv;
+  } cases[] = {
+      {7u, 5u, MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V, MANGO_CPSR_C | MANGO_CPSR_V},
+      {2u, 0u, MANGO_CPSR_T | MANGO_CPSR_C, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0x80000002u, 0x80000000u, MANGO_CPSR_T, MANGO_CPSR_N},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = cases[c].cpsr_in;
+    cpu.r[10] = cases[c].rn;
+    cpu.r[3] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[3] != cases[c].want || cpu.r[10] != cases[c].rn ||
+        nzcv != cases[c].nzcv || (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr, "FAIL(t32_bics_imm2#%u): rc=%d r3=%x want %x nzcv=%x want %x\n", c, rc,
+              cpu.r[3], cases[c].want, nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+  printf("ok: T32 BICS r3, r10, #2 (Q-OTTD-0bu)\n");
+  return 0;
+}
 
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
@@ -11111,6 +11162,7 @@ int main(void) {
   failures += test_t32_bic_w_modimm_3();
   failures += test_t32_bic_w_modimm_15();
   failures += test_t32_bic_w_modimm_reject();
+  failures += test_t32_bics_w_imm2();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
