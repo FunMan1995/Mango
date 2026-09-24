@@ -3335,6 +3335,99 @@ static int test_t32_tst_w_imm1(void) {
   return 0;
 }
 
+static int test_t16_rev16(void) {
+  /* Q-OTTD-0aq: rev16 r1,r1 = ba49. Swap bytes in each halfword.
+   * 0x12345678 → 0x34127856. NZCV unchanged. REV and REVSH share the group. */
+  static const uint16_t kProg[] = {0xBA49u, 0x4770u};
+  uint8_t mem_buf[16];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+  MangoInsn di;
+  if (mango_decode_t16(0xBA49u, &di) != 0 || di.op != MANGO_OP_REV || di.rd != 1 || di.rm != 1 ||
+      di.imm != 1) {
+    fprintf(stderr, "FAIL(t16_rev16): decode op=%d rd=%u rm=%u imm=%u\n", di.op, di.rd, di.rm,
+            di.imm);
+    return 1;
+  }
+  if (mango_decode_t16(0xBA09u, &di) != 0 || di.imm != 0 || mango_decode_t16(0xBAC9u, &di) != 0 ||
+      di.imm != 2) {
+    fprintf(stderr, "FAIL(t16_rev16): REV/REVSH decode\n");
+    return 1;
+  }
+  if (mango_decode_t16(0xBA89u, &di) == 0) {
+    fprintf(stderr, "FAIL(t16_rev16): bits[7:6]=10 decoded as op=%d\n", di.op);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[1] = 0x12345678u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[1] != 0x34127856u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t16_rev16): rc=%d r1=%x cpsr %x->%x\n", rc, cpu.r[1], cpsr_before,
+            cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T16 REV16 r1,r1 (Q-OTTD-0aq)\n");
+  return 0;
+}
+
+static int test_t32_bfi(void) {
+  /* Q-OTTD-0ar: bfi r0,r12,#16,#16 = f36c 401f. Insert r12[15:0] into r0[31:16].
+   * bfc r0,#16,#16 (Rn=15) clears those bits. NZCV unchanged. msb<lsb rejected. */
+  static const uint16_t kProg[] = {0xF36Cu, 0x401Fu, 0x4770u};
+  uint8_t mem_buf[16];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xF36Cu, 0x401Fu, &di) != 0 || di.op != MANGO_OP_BFI || di.rd != 0 ||
+      di.rm != 12 || di.imm != 16u || di.rs != 31u) {
+    fprintf(stderr, "FAIL(t32_bfi): decode op=%d rd=%u rm=%u lsb=%u msb=%u\n", di.op, di.rd, di.rm,
+            di.imm, di.rs);
+    return 1;
+  }
+  if (mango_decode_t32(0xF36Fu, 0x401Fu, &di) != 0 || di.op != MANGO_OP_BFC || di.imm != 16u) {
+    fprintf(stderr, "FAIL(t32_bfi): BFC decode op=%d\n", di.op);
+    return 1;
+  }
+  /* lsb=20 (imm3=5), msb=16: msb<lsb */
+  if (mango_decode_t32(0xF36Cu, 0x5010u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_bfi): msb<lsb decoded\n");
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0xAAAABBBBu;
+  cpu.r[12] = 0x0000CCCCu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[0] != 0xCCCCBBBBu || cpu.r[12] != 0x0000CCCCu || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_bfi): rc=%d r0=%x r12=%x cpsr %x->%x\n", rc, cpu.r[0], cpu.r[12],
+            cpsr_before, cpu.cpsr);
+    return 1;
+  }
+
+  static const uint16_t kBfc[] = {0xF36Fu, 0x401Fu, 0x4770u};
+  load_halfwords(mem_buf, sizeof(mem_buf), kBfc, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  cpu.r[0] = 0xAAAABBBBu;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[0] != 0x0000BBBBu) {
+    fprintf(stderr, "FAIL(t32_bfc): rc=%d r0=%x\n", rc, cpu.r[0]);
+    return 1;
+  }
+  printf("ok: T32 BFI r0,r12,#16,#16 and BFC (Q-OTTD-0ar)\n");
+  return 0;
+}
+
 static int test_t32_rsb_w_imm1(void) {
   /* Q-OTTD-0am: rsb.w r4,r0,#1 = f1c0 0401. r4 = 1 - r0; NZCV unchanged.
    * RSBS f1d0 0401 and Rd/Rn=PC stay closed. */
@@ -9504,6 +9597,8 @@ int main(void) {
   failures += test_t32_orr_w_imm1();
   failures += test_t32_eor_w_imm1();
   failures += test_t32_tst_w_imm1();
+  failures += test_t16_rev16();
+  failures += test_t32_bfi();
   failures += test_t32_rsb_w_imm1();
   failures += test_t32_tbb_pc();
   failures += test_t32_mov_w_modimm_0();

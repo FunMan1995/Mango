@@ -1561,6 +1561,17 @@ int mango_decode_t16(uint16_t hw, MangoInsn* out) {
       out->sets_flags = 0;
       return 0;
     }
+    /* Q-OTTD-0aq: T16 REV/REV16/REVSH. OpenTTD ba49 = rev16 r1,r1.
+     * bits[7:6]: 00=REV, 01=REV16, 11=REVSH. 10 is not a reverse.
+     * Reuse MANGO_OP_REV (imm 0/1/2). Low registers only. */
+    if ((hw & 0xFF00u) == 0xBA00u && ((hw >> 6) & 3u) != 2u) {
+      uint32_t kind = (hw >> 6) & 3u;
+      out->op = MANGO_OP_REV;
+      out->rd = hw & 7u;
+      out->rm = (hw >> 3) & 7u;
+      out->imm = (kind == 3u) ? 2u : kind;
+      return 0;
+    }
     return -1;
   }
 
@@ -2753,6 +2764,25 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * A32 F57FF05x/04x/06x/01F already NOP. Execute is existing NOP (pc+=4). */
   if (hw1 == 0xF3BFu && (hw2 & 0xFFF0u) == 0x8F50u) {
     out->op = MANGO_OP_NOP;
+    return 0;
+  }
+
+  /* Q-OTTD-0ar: T32 BFI/BFC. OpenTTD f36c 401f = bfi r0,r12,#16,#16
+   * (llvm-mc [6c,f3,1f,40]). lsb=imm3:imm2, msb=hw2[4:0], width=msb-lsb+1.
+   * Rn=15 is BFC. Reuse MANGO_OP_BFI (rm=source). Reject Rd=PC and msb<lsb. */
+  if ((hw1 & 0xFFF0u) == 0xF360u && (hw2 & 0x8020u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t lsb = (((hw2 >> 12) & 7u) << 2) | ((hw2 >> 6) & 3u);
+    uint32_t msb = hw2 & 0x1Fu;
+    if (rd == MANGO_REG_PC || msb < lsb) {
+      return -1;
+    }
+    out->op = (rn == MANGO_REG_PC) ? MANGO_OP_BFC : MANGO_OP_BFI;
+    out->rd = rd;
+    out->rm = rn;
+    out->imm = lsb;
+    out->rs = msb;
     return 0;
   }
 
