@@ -1863,6 +1863,33 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0am: RSB.W Rd,Rn,#<const> modified-imm (S=0).
+   * OpenTTD f1c0 0401 = rsb.w r4,r0,#1 (llvm-mc [c0,f1,01,04]).
+   * Rd = imm - Rn. RSBS (S=1, f1d0) stays closed. Reject Rd/Rn=PC. */
+  if ((hw1 & 0xFBE0u) == 0xF1C0u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t i = (hw1 >> 10) & 1u;
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+    uint32_t imm = 0;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (mango_thumb_expand_imm(imm12, &imm) != 0) {
+      return -1;
+    }
+    out->op = MANGO_OP_RSB;
+    out->rd = rd;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->sets_flags = 0;
+    out->imm = imm;
+    out->shift_amount = 0;
+    return 0;
+  }
+
 
   /* Q-OTTD-0f: MVN.W Rd,#<const> modified-imm (op=0011, Rn=15, S=0).
    * Guest f46f 5207 = mvn.w r2,#0x21c0 (ThumbExpandImm(0xD07)=0x21C0; NOT #0x87000 /
