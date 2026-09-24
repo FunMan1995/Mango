@@ -3081,6 +3081,66 @@ static int test_t32_ldr_w_pc_post(void) {
   return 0;
 }
 
+static int test_t32_vmov_s15_r0(void) {
+  /* Q-OTTD-0bs: vmov s15, r0 = ee07 0a90. Copies the GPR bit pattern.
+   * Reverse ee17 0a90 is vmov r0, s15. The following guest words
+   * vcvt.f32.u32 s15, s15 and vstr s15, [r4] already decode. */
+  static const uint16_t kToS[] = {0xEE07u, 0x0A90u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kToS, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xEE07u, 0x0A90u, &di) != 0 || di.op != MANGO_OP_VMOV || di.u != 4 ||
+      di.rd != 15 || di.rn != 0 || di.b != 0) {
+    fprintf(stderr, "FAIL(t32_vmov_s15): decode op=%d u=%d rd=%u rn=%u b=%d\n", di.op, di.u,
+            di.rd, di.rn, di.b);
+    return 1;
+  }
+  if (mango_decode_t32(0xEE17u, 0x0A90u, &di) != 0 || di.op != MANGO_OP_VMOV || di.b != 1 ||
+      di.rd != 15 || di.rn != 0) {
+    fprintf(stderr, "FAIL(t32_vmov_s15 rev): op=%d b=%d rd=%u rn=%u\n", di.op, di.b, di.rd, di.rn);
+    return 1;
+  }
+  if (mango_decode_t32(0xEEF8u, 0x7A67u, &di) != 0 || di.op != MANGO_OP_VCVT || di.rd != 15 ||
+      di.rn != 15 || di.imm != 9) {
+    fprintf(stderr, "FAIL(t32_vmov_s15): vcvt op=%d rd=%u rn=%u imm=%u\n", di.op, di.rd, di.rn,
+            di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xEDC4u, 0x7A00u, &di) != 0 || di.op != MANGO_OP_VSTR || di.rd != 15) {
+    fprintf(stderr, "FAIL(t32_vmov_s15): vstr op=%d rd=%u\n", di.op, di.rd);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0x3f800000u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.s[15] != 0x3f800000u || cpu.r[0] != 0x3f800000u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_vmov_s15): rc=%d s15=%x r0=%x cpsr %x->%x\n", rc, cpu.s[15],
+            cpu.r[0], cpsr_before, cpu.cpsr);
+    return 1;
+  }
+
+  static const uint16_t kToR[] = {0xEE17u, 0x0A90u, 0x4770u};
+  load_halfwords(mem_buf, sizeof(mem_buf), kToR, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = cpsr_before;
+  cpu.s[15] = 0x40000000u;
+  cpu.r[0] = 0;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[0] != 0x40000000u || cpu.s[15] != 0x40000000u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_vmov_s15 rev run): rc=%d r0=%x s15=%x\n", rc, cpu.r[0], cpu.s[15]);
+    return 1;
+  }
+  printf("ok: T32 VMOV s15, r0 (Q-OTTD-0bs)\n");
+  return 0;
+}
+
 static int test_t32_smull(void) {
   /* Q-OTTD-0bd: smull r8,r9,r12,r0 = fb8c 8900. r9:r8 = r12 * r0, signed.
    * Flags hold. Sibling fb87 8900 is smull r8,r9,r7,r0. */
@@ -10893,6 +10953,7 @@ int main(void) {
   failures += test_t32_mla();
   failures += test_t32_mls();
   failures += test_t32_ldr_w_pc_post();
+  failures += test_t32_vmov_s15_r0();
   failures += test_t32_smull();
   failures += test_t32_umull();
   failures += test_t32_smulbb();

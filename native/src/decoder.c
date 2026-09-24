@@ -3313,5 +3313,12 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Thumb coprocessor encodings (VFP/NEON) match the ARM instruction word
+   * with cond=AL. hw1 is the high halfword. 1110 11xx only — LDM/STM
+   * (1110 10xx) stay on the T32 paths above. */
+  if ((hw1 & 0xFC00u) == 0xEC00u) {
+    return mango_decode(((uint32_t)hw1 << 16) | hw2, out);
+  }
+
   return -1;
 }
