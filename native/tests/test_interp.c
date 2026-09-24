@@ -2992,6 +2992,170 @@ static int test_t32_pop_w_ldmia_sp_reject(void) {
   return 0;
 }
 
+static int test_t32_ldmia_lr_wb(void) {
+  /* Q-OTTD-0ah: OpenTTD e8be 000f = ldmia.w lr!, {r0-r3}.
+   * llvm-objdump: ldm.w lr!, {r0, r1, r2, r3}. Load four words at LR,
+   * then LR += 16. LR itself is not in the list. NZCV hold. */
+  static const uint16_t kProg[] = {0xE8BEu, 0x000Fu, 0x4770u};
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xE8BEu, 0x000Fu, &di) != 0 || di.op != MANGO_OP_LDM ||
+      di.rn != MANGO_REG_LR || di.p != 0 || di.u != 1 || di.w != 1 || di.reglist != 0x000Fu) {
+    fprintf(stderr, "FAIL(t32_ldmia_lr): decode op=%d rn=%u p=%d u=%d w=%d list=0x%x\n", di.op,
+            di.rn, di.p, di.u, di.w, di.reglist);
+    return 1;
+  }
+  /* Rn=PC with W (e8bf) and ldmia.w r2!, {r2}. W=0 e89e is the next OpenTTD word. */
+  if (mango_decode_t32(0xE8BFu, 0x000Fu, &di) == 0 || mango_decode_t32(0xE8B2u, 0x0004u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldmia_lr): PC base or WB-into-Rn decoded\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xE89Eu, 0x000Fu, &di) != 0 || di.op != MANGO_OP_LDM || di.rn != MANGO_REG_LR ||
+      di.w != 0 || di.reglist != 0x000Fu) {
+    fprintf(stderr, "FAIL(t32_ldmia_lr): W=0 e89e 000f want LDM lr w=0\n");
+    return 1;
+  }
+
+  uint32_t base = 0x40u;
+  u32_to_bytes_le(mem_buf + base + 0u, 0x11111111u);
+  u32_to_bytes_le(mem_buf + base + 4u, 0x22222222u);
+  u32_to_bytes_le(mem_buf + base + 8u, 0x33333333u);
+  u32_to_bytes_le(mem_buf + base + 12u, 0x44444444u);
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[MANGO_REG_LR] = base;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  /* Stop at the following bx (addr 4). Writeback makes LR even, so an odd
+   * sentinel in LR would not match the halt before that bx. */
+  int rc = mango_interp_run(&cpu, &mem, 4u, 10);
+  if (rc != 0 || cpu.r[0] != 0x11111111u || cpu.r[1] != 0x22222222u || cpu.r[2] != 0x33333333u ||
+      cpu.r[3] != 0x44444444u || cpu.r[MANGO_REG_LR] != base + 16u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_ldmia_lr): rc=%d r0=%x r1=%x r2=%x r3=%x lr=%x cpsr %x->%x\n", rc,
+            cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[MANGO_REG_LR], cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  /* W=0 sibling: e89e 000f loads the same words and leaves LR alone. */
+  static const uint16_t kNoWb[] = {0xE89Eu, 0x000Fu, 0x4770u};
+  memset(&cpu, 0, sizeof(cpu));
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kNoWb, 3);
+  u32_to_bytes_le(mem_buf + base + 0u, 0x11111111u);
+  u32_to_bytes_le(mem_buf + base + 4u, 0x22222222u);
+  u32_to_bytes_le(mem_buf + base + 8u, 0x33333333u);
+  u32_to_bytes_le(mem_buf + base + 12u, 0x44444444u);
+  cpu.cpsr = cpsr_before;
+  cpu.r[MANGO_REG_LR] = base;
+  rc = mango_interp_run(&cpu, &mem, 4u, 10);
+  if (rc != 0 || cpu.r[0] != 0x11111111u || cpu.r[MANGO_REG_LR] != base) {
+    fprintf(stderr, "FAIL(t32_ldmia_lr): W=0 rc=%d r0=%x lr=%x\n", rc, cpu.r[0],
+            cpu.r[MANGO_REG_LR]);
+    return 1;
+  }
+  printf("ok: T32 LDMIA.W lr! and lr, {r0-r3} (Q-OTTD-0ah)\n");
+  return 0;
+}
+
+static int test_t32_stmia_r12_wb(void) {
+  /* Q-OTTD-0ai: OpenTTD e8ac 000f = stmia.w r12!, {r0-r3}.
+   * llvm-mc encoding [ac,e8,0f,00]. Store r0..r3 at r12, then r12 += 16.
+   * r12 is not in the list. NZCV hold. */
+  static const uint16_t kProg[] = {0xE8ACu, 0x000Fu, 0x4770u};
+  uint8_t mem_buf[128];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xE8ACu, 0x000Fu, &di) != 0 || di.op != MANGO_OP_STM || di.rn != 12 ||
+      di.p != 0 || di.u != 1 || di.w != 1 || di.reglist != 0x000Fu) {
+    fprintf(stderr, "FAIL(t32_stmia_r12): decode op=%d rn=%u p=%d u=%d w=%d list=0x%x\n", di.op,
+            di.rn, di.p, di.u, di.w, di.reglist);
+    return 1;
+  }
+  if (mango_decode_t32(0xE8AFu, 0x000Fu, &di) == 0 || mango_decode_t32(0xE8A2u, 0x0004u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_stmia_r12): PC base or WB-into-Rn decoded\n");
+    return 1;
+  }
+
+  uint32_t base = 0x40u;
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[12] = base;
+  cpu.r[0] = 0x3u;
+  cpu.r[1] = 0x4u;
+  cpu.r[2] = 0x7u;
+  cpu.r[3] = 0x8u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[12] != base + 16u || cpu.cpsr != cpsr_before ||
+      bytes_to_u32_le(mem_buf + base) != 0x3u || bytes_to_u32_le(mem_buf + base + 4u) != 0x4u ||
+      bytes_to_u32_le(mem_buf + base + 8u) != 0x7u ||
+      bytes_to_u32_le(mem_buf + base + 12u) != 0x8u) {
+    fprintf(stderr, "FAIL(t32_stmia_r12): rc=%d r12=%x m=%x %x %x %x cpsr %x->%x\n", rc, cpu.r[12],
+            bytes_to_u32_le(mem_buf + base), bytes_to_u32_le(mem_buf + base + 4u),
+            bytes_to_u32_le(mem_buf + base + 8u), bytes_to_u32_le(mem_buf + base + 12u),
+            cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 STMIA.W r12!, {r0-r3} (Q-OTTD-0ai)\n");
+  return 0;
+}
+
+static int test_t32_ldrsb_w_imm12(void) {
+  /* Q-OTTD-0aj: ldrsb.w r3,[r2] = f992 3000. Sign-extend the byte at r2.
+   * llvm-objdump: ldrsb.w r3, [r2]. NZCV hold. Rt/Rn=PC uncover. */
+  static const uint16_t kProg[] = {0xF992u, 0x3000u, 0x4770u};
+  uint8_t mem_buf[64];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF992u, 0x3000u, &di) != 0 || di.op != MANGO_OP_LDRSB || di.rd != 3 ||
+      di.rn != 2 || di.is_imm != 1 || di.imm != 0 || di.p != 1 || di.u != 1 || di.w != 0) {
+    fprintf(stderr, "FAIL(t32_ldrsb_w): decode op=%d rd=%u rn=%u imm=%u\n", di.op, di.rd, di.rn,
+            di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xF99Fu, 0x3000u, &di) == 0 || mango_decode_t32(0xF992u, 0xF000u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrsb_w): PC operand decoded\n");
+    return 1;
+  }
+
+  mem_buf[32] = 0x80;
+  mem_buf[36] = 0x7f;
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[2] = 32u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[3] != 0xffffff80u || cpu.r[2] != 32u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_ldrsb_w): neg rc=%d r3=%x r2=%x cpsr %x->%x\n", rc, cpu.r[3],
+            cpu.r[2], cpsr_before, cpu.cpsr);
+    return 1;
+  }
+  cpu.r[MANGO_REG_PC] = 0;
+  cpu.r[2] = 36u;
+  cpu.r[3] = 0;
+  rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[3] != 0x7fu) {
+    fprintf(stderr, "FAIL(t32_ldrsb_w): pos rc=%d r3=%x\n", rc, cpu.r[3]);
+    return 1;
+  }
+  printf("ok: T32 LDRSB.W r3,[r2] imm12 (Q-OTTD-0aj)\n");
+  return 0;
+}
+
 
 static int test_t32_mov_w_modimm_0(void) {
   /* Q-OTTD-0d: mov.w r8,#0 = f04f 0800. S=0 leaves NZCV. */
@@ -6135,10 +6299,10 @@ static int test_t32_ubfx(void) {
 static int test_t32_stmia_ubfx_reject(void) {
   /* Optional negatives: W=1 STMIA; PC in STM list; UBFX PC Rd/Rn; SBFX uncover. */
   MangoInsn di;
-  /* e8a0 002c = stmia.w r0!, {r2,r3,r5} — W=1 out of this bite */
-  if (mango_decode_t32(0xE8A0u, 0x002Cu, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_stmia_ubfx_reject): W=1 e8a0002c decoded as op=%d w=%d\n", di.op,
-            di.w);
+  /* Q-OTTD-0ai: e8a0 002c = stmia.w r0!, {r2,r3,r5} now tip */
+  if (mango_decode_t32(0xE8A0u, 0x002Cu, &di) != 0 || di.op != MANGO_OP_STM || di.rn != 0 ||
+      di.w != 1 || di.reglist != 0x002Cu) {
+    fprintf(stderr, "FAIL(t32_stmia_ubfx_reject): W=1 e8a0002c want STM w=1\n");
     return 1;
   }
   /* e880 8000 = STMIA with PC in list */
@@ -6163,7 +6327,7 @@ static int test_t32_stmia_ubfx_reject(void) {
     return 1;
   }
   /* f85d 4b04 post-index cleared by Q-OTTD-0m — no longer reject here */
-  printf("ok: T32 STMIA W=1 / UBFX PC / SBFX reject (Q-OTTD-0j)\n");
+  printf("ok: T32 STMIA W=1 tip; UBFX PC / SBFX / STM-PC reject (Q-OTTD-0j/0ai)\n");
   return 0;
 }
 
@@ -9011,6 +9175,9 @@ int main(void) {
   failures += test_t32_pop_w_ldmia_sp();
   failures += test_t32_pop_w_ldmia_sp_sib();
   failures += test_t32_pop_w_ldmia_sp_reject();
+  failures += test_t32_ldmia_lr_wb();
+  failures += test_t32_stmia_r12_wb();
+  failures += test_t32_ldrsb_w_imm12();
   failures += test_t32_mov_w_modimm_0();
   failures += test_t32_mov_w_modimm_25();
   failures += test_t32_sub_w_modimm_sp();

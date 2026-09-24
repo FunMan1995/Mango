@@ -2079,6 +2079,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0aj: T32 LDRSB.W Rt,[Rn,#imm12] T1 — F990 class.
+   * OpenTTD f992 3000 = ldrsb.w r3,[r2] (imm12=0). Mirror 0g LDRSH (F9B0).
+   * Reuse MANGO_OP_LDRSB (byte sign-extend). Reject Rt/Rn=PC. Not the
+   * register form (F910 bit11=0) and not writeback. */
+  if ((hw1 & 0xFFF0u) == 0xF990u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm12 = hw2 & 0xFFFu;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDRSB;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm12;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0s / widen 0g-str: T32 STR.W Rt,[Rn,#±imm8]!? T4 — bit11=1 P/U/W.
    * Guest f840 1f0c = str.w r1,[r0,#12]! (P=1 U=1 W=1). Also covers tip 0g
    * f849 6c3c / f840 1c0c (P=1 U=0 W=0), post 1b0c, neg WB 1d0c.
@@ -2476,12 +2498,18 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   }
 
 
-  /* Q-OTTD-0j: T32 STMIA Rn,{reglist} W=0 — guest e880 002c.
-   * Reuse MANGO_OP_STM (p=0 u=1 w=0). Not W=1 (e8a0) or STMDB non-SP. */
-  if ((hw1 & 0xFFD0u) == 0xE880u && (hw1 & 0x0020u) == 0 && (hw2 & 0x8000u) == 0) {
+  /* Q-OTTD-0j / 0ai: T32 STMIA Rn{!} — W=0 guest e880 002c, W=1 OpenTTD
+   * e8ac 000f = stmia.w r12!, {r0-r3} (llvm-mc [ac,e8,0f,00]). Reuse
+   * MANGO_OP_STM (p=0 u=1). Reject PC in the list, Rn=PC, empty list, and
+   * writeback with a non-SP Rn in the list. STMDB non-SP stays closed. */
+  if ((hw1 & 0xFFD0u) == 0xE880u && (hw2 & 0x8000u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t reglist = hw2 & 0x7FFFu;
+    int w = (hw1 & 0x0020u) != 0;
     if (rn == MANGO_REG_PC || reglist == 0) {
+      return -1;
+    }
+    if (w && (reglist & (1u << rn)) && rn != MANGO_REG_SP) {
       return -1;
     }
     out->op = MANGO_OP_STM;
@@ -2489,24 +2517,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->reglist = reglist;
     out->p = 0;
     out->u = 1;
-    out->w = 0;
+    out->w = w;
     return 0;
   }
 
-  /* Q-OTTD-0c: T32 LDMIA / POP.W SP! — hw1 E8BD form, Rn=SP, W=1, P(hw2)=0.
-   * Reuse MANGO_OP_LDM (p=0 u=1 w=1). PC-in-list is Q-OTTD-0i-pop sibling. */
-  if ((hw1 & 0xFFD0u) == 0xE890u && (hw1 & 0x0020u) != 0 && (hw1 & 0xFu) == MANGO_REG_SP &&
-      (hw2 & 0x8000u) == 0) {
+  /* Q-OTTD-0c / 0ah: T32 LDMIA Rn{!} without PC. POP.W is Rn=SP W=1
+   * (e8bd 4ff8). OpenTTD e8be 000f = ldmia.w lr!, {r0-r3}; the next word
+   * e89e 000f = ldmia.w lr, {r0-r3} (W=0). p=0 u=1. Reject empty list,
+   * Rn=PC, and writeback with a non-SP Rn in the list. SP-in-list stays
+   * allowed. PC-in-list is 0i-pop (SP only). */
+  if ((hw1 & 0xFFD0u) == 0xE890u && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
     uint32_t reglist = hw2 & 0x7FFFu; /* M<<14 | R[12:0]; PC forbidden here */
-    if (reglist == 0) {
-      return -1; /* empty list UNPRED */
+    int w = (hw1 & 0x0020u) != 0;
+    if (rn == MANGO_REG_PC || reglist == 0) {
+      return -1;
+    }
+    if (w && (reglist & (1u << rn)) && rn != MANGO_REG_SP) {
+      return -1; /* WB with Rn in the list is UNPRED except SP */
     }
     out->op = MANGO_OP_LDM;
-    out->rn = MANGO_REG_SP;
+    out->rn = rn;
     out->reglist = reglist;
     out->p = 0;
     out->u = 1;
-    out->w = 1;
+    out->w = w;
     return 0;
   }
 
