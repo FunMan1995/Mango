@@ -9242,12 +9242,78 @@ static int test_t32_ldrh_w_reg_lsl1(void) {
     return 1;
   }
   if (mango_decode_t32(0xF832u, 0xF014u, &di) == 0 || mango_decode_t32(0xF83Fu, 0x3014u, &di) == 0 ||
-      mango_decode_t32(0xF832u, 0x300Fu, &di) == 0 || mango_decode_t32(0xF832u, 0x3044u, &di) == 0 ||
-      mango_decode_t32(0xF932u, 0x3014u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_ldrh_w_reg): PC, stray shift, or LDRSH reg should stay closed\n");
+      mango_decode_t32(0xF832u, 0x300Fu, &di) == 0 || mango_decode_t32(0xF832u, 0x3044u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrh_w_reg): PC or stray shift should stay closed\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF932u, 0x3014u, &di) != 0 || di.op != MANGO_OP_LDRSH || di.is_imm != 0 ||
+      di.shift_amount != 1u) {
+    fprintf(stderr, "FAIL(t32_ldrh_w_reg): LDRSH reg f9323014 is Q-OTTD-0cs\n");
     return 1;
   }
   printf("ok: T32 LDRH.W r3, [r2, r4, lsl #1] (Q-OTTD-0by)\n");
+  return 0;
+}
+
+static int test_t32_ldrsh_w_reg(void) {
+  /* Q-OTTD-0cs: ldrsh.w r2, [r3, r1, lsl #2] = f933 2021
+   * (llvm-mc [33,f9,21,20]). Sign-extend the halfword. Rn and Rm hold.
+   * lsl #0 is f933 2001; lsl #1 is f933 2011; lsl #3 is f933 2031. */
+  struct {
+    uint16_t hw2;
+    uint32_t r1, shift, off, half, want;
+  } cases[] = {
+      {0x2021u, 1u, 2u, 4u, 0x8000u, 0xffff8000u},
+      {0x2001u, 5u, 0u, 5u, 0x00ffu, 0x000000ffu},
+      {0x2011u, 3u, 1u, 6u, 0xffffu, 0xffffffffu},
+      {0x2031u, 1u, 3u, 8u, 0x7fffu, 0x00007fffu},
+  };
+  uint32_t base = 64u;
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    uint8_t mem_buf[128];
+    uint16_t prog[3] = {0xF933u, cases[c].hw2, 0x4770u};
+    MangoInsn di;
+    memset(mem_buf, 0xA5, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), prog, 3);
+    if (mango_decode_t32(0xF933u, cases[c].hw2, &di) != 0 || di.op != MANGO_OP_LDRSH || di.rd != 2 ||
+        di.rn != 3 || di.rm != 1 || di.is_imm != 0 || di.shift_type != 0 ||
+        di.shift_amount != cases[c].shift || di.p != 1 || di.u != 1 || di.w != 0) {
+      fprintf(stderr, "FAIL(t32_ldrsh_w_reg#%u): decode op=%d rd=%u rn=%u rm=%u sh=%u\n", c, di.op,
+              di.rd, di.rn, di.rm, di.shift_amount);
+      return 1;
+    }
+    mem_buf[base + cases[c].off] = (uint8_t)(cases[c].half & 0xFFu);
+    mem_buf[base + cases[c].off + 1u] = (uint8_t)(cases[c].half >> 8);
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[3] = base;
+    cpu.r[1] = cases[c].r1;
+    cpu.r[2] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[2] != cases[c].want || cpu.r[3] != base || cpu.r[1] != cases[c].r1 ||
+        cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_ldrsh_w_reg#%u): rc=%d r2=%x want %x r3=%x r1=%x cpsr=%x\n", c, rc,
+              cpu.r[2], cases[c].want, cpu.r[3], cpu.r[1], cpu.cpsr);
+      return 1;
+    }
+  }
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF934u, 0xEC04u, &di) != 0 || di.op != MANGO_OP_LDRSH || di.is_imm != 1 ||
+      di.u != 0) {
+    fprintf(stderr, "FAIL(t32_ldrsh_w_reg): imm8 f934ec04 should stay LDRSH\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF933u, 0xF021u, &di) == 0 || mango_decode_t32(0xF93Fu, 0x2021u, &di) == 0 ||
+      mango_decode_t32(0xF933u, 0x202Fu, &di) == 0 || mango_decode_t32(0xF933u, 0x2041u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrsh_w_reg): PC or stray shift decoded\n");
+    return 1;
+  }
+  printf("ok: T32 LDRSH.W r2, [r3, r1, lsl #2] (Q-OTTD-0cs)\n");
   return 0;
 }
 
@@ -12357,6 +12423,7 @@ int main(void) {
   failures += test_t32_cmp_w_reg_lsl2();
   failures += test_t32_subs_w_reg_lsl4();
   failures += test_t32_ldrh_w_reg_lsl1();
+  failures += test_t32_ldrsh_w_reg();
   failures += test_t32_adc_w_reg();
   failures += test_t32_adc_w_imm();
   failures += test_t32_sbcs_w_imm0();

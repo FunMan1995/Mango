@@ -2992,7 +2992,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * ldrh.w r3, [r2, r4, lsl #1] (llvm-mc [32,f8,14,30]).
    * Mirror 0v STRH.W reg (F820) and 0m LDRB.W reg (F810).
    * Mutually exclusive with 0ab imm8 (bit11=1) and F8B0 imm12 (bit7=1).
-   * Reject Rt/Rn/Rm=PC. LDRSH register (F930, bit11=0) stays closed. */
+   * Reject Rt/Rn/Rm=PC. LDRSH register is Q-OTTD-0cs. */
   if ((hw1 & 0xFFF0u) == 0xF830u && (hw2 & 0x0FC0u) == 0) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
@@ -3043,6 +3043,32 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->p = p;
     out->u = u;
     out->w = w;
+    return 0;
+  }
+
+  /* Q-OTTD-0cs: T32 LDRSH.W Rt,[Rn,Rm,LSL#imm2] — F930, bits[11:6]=0.
+   * Guest f933 2021 = ldrsh.w r2, [r3, r1, lsl #2]
+   * (llvm-mc [33,f9,21,20]). Sign-extend the halfword. Mirror 0by
+   * LDRH register. Mutually exclusive with 0bn imm8 (bit11=1).
+   * Reject Rt/Rn/Rm=PC. LDRSHT stays the imm8 P=0 W=0 reject. */
+  if ((hw1 & 0xFFF0u) == 0xF930u && (hw2 & 0x0FC0u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm2 = (hw2 >> 4) & 3u;
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDRSH;
+    out->rd = rt;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->shift_type = 0; /* LSL */
+    out->shift_amount = imm2;
+    out->p = 1;
+    out->u = 1;
+    out->w = 0;
     return 0;
   }
 
