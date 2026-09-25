@@ -2164,10 +2164,170 @@ static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n) {
 /* File-backed mmap lives after the heap reservation. Anonymous GC maps
  * stay in the heap (see MANGO_LIBC_MMAP). */
 static uint32_t g_filemap_next;
-/* Most recent bump allocation, so free can rewind that one block. */
-static uint32_t g_bump_last;
-static uint32_t g_bump_last_n;
+/* malloc/calloc/realloc blocks carry an 8-byte header so free can
+ * reuse them. The tail block still rewinds the bump cursor. */
+#define MANGO_ALLOC_HDR 8u
+#define MANGO_HOLE_MAX 1024
+typedef struct MangoHole {
+  uint32_t addr;
+  uint32_t size;
+} MangoHole;
+static MangoHole g_holes[MANGO_HOLE_MAX];
+static int g_nholes;
+static uint32_t g_bump_last;      /* user pointer of the live bump tail */
+static uint32_t g_bump_last_base; /* heap_used to restore when that tail is freed */
+static uint32_t g_bump_last_end;  /* guest address just past that tail */
 static MangoLoadedLibrary* g_bump_lib;
+
+static void mango_hole_add(uint32_t addr, uint32_t size) {
+  int i;
+  if (size == 0) {
+    return;
+  }
+  for (i = 0; i < g_nholes; i++) {
+    if (g_holes[i].addr + g_holes[i].size == addr) {
+      addr = g_holes[i].addr;
+      size += g_holes[i].size;
+      g_holes[i] = g_holes[--g_nholes];
+      i = -1;
+    }
+  }
+  for (i = 0; i < g_nholes; i++) {
+    if (addr + size == g_holes[i].addr) {
+      size += g_holes[i].size;
+      g_holes[i] = g_holes[--g_nholes];
+      i = -1;
+    }
+  }
+  if (g_nholes < MANGO_HOLE_MAX) {
+    g_holes[g_nholes].addr = addr;
+    g_holes[g_nholes].size = size;
+    g_nholes++;
+  }
+}
+
+static void mango_hole_trim_end(MangoLoadedLibrary* heap) {
+  int again = 1;
+  if (heap == NULL) {
+    return;
+  }
+  while (again) {
+    uint32_t end = heap->heap_base + heap->heap_used;
+    int i;
+    again = 0;
+    for (i = 0; i < g_nholes; i++) {
+      if (g_holes[i].size > 0 && g_holes[i].addr + g_holes[i].size == end &&
+          g_holes[i].size <= heap->heap_used) {
+        mango_bump_set(heap, heap->heap_used - g_holes[i].size);
+        g_holes[i] = g_holes[--g_nholes];
+        again = 1;
+        break;
+      }
+    }
+  }
+}
+
+/* Take a hole of at least `need` bytes. *size_out is the bytes granted. */
+static int mango_hole_take(uint32_t need, uint32_t* addr_out, uint32_t* size_out) {
+  int i;
+  for (i = 0; i < g_nholes; i++) {
+    if (g_holes[i].size >= need) {
+      uint32_t addr = g_holes[i].addr;
+      uint32_t left = g_holes[i].size - need;
+      if (left >= 16u) {
+        g_holes[i].addr = addr + need;
+        g_holes[i].size = left;
+        *size_out = need;
+      } else {
+        *size_out = g_holes[i].size;
+        g_holes[i] = g_holes[--g_nholes];
+      }
+      *addr_out = addr;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static uint32_t mango_heap_acquire(MangoLoadedLibrary* heap, uint32_t payload, int zero) {
+  uint32_t hdr = 0, total = 0, user, used, addr, aligned, pad, span;
+  if (heap == NULL) {
+    return 0;
+  }
+  if (payload == 0) {
+    payload = 8u;
+  }
+  payload = (payload + 7u) & ~7u;
+  if (payload > MANGO_HEAP_SIZE - MANGO_ALLOC_HDR) {
+    return 0;
+  }
+  if (mango_hole_take(payload + MANGO_ALLOC_HDR, &hdr, &total)) {
+    mango_store_u32_guest(heap->guest_mem, hdr, total);
+    mango_store_u32_guest(heap->guest_mem, hdr + 4u, payload);
+    user = hdr + MANGO_ALLOC_HDR;
+    if (zero) {
+      memset(heap->guest_mem + user, 0, payload);
+    }
+    return user;
+  }
+  used = heap->heap_used;
+  addr = heap->heap_base + used;
+  aligned = (addr + 7u) & ~7u;
+  pad = aligned - addr;
+  span = pad + payload + MANGO_ALLOC_HDR;
+  if (span > MANGO_HEAP_SIZE || used > MANGO_HEAP_SIZE - span) {
+    return 0;
+  }
+  hdr = aligned;
+  total = payload + MANGO_ALLOC_HDR;
+  mango_store_u32_guest(heap->guest_mem, hdr, total);
+  mango_store_u32_guest(heap->guest_mem, hdr + 4u, payload);
+  user = hdr + MANGO_ALLOC_HDR;
+  if (zero) {
+    memset(heap->guest_mem + user, 0, payload);
+  }
+  mango_bump_set(heap, used + span);
+  g_bump_last = user;
+  g_bump_last_base = used;
+  g_bump_last_end = heap->heap_base + heap->heap_used;
+  g_bump_lib = heap;
+  return user;
+}
+
+static void mango_heap_release(MangoLoadedLibrary* heap, uint32_t user) {
+  uint32_t hdr, total;
+  if (user == 0 || heap == NULL) {
+    return;
+  }
+  if (user == g_bump_last && g_bump_lib != NULL &&
+      heap->heap_base + heap->heap_used == g_bump_last_end) {
+    mango_bump_set(heap, g_bump_last_base);
+    g_bump_last = 0;
+    g_bump_last_end = 0;
+    mango_hole_trim_end(heap);
+    return;
+  }
+  if (user < heap->heap_base + MANGO_ALLOC_HDR || (user & 7u) != 0) {
+    return;
+  }
+  hdr = user - MANGO_ALLOC_HDR;
+  if (!mango_guest_range_ok(heap, hdr, MANGO_ALLOC_HDR)) {
+    return;
+  }
+  total = mango_load_u32_guest(heap->guest_mem, hdr);
+  if (total < MANGO_ALLOC_HDR || (total & 7u) != 0) {
+    return;
+  }
+  if (hdr < heap->heap_base ||
+      (uint64_t)hdr + total > (uint64_t)heap->heap_base + heap->heap_used) {
+    return;
+  }
+  mango_hole_add(hdr, total);
+  if (user == g_bump_last) {
+    g_bump_last = 0;
+  }
+  mango_hole_trim_end(heap);
+}
 
 static uint32_t mango_file_mmap(MangoLoadedLibrary* lib, int host_fd, uint32_t length,
                                 uint32_t offset) {
@@ -3059,66 +3219,85 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
   switch (fn) {
     case MANGO_LIBC_MALLOC: {
       MangoLoadedLibrary* heap = mango_bump_owner(lib);
-      uint32_t n = (r0 + 7u) & ~7u;
-      uint32_t used = heap->heap_used;
-      if (n == 0) {
-        n = 8u;
-      }
-      if (n > MANGO_HEAP_SIZE || used > MANGO_HEAP_SIZE - n) {
-        if (!mango_new_fail_to_spritecache(cpu)) {
-          static int s_malloc_fail;
-          if (s_malloc_fail < 4) {
-            fprintf(stderr, "mango: malloc fail n=%u heap=%u/%u\n", n, used, MANGO_HEAP_SIZE);
-            s_malloc_fail++;
-          }
-          cpu->r[0] = 0;
+      uint32_t got = mango_heap_acquire(heap, r0, 0);
+      if (got == 0 && !mango_new_fail_to_spritecache(cpu)) {
+        static int s_malloc_fail;
+        if (s_malloc_fail < 4) {
+          fprintf(stderr, "mango: malloc fail n=%u heap=%u/%u holes=%d\n", r0, heap->heap_used,
+                  MANGO_HEAP_SIZE, g_nholes);
+          s_malloc_fail++;
         }
-      } else {
-        cpu->r[0] = heap->heap_base + used;
-        mango_bump_set(heap, used + n);
-        g_bump_last = cpu->r[0];
-        g_bump_last_n = n;
-        g_bump_lib = heap;
+        cpu->r[0] = 0;
+      } else if (got != 0) {
+        cpu->r[0] = got;
       }
       break;
     }
     case MANGO_LIBC_REALLOC: {
-      /* Unity MemoryManager realloc: r0=old (may be 0), r1=new bytes. */
+      /* r0=old (may be 0), r1=new bytes. Old blocks are released so the
+       * bytes can be reused. */
       MangoLoadedLibrary* heap = mango_bump_owner(lib);
       uint32_t old = r0;
-      uint32_t n = (r1 + 7u) & ~7u;
-      uint32_t used = heap->heap_used;
+      uint32_t n = r1 == 0 ? 8u : r1;
       uint32_t neu;
-      if (n == 0) {
-        n = 8u;
-      }
-      if (n > MANGO_HEAP_SIZE || used > MANGO_HEAP_SIZE - n) {
+      uint32_t copy = 0;
+      if (n > MANGO_HEAP_SIZE - MANGO_ALLOC_HDR) {
         cpu->r[0] = 0;
         break;
       }
-      neu = heap->heap_base + used;
-      if (old != 0 && old >= heap->heap_base && old < heap->heap_base + used) {
-        uint32_t avail = (heap->heap_base + used) - old;
-        uint32_t copy = n < avail ? n : avail;
-        memmove(heap->guest_mem + neu, heap->guest_mem + old, copy);
+      if (old != 0 && old >= heap->heap_base + MANGO_ALLOC_HDR &&
+          mango_guest_range_ok(heap, old - 4u, 4u)) {
+        copy = mango_load_u32_guest(heap->guest_mem, old - 4u);
       }
-      mango_bump_set(heap, used + n);
-      g_bump_last = neu;
-      g_bump_last_n = n;
-      g_bump_lib = heap;
+      if (old == g_bump_last && g_bump_lib != NULL &&
+          heap->heap_base + heap->heap_used == g_bump_last_end &&
+          old >= MANGO_ALLOC_HDR) {
+        uint32_t hdr = old - MANGO_ALLOC_HDR;
+        uint32_t old_total = mango_load_u32_guest(heap->guest_mem, hdr);
+        uint32_t payload = (n + 7u) & ~7u;
+        uint32_t new_total = payload + MANGO_ALLOC_HDR;
+        if (payload == 0) {
+          payload = 8u;
+          new_total = payload + MANGO_ALLOC_HDR;
+        }
+        if (new_total <= old_total) {
+          uint32_t drop = old_total - new_total;
+          mango_store_u32_guest(heap->guest_mem, hdr, new_total);
+          mango_store_u32_guest(heap->guest_mem, hdr + 4u, payload);
+          if (drop != 0 && heap->heap_used >= drop) {
+            mango_bump_set(heap, heap->heap_used - drop);
+            g_bump_last_end -= drop;
+          }
+          cpu->r[0] = old;
+          break;
+        }
+        if (new_total - old_total <= MANGO_HEAP_SIZE - heap->heap_used) {
+          mango_bump_set(heap, heap->heap_used + (new_total - old_total));
+          mango_store_u32_guest(heap->guest_mem, hdr, new_total);
+          mango_store_u32_guest(heap->guest_mem, hdr + 4u, payload);
+          g_bump_last_end = heap->heap_base + heap->heap_used;
+          cpu->r[0] = old;
+          break;
+        }
+      }
+      neu = mango_heap_acquire(heap, n, 0);
+      if (neu == 0) {
+        cpu->r[0] = 0;
+        break;
+      }
+      if (old != 0 && copy != 0 && mango_guest_range_ok(heap, old, copy) &&
+          mango_guest_range_ok(heap, neu, copy < n ? copy : n)) {
+        uint32_t nbytes = copy < n ? copy : n;
+        memcpy(heap->guest_mem + neu, heap->guest_mem + old, nbytes);
+      }
+      if (old != 0) {
+        mango_heap_release(heap, old);
+      }
       cpu->r[0] = neu;
       break;
     }
     case MANGO_LIBC_FREE:
-      /* delete[] of the sprite-cache probe is the most recent bump.
-       * Rewind that block so the following smaller new can fit. */
-      if (r0 != 0 && r0 == g_bump_last && g_bump_lib != NULL && g_bump_last_n != 0 &&
-          g_bump_lib->heap_used >= g_bump_last_n &&
-          r0 + g_bump_last_n == g_bump_lib->heap_base + g_bump_lib->heap_used) {
-        mango_bump_set(g_bump_lib, g_bump_lib->heap_used - g_bump_last_n);
-        g_bump_last = 0;
-        g_bump_last_n = 0;
-      }
+      mango_heap_release(mango_bump_owner(lib), r0);
       break;
     case MANGO_LIBC_MEMCPY:
     case MANGO_LIBC_AEABI_MEMCPY:
@@ -3599,27 +3778,22 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     case MANGO_LIBC_CALLOC: {
       MangoLoadedLibrary* heap = mango_bump_owner(lib);
-      uint64_t n = (uint64_t)r0 * (uint64_t)r1;
-      uint32_t used = heap->heap_used;
-      if (n == 0) {
-        n = 8;
+      uint64_t bytes = (uint64_t)r0 * (uint64_t)r1;
+      uint32_t got;
+      if (bytes > 0xffffffffu) {
+        bytes = 0xffffffffu;
       }
-      n = (n + 7ull) & ~7ull;
-      if (n > MANGO_HEAP_SIZE || used > MANGO_HEAP_SIZE - (uint32_t)n) {
+      got = mango_heap_acquire(heap, (uint32_t)bytes, 1);
+      if (got == 0) {
         static int s_calloc_fail;
         if (s_calloc_fail < 4) {
-          fprintf(stderr, "mango: calloc fail n=%u heap=%u/%u\n", (unsigned)n, used,
-                  MANGO_HEAP_SIZE);
+          fprintf(stderr, "mango: calloc fail n=%u heap=%u/%u holes=%d\n", (unsigned)bytes,
+                  heap->heap_used, MANGO_HEAP_SIZE, g_nholes);
           s_calloc_fail++;
         }
         cpu->r[0] = 0;
       } else {
-        cpu->r[0] = heap->heap_base + used;
-        memset(heap->guest_mem + cpu->r[0], 0, (size_t)n);
-        mango_bump_set(heap, used + (uint32_t)n);
-        g_bump_last = cpu->r[0];
-        g_bump_last_n = (uint32_t)n;
-        g_bump_lib = heap;
+        cpu->r[0] = got;
       }
       break;
     }
