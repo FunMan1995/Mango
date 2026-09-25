@@ -3545,8 +3545,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0ax: T32 LSL.W Rd,Rn,Rm (shift amount in Rm, low 8 bits).
    * OpenTTD fa08 f204 = lsl.w r2,r8,r4 (llvm-mc [08,fa,04,f2]).
    * Reuse MANGO_OP_MOV + shift_by_reg, S=0 so NZCV hold. ASR.W is
-   * Q-OTTD-0bh. LSLS is Q-OTTD-0cl. LSR/ROR.W and ASRS stay closed.
-   * Reject Rd/Rn/Rm=PC. */
+   * Q-OTTD-0bh. LSLS is Q-OTTD-0cl. LSR.W S=0 is Q-OTTD-0cn.
+   * ROR.W, LSRS, and ASRS stay closed. Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFF0u) == 0xFA00u && (hw2 & 0xF0F0u) == 0xF000u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -3589,7 +3589,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0bh: T32 ASR.W Rd,Rn,Rm. SDL fa41 f20b = asr.w r2,r1,r11
    * (llvm-mc [41,fa,0b,f2]). Amount is Rm[7:0]. S=0. ASRS (FA5x) and
-   * LSR/ROR.W stay closed. Reject Rd/Rn/Rm=PC. */
+   * ROR.W stay closed. Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFF0u) == 0xFA40u && (hw2 & 0xF0F0u) == 0xF000u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -3604,6 +3604,28 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->is_imm = 0;
     out->sets_flags = 0;
     out->shift_type = 2; /* ASR */
+    out->shift_by_reg = 1;
+    return 0;
+  }
+
+  /* Q-OTTD-0cn: T32 LSR.W Rd,Rn,Rm. grfmsg map fa2b fb04 =
+   * lsr.w r11, r11, r4 inside itt lt (llvm-mc [2b,fa,04,fb]).
+   * Amount is Rm[7:0]. S=0 so NZCV hold. Amount 0 leaves the value.
+   * LSRS (FA3x) and ROR.W stay closed. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFA20u && (hw2 & 0xF0F0u) == 0xF000u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_MOV;
+    out->rd = rd;
+    out->rm = rn;
+    out->rs = rm;
+    out->is_imm = 0;
+    out->sets_flags = 0;
+    out->shift_type = 1; /* LSR */
     out->shift_by_reg = 1;
     return 0;
   }

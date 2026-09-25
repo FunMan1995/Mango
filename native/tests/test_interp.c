@@ -3758,8 +3758,8 @@ static int test_t32_lsl_w_reg(void) {
             di.rd, di.rm, di.rs, di.shift_by_reg, di.shift_type, di.sets_flags);
     return 1;
   }
-  if (mango_decode_t32(0xFA20u, 0xF204u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_lsl_w): LSR.W decoded\n");
+  if (mango_decode_t32(0xFA20u, 0xF204u, &di) != 0 || di.shift_type != 1 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_lsl_w): LSR.W S=0 should decode\n");
     return 1;
   }
 
@@ -3808,8 +3808,12 @@ static int test_t32_asr_w_reg(void) {
             di.rm, di.rs, di.shift_type, di.sets_flags);
     return 1;
   }
-  if (mango_decode_t32(0xFA51u, 0xF20Bu, &di) == 0 || mango_decode_t32(0xFA21u, 0xF20Bu, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_asr): ASRS or LSR.W decoded\n");
+  if (mango_decode_t32(0xFA51u, 0xF20Bu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_asr): ASRS decoded\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xFA21u, 0xF20Bu, &di) != 0 || di.shift_type != 1 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_asr): LSR.W S=0 should decode\n");
     return 1;
   }
 
@@ -9752,6 +9756,54 @@ static int test_t32_rev_w(void) {
   return 0;
 }
 
+static int test_t32_lsr_w_reg(void) {
+  /* Q-OTTD-0cn: lsr.w r11, r11, r4 = fa2b fb04 (llvm-mc [2b,fa,04,fb]).
+   * Amount is r4[7:0]. S=0, so NZCV hold. Amount 0 leaves r11. */
+  static const uint16_t kProg[] = {0xFA2Bu, 0xFB04u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t v, sh, want;
+  } cases[] = {
+      {0x80000011u, 1u, 0x40000008u},
+      {0x80000011u, 0u, 0x80000011u},
+      {0xffu, 32u, 0u},
+      {0xffu, 40u, 0u},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xFA2Bu, 0xFB04u, &di) != 0 || di.op != MANGO_OP_MOV || di.rd != 11 ||
+      di.rm != 11 || di.rs != 4 || di.shift_by_reg != 1 || di.shift_type != 1 ||
+      di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_lsr_w): decode op=%d rd=%u rm=%u rs=%u ty=%u s=%d\n", di.op, di.rd,
+            di.rm, di.rs, di.shift_type, di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xFA3Bu, 0xFB04u, &di) == 0 || mango_decode_t32(0xFA2Bu, 0xFF04u, &di) == 0 ||
+      mango_decode_t32(0xFA2Fu, 0xFB04u, &di) == 0 || mango_decode_t32(0xFA2Bu, 0xFB0Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_lsr_w): LSRS or PC decoded\n");
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[11] = cases[c].v;
+    cpu.r[4] = cases[c].sh;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[11] != cases[c].want || cpu.r[4] != cases[c].sh ||
+        cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_lsr_w#%u): rc=%d r11=%x want %x cpsr %x->%x\n", c, rc, cpu.r[11],
+              cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 LSR.W r11, r11, r4 (Q-OTTD-0cn)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -12107,6 +12159,7 @@ int main(void) {
   failures += test_t32_umlal();
   failures += test_t32_lsls_w_reg();
   failures += test_t32_rev_w();
+  failures += test_t32_lsr_w_reg();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
