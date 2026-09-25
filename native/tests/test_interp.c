@@ -3892,6 +3892,55 @@ static int test_t32_orn_w_reg(void) {
   return 0;
 }
 
+static int test_t32_orn_w_imm(void) {
+  /* Q-OTTD-0cr: orn r1,r1,#127 = f061 017f. r1 |= ~127. NZCV unchanged.
+   * ORNS f071 017f and Rd=PC stay closed. Rn=15 stays MVN. */
+  static const uint16_t kProg[] = {0xF061u, 0x017Fu, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xF061u, 0x017Fu, &di) != 0 || di.op != MANGO_OP_ORN || di.rd != 1 ||
+      di.rn != 1 || di.is_imm != 1 || di.imm != 127u || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_orn_imm): decode op=%d rd=%u rn=%u imm=%u s=%d\n", di.op, di.rd,
+            di.rn, di.imm, di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xF071u, 0x017Fu, &di) == 0 || mango_decode_t32(0xF061u, 0x0F7Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_orn_imm): ORNS or Rd=PC decoded\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xF46Fu, 0x5207u, &di) != 0 || di.op != MANGO_OP_MVN) {
+    fprintf(stderr, "FAIL(t32_orn_imm): MVN.W Rn=15 no longer MVN\n");
+    return 1;
+  }
+
+  struct {
+    uint32_t in, want;
+  } cases[] = {
+      {0u, 0xffffff80u},
+      {0x22u, 0xffffffa2u},
+      {0x7fu, 0xffffffffu},
+      {0xffffffffu, 0xffffffffu},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[1] = cases[c].in;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[1] != cases[c].want || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_orn_imm#%u): rc=%d r1=%x want %x cpsr %x->%x\n", c, rc, cpu.r[1],
+              cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 ORN r1,r1,#127 (Q-OTTD-0cr)\n");
+  return 0;
+}
+
 static int test_t32_lsl_w_reg(void) {
   /* Q-OTTD-0ax: lsl.w r2,r8,r4 = fa08 f204. r2 = r8 << r4[7:0]. Flags hold. */
   static const uint16_t kProg[] = {0xFA08u, 0xF204u, 0x4770u};
@@ -5964,9 +6013,10 @@ static int test_t32_mvn_ldr_reject(void) {
     fprintf(stderr, "FAIL(t32_mvn_ldr_reject): S=1 MVNS decoded as op=%d\n", di.op);
     return 1;
   }
-  /* ORN: same op=0011 but Rn=r14 (f46e …) — must uncover this bite */
-  if (mango_decode_t32(0xF46Eu, 0x5207u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_mvn_ldr_reject): ORN Rn!=15 decoded as op=%d\n", di.op);
+  /* ORN immediate Rn=r14 is Q-OTTD-0cr. MVNS stays closed. */
+  if (mango_decode_t32(0xF46Eu, 0x5207u, &di) != 0 || di.op != MANGO_OP_ORN || di.rn != 14 ||
+      di.is_imm != 1 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_mvn_ldr_reject): ORN f46e5207 op=%d rn=%u\n", di.op, di.rn);
     return 1;
   }
   /* f85d 4b04 post-index cleared by Q-OTTD-0m; LDR imm2 by 0y — no longer reject */
@@ -8975,9 +9025,11 @@ static int test_t32_bic_w_modimm_reject(void) {
             di.op, di.sets_flags);
     return 1;
   }
-  /* f066 0603 = orn — not BIC (MVN requires Rn=15) */
-  if (mango_decode_t32(0xF066u, 0x0603u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_bic_w_reject): ORN f0660603 decoded as op=%d\n", di.op);
+  /* f066 0603 = orn.w r6,r6,#3 (Q-OTTD-0cr), not BIC. */
+  if (mango_decode_t32(0xF066u, 0x0603u, &di) != 0 || di.op != MANGO_OP_ORN || di.rd != 6 ||
+      di.rn != 6 || di.imm != 3u || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_bic_w_reject): ORN f0660603 op=%d rd=%u imm=%u\n", di.op, di.rd,
+            di.imm);
     return 1;
   }
   /* A32 e3c66003 bic r6,r6,#3 still BIC */
@@ -12204,6 +12256,7 @@ int main(void) {
   failures += test_t32_sbfx();
   failures += test_t32_mvn_w_reg();
   failures += test_t32_orn_w_reg();
+  failures += test_t32_orn_w_imm();
   failures += test_t32_lsl_w_reg();
   failures += test_t32_asr_w_reg();
   failures += test_t32_pop_w_ldmia_sp();
