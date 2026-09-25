@@ -3700,6 +3700,54 @@ static int test_t32_tst_w_reg(void) {
   return 0;
 }
 
+static int test_t32_cmn_w_imm(void) {
+  /* Q-OTTD-0cp: cmn.w r1, #9 = f111 0f09 (llvm-mc [11,f1,09,0f]).
+   * Flags from r1+9. r1 holds. #256 expands to 0x100. */
+  static const uint16_t kProg[] = {0xF111u, 0x0F09u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t r1, nzcv;
+  } cases[] = {
+      {0u, 0u},
+      {0xfffffff7u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0x7fffffffu, MANGO_CPSR_N | MANGO_CPSR_V},
+      {0xffffffffu, MANGO_CPSR_C},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xF111u, 0x0F09u, &di) != 0 || di.op != MANGO_OP_CMN || di.rn != 1 ||
+      di.is_imm != 1 || di.imm != 9 || di.sets_flags != 1) {
+    fprintf(stderr, "FAIL(t32_cmn_w): decode op=%d rn=%u imm=%u s=%d\n", di.op, di.rn, di.imm,
+            di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xF511u, 0x7F80u, &di) != 0 || di.op != MANGO_OP_CMN || di.imm != 0x100u) {
+    fprintf(stderr, "FAIL(t32_cmn_w): #256 op=%d imm=%x\n", di.op, di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xF11Fu, 0x0F09u, &di) == 0 || mango_decode_t32(0xEB11u, 0x0F09u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_cmn_w): Rn=PC or register CMN decoded\n");
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    cpu.r[1] = cases[c].r1;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[1] != cases[c].r1 || nzcv != cases[c].nzcv) {
+      fprintf(stderr, "FAIL(t32_cmn_w#%u): rc=%d r1=%x nzcv=%x want %x\n", c, rc, cpu.r[1], nzcv,
+              cases[c].nzcv);
+      return 1;
+    }
+  }
+  printf("ok: T32 CMN.W r1, #9 (Q-OTTD-0cp)\n");
+  return 0;
+}
+
 static int test_t32_mvn_w_reg(void) {
   /* Q-OTTD-0bl: mvn.w r10,r2 = ea6f 0a02. r10 = ~r2. Flags and r2 hold.
    * MVNS (ea7f) stays closed. ORN is Q-OTTD-0bm. */
@@ -4286,7 +4334,7 @@ static int test_t32_ldrsb_w_imm12(void) {
 
 static int test_t32_adds_w_imm0(void) {
   /* Q-OTTD-0ak: adds.w r6,r10,#0 = f11a 0600. r6 = r10; NZCV from the add.
-   * Adding zero clears C and V. CMN (Rd=15) and Rn=PC stay closed. */
+   * Adding zero clears C and V. Rn=PC stays closed. CMN is Q-OTTD-0cp. */
   static const uint16_t kProg[] = {0xF11Au, 0x0600u, 0x4770u};
   uint8_t mem_buf[32];
   load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
@@ -4297,8 +4345,13 @@ static int test_t32_adds_w_imm0(void) {
             di.rn, di.imm, di.sets_flags);
     return 1;
   }
-  if (mango_decode_t32(0xF110u, 0x0F00u, &di) == 0 || mango_decode_t32(0xF11Fu, 0x0600u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_adds_w): CMN or Rn=PC decoded\n");
+  if (mango_decode_t32(0xF110u, 0x0F00u, &di) != 0 || di.op != MANGO_OP_CMN || di.rn != 0 ||
+      di.imm != 0) {
+    fprintf(stderr, "FAIL(t32_adds_w): CMN f1100f00 op=%d rn=%u imm=%u\n", di.op, di.rn, di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xF11Fu, 0x0600u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_adds_w): Rn=PC decoded\n");
     return 1;
   }
 
@@ -8317,9 +8370,11 @@ static int test_t32_cmp_w_modimm_reject(void) {
             di.op, di.rd, di.rn, di.imm, di.sets_flags);
     return 1;
   }
-  /* f110 0f00 = CMN.W — not this bite */
-  if (mango_decode_t32(0xF110u, 0x0F00u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_cmp_w_reject): CMN f1100f00 decoded as op=%d\n", di.op);
+  /* f110 0f00 = cmn.w r0, #0 (Q-OTTD-0cp), not CMP. */
+  if (mango_decode_t32(0xF110u, 0x0F00u, &di) != 0 || di.op != MANGO_OP_CMN || di.rn != 0 ||
+      di.imm != 0) {
+    fprintf(stderr, "FAIL(t32_cmp_w_reject): CMN f1100f00 op=%d rn=%u imm=%u\n", di.op, di.rn,
+            di.imm);
     return 1;
   }
   /* footnote bic.w f026 060f — cleared by Q-OTTD-0q (expect BIC) */
@@ -8331,7 +8386,7 @@ static int test_t32_cmp_w_modimm_reject(void) {
             di.op, di.rd, di.rn, di.imm, di.sets_flags);
     return 1;
   }
-  printf("ok: T32 CMP.W reject Rn=PC/CMN; SUBS cleared by 0as (Q-OTTD-0k)\n");
+  printf("ok: T32 CMP.W reject Rn=PC; CMN is 0cp; SUBS cleared by 0as (Q-OTTD-0k)\n");
   return 0;
 }
 
@@ -12094,6 +12149,7 @@ int main(void) {
   failures += test_t32_eor_w_reg();
   failures += test_t32_and_w_reg();
   failures += test_t32_tst_w_reg();
+  failures += test_t32_cmn_w_imm();
   failures += test_t32_mvn_w_reg();
   failures += test_t32_orn_w_reg();
   failures += test_t32_lsl_w_reg();
