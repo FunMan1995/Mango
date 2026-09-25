@@ -3592,6 +3592,30 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0cq: T32 SBFX Rd,Rn,#lsb,#width. seprintf f342 2555 =
+   * sbfx r5, r2, #9, #22 (llvm-mc [42,f3,55,25]). Sign-extend the
+   * extracted field. Same lsb/widthm1 packing as UBFX. lsb+width
+   * past bit 31 is rejected. Rd/Rn=PC stay closed. */
+  if ((hw1 & 0xFFF0u) == 0xF340u && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t lsb = (((hw2 >> 12) & 7u) << 2) | ((hw2 >> 6) & 3u);
+    uint32_t widthm1 = hw2 & 0x3Fu;
+    uint32_t width = widthm1 + 1u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (lsb + width > 32u) {
+      return -1;
+    }
+    out->op = MANGO_OP_SBFX;
+    out->rd = rd;
+    out->rn = rn;
+    out->imm = lsb;
+    out->rs = widthm1;
+    return 0;
+  }
+
   /* Q-OTTD-0ax: T32 LSL.W Rd,Rn,Rm (shift amount in Rm, low 8 bits).
    * OpenTTD fa08 f204 = lsl.w r2,r8,r4 (llvm-mc [08,fa,04,f2]).
    * Reuse MANGO_OP_MOV + shift_by_reg, S=0 so NZCV hold. ASR.W is

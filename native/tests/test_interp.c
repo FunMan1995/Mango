@@ -3748,6 +3748,55 @@ static int test_t32_cmn_w_imm(void) {
   return 0;
 }
 
+static int test_t32_sbfx(void) {
+  /* Q-OTTD-0cq: sbfx r5, r2, #9, #22 = f342 2555 (llvm-mc [42,f3,55,25]).
+   * Extract bits [30:9] and sign-extend. NZCV and r2 hold. */
+  static const uint16_t kProg[] = {0xF342u, 0x2555u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t in, want;
+  } cases[] = {
+      {0x00ABCDEFu, 0x000055E6u},
+      {0x40000000u, 0xFFE00000u},
+      {0u, 0u},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xF342u, 0x2555u, &di) != 0 || di.op != MANGO_OP_SBFX || di.rd != 5 ||
+      di.rn != 2 || di.imm != 9 || di.rs != 21) {
+    fprintf(stderr, "FAIL(t32_sbfx): decode op=%d rd=%u rn=%u lsb=%u w=%u\n", di.op, di.rd, di.rn,
+            di.imm, di.rs);
+    return 1;
+  }
+  if (mango_decode_t32(0xF342u, 0x051Fu, &di) != 0 || di.imm != 0 || di.rs != 31) {
+    fprintf(stderr, "FAIL(t32_sbfx): width 32 lsb=%u w=%u\n", di.imm, di.rs);
+    return 1;
+  }
+  if (mango_decode_t32(0xF342u, 0x5513u, &di) == 0 || mango_decode_t32(0xF342u, 0x2F55u, &di) == 0 ||
+      mango_decode_t32(0xF34Fu, 0x2555u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_sbfx): wide field or PC decoded\n");
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[2] = cases[c].in;
+    cpu.r[5] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[5] != cases[c].want || cpu.r[2] != cases[c].in || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_sbfx#%u): rc=%d r5=%x want %x cpsr %x->%x\n", c, rc, cpu.r[5],
+              cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 SBFX r5, r2, #9, #22 (Q-OTTD-0cq)\n");
+  return 0;
+}
+
 static int test_t32_mvn_w_reg(void) {
   /* Q-OTTD-0bl: mvn.w r10,r2 = ea6f 0a02. r10 = ~r2. Flags and r2 hold.
    * MVNS (ea7f) stays closed. ORN is Q-OTTD-0bm. */
@@ -8231,13 +8280,15 @@ static int test_t32_stmia_ubfx_reject(void) {
     fprintf(stderr, "FAIL(t32_stmia_ubfx_reject): UBFX Rd=PC decoded as op=%d\n", di.op);
     return 1;
   }
-  /* f341 070a = SBFX — not this bite */
-  if (mango_decode_t32(0xF341u, 0x070Au, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_stmia_ubfx_reject): SBFX f341070a decoded as op=%d\n", di.op);
+  /* f341 070a = sbfx r7, r1, #0, #11 (Q-OTTD-0cq). */
+  if (mango_decode_t32(0xF341u, 0x070Au, &di) != 0 || di.op != MANGO_OP_SBFX || di.rd != 7 ||
+      di.rn != 1 || di.imm != 0 || di.rs != 10) {
+    fprintf(stderr, "FAIL(t32_stmia_ubfx_reject): SBFX f341070a op=%d rd=%u rn=%u lsb=%u w=%u\n",
+            di.op, di.rd, di.rn, di.imm, di.rs);
     return 1;
   }
   /* f85d 4b04 post-index cleared by Q-OTTD-0m — no longer reject here */
-  printf("ok: T32 STMIA W=1 tip; UBFX PC / SBFX / STM-PC reject (Q-OTTD-0j/0ai)\n");
+  printf("ok: T32 STMIA W=1 tip; UBFX PC / STM-PC reject; SBFX is 0cq (Q-OTTD-0j/0ai)\n");
   return 0;
 }
 
@@ -12150,6 +12201,7 @@ int main(void) {
   failures += test_t32_and_w_reg();
   failures += test_t32_tst_w_reg();
   failures += test_t32_cmn_w_imm();
+  failures += test_t32_sbfx();
   failures += test_t32_mvn_w_reg();
   failures += test_t32_orn_w_reg();
   failures += test_t32_lsl_w_reg();
