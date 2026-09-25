@@ -696,6 +696,7 @@ static void mango_aeabi_note(uint32_t which) {
   if ((g_aeabi_calls_total & 0xfffffu) == 0u) {
     fprintf(stderr, "mango: softfloat host calls=%llu\n",
             (unsigned long long)g_aeabi_calls_total);
+    fflush(stderr);
   }
 }
 
@@ -6375,9 +6376,11 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
               pc, cpu->cpsr, w, rc, dec, dec == 0 ? (int)ins.op : -1, cpu->r[0], cpu->r[1],
               cpu->r[2], cpu->r[3], cpu->r[4], cpu->r[5], cpu->r[6], cpu->r[7],
               cpu->r[MANGO_REG_SP], cpu->r[MANGO_REG_LR], lib->load_bias);
+      fflush(stderr);
       for (int i = 0; i < g_nlibs; i++) {
         fprintf(stderr, "mango: lib[%d] bias=0x%x %s\n", i, g_libs[i]->load_bias, g_libs[i]->path);
       }
+      fflush(stderr);
       if (g_meritous_progress_armed) {
         mango_dump_aeabi_top();
         mango_dump_pc_hist();
