@@ -299,7 +299,23 @@
 #define MANGO_LIBC_STRLCPY 182
 /* __verbose_terminate_handler prints the exception name with fputs. */
 #define MANGO_LIBC_FPUTS 183
-#define MANGO_LIBC_COUNT 184
+/* OpenTTD savegame zlib. A zero stub returns Z_OK and never consumes
+ * input, so ZlibLoadFilter::Read spins. Guest z_stream is 56 bytes
+ * (32-bit long); the host stream stays in a side table. */
+#define MANGO_LIBC_INFLATE 184
+#define MANGO_LIBC_INFLATEEND 185
+#define MANGO_LIBC_INFLATEINIT_ 186
+#define MANGO_LIBC_INFLATEINIT2_ 187
+#define MANGO_LIBC_INFLATERESET 188
+#define MANGO_LIBC_INFLATECOPY 189
+#define MANGO_LIBC_DEFLATE 190
+#define MANGO_LIBC_DEFLATEEND 191
+#define MANGO_LIBC_DEFLATEINIT_ 192
+#define MANGO_LIBC_DEFLATEINIT2_ 193
+#define MANGO_LIBC_DEFLATERESET 194
+#define MANGO_LIBC_CRC32 195
+#define MANGO_LIBC_ZLIBVERSION 196
+#define MANGO_LIBC_COUNT 197
 /* bionic struct __sFILE is 84 bytes in this NDK. stderr is &__sF[2]. */
 #define MANGO_SF_FILE 84u
 #define MANGO_TSD_KEYS 16
@@ -559,6 +575,19 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "fgets",
     "strlcpy",
     "fputs",
+    "inflate",
+    "inflateEnd",
+    "inflateInit_",
+    "inflateInit2_",
+    "inflateReset",
+    "inflateCopy",
+    "deflate",
+    "deflateEnd",
+    "deflateInit_",
+    "deflateInit2_",
+    "deflateReset",
+    "crc32",
+    "zlibVersion",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -648,6 +677,7 @@ static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v);
 static uint32_t mango_load_u32_guest(const uint8_t* mem, uint32_t addr);
 static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n);
 static uint32_t mango_handle_intern(void* p);
+static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n);
 static uint32_t mango_guest_strdup(MangoLoadedLibrary* lib, const char* s);
 static void* mango_handle_lookup(uint32_t id);
 static const char* mango_fake_jstring_chars(MangoLoadedLibrary* lib, void* js);
@@ -869,6 +899,200 @@ static void mango_gz_release(uint32_t id) {
     gzclose(g_gzfiles[id]);
     g_gzfiles[id] = NULL;
   }
+}
+
+/* Guest z_stream is 56 bytes (Android ARM32: pointers, uInt, and uLong
+ * are all 4 bytes). Host z_stream is larger, so each guest address maps
+ * to its own host stream. zlib's zalloc stays NULL (host malloc). */
+#define MANGO_Z_MAX 8
+#define MANGO_Z_NONE 0
+#define MANGO_Z_INFLATE 1
+#define MANGO_Z_DEFLATE 2
+#define MANGO_Z_GUEST 56u
+typedef struct MangoZSlot {
+  uint32_t guest;
+  int mode;
+  z_stream zs;
+} MangoZSlot;
+static MangoZSlot g_zslots[MANGO_Z_MAX];
+static uint32_t g_zmsg_guest;
+static uint32_t g_zver_guest;
+static int g_zlog_init;
+static int g_zlog_err;
+
+static void mango_z_log(const char* what, int rc, uint32_t guest, int err) {
+  int* n = err ? &g_zlog_err : &g_zlog_init;
+  if (*n >= 8) {
+    return;
+  }
+  (*n)++;
+  fprintf(stderr, "mango: %s r=%d strm=%#x\n", what, rc, (unsigned)guest);
+}
+
+static void mango_z_end_slot(MangoZSlot* s) {
+  if (s->mode == MANGO_Z_INFLATE && s->zs.state != NULL) {
+    inflateEnd(&s->zs);
+  } else if (s->mode == MANGO_Z_DEFLATE && s->zs.state != NULL) {
+    deflateEnd(&s->zs);
+  }
+  memset(s, 0, sizeof(*s));
+}
+
+static void mango_z_reset_all(void) {
+  int i;
+  for (i = 0; i < MANGO_Z_MAX; i++) {
+    mango_z_end_slot(&g_zslots[i]);
+  }
+  g_zmsg_guest = 0;
+  g_zver_guest = 0;
+}
+
+static MangoZSlot* mango_z_find(uint32_t guest) {
+  int i;
+  if (guest == 0) {
+    return NULL;
+  }
+  for (i = 0; i < MANGO_Z_MAX; i++) {
+    if (g_zslots[i].guest == guest) {
+      return &g_zslots[i];
+    }
+  }
+  return NULL;
+}
+
+static MangoZSlot* mango_z_acquire(uint32_t guest) {
+  MangoZSlot* s = mango_z_find(guest);
+  int i;
+  if (s != NULL) {
+    mango_z_end_slot(s);
+  }
+  for (i = 0; i < MANGO_Z_MAX; i++) {
+    if (g_zslots[i].guest == 0) {
+      s = &g_zslots[i];
+      break;
+    }
+  }
+  if (s == NULL) {
+    return NULL;
+  }
+  memset(s, 0, sizeof(*s));
+  s->guest = guest;
+  return s;
+}
+
+static uint32_t mango_z_msg(MangoLoadedLibrary* lib, const char* msg) {
+  size_t n;
+  if (msg == NULL) {
+    return 0;
+  }
+  if (g_zmsg_guest == 0) {
+    g_zmsg_guest = mango_guest_alloc(lib, 96u);
+  }
+  if (g_zmsg_guest == 0 || !mango_guest_range_ok(lib, g_zmsg_guest, 96u)) {
+    return 0;
+  }
+  n = strlen(msg);
+  if (n > 95u) {
+    n = 95u;
+  }
+  memcpy(lib->guest_mem + g_zmsg_guest, msg, n);
+  lib->guest_mem[g_zmsg_guest + n] = 0;
+  return g_zmsg_guest;
+}
+
+static uint32_t mango_z_guest_ptr(const MangoLoadedLibrary* lib, const Bytef* p) {
+  const uint8_t* u = (const uint8_t*)p;
+  const uint8_t* base = lib->guest_mem;
+  if (u == NULL || base == NULL || u < base || u >= base + lib->guest_mem_size) {
+    return 0;
+  }
+  return (uint32_t)(u - base);
+}
+
+/* Cursors move only when zlib hands back a pointer inside the guest.
+ * Status fields (totals, adler, msg, state cookie) always update. */
+static void mango_z_writeback(MangoLoadedLibrary* lib, MangoZSlot* s, int cursors) {
+  uint8_t* mem = lib->guest_mem;
+  uint32_t g = s->guest;
+  uint32_t in_p;
+  uint32_t out_p;
+  uint32_t cookie;
+  if (!mango_guest_range_ok(lib, g, MANGO_Z_GUEST)) {
+    return;
+  }
+  if (cursors) {
+    in_p = mango_z_guest_ptr(lib, s->zs.next_in);
+    out_p = mango_z_guest_ptr(lib, s->zs.next_out);
+    if (in_p != 0) {
+      mango_store_u32_guest(mem, g + 0u, in_p);
+    }
+    mango_store_u32_guest(mem, g + 4u, s->zs.avail_in);
+    if (out_p != 0) {
+      mango_store_u32_guest(mem, g + 12u, out_p);
+    }
+    mango_store_u32_guest(mem, g + 16u, s->zs.avail_out);
+  }
+  cookie = 0x7A000001u + (uint32_t)(s - g_zslots);
+  mango_store_u32_guest(mem, g + 8u, (uint32_t)s->zs.total_in);
+  mango_store_u32_guest(mem, g + 20u, (uint32_t)s->zs.total_out);
+  mango_store_u32_guest(mem, g + 24u, mango_z_msg(lib, s->zs.msg));
+  mango_store_u32_guest(mem, g + 28u, cookie);
+  mango_store_u32_guest(mem, g + 44u, (uint32_t)s->zs.data_type);
+  mango_store_u32_guest(mem, g + 48u, (uint32_t)s->zs.adler);
+}
+
+static int mango_z_bind(MangoLoadedLibrary* lib, MangoZSlot* s) {
+  uint8_t* mem = lib->guest_mem;
+  uint32_t g = s->guest;
+  uint32_t next_in = mango_load_u32_guest(mem, g + 0u);
+  uint32_t avail_in = mango_load_u32_guest(mem, g + 4u);
+  uint32_t next_out = mango_load_u32_guest(mem, g + 12u);
+  uint32_t avail_out = mango_load_u32_guest(mem, g + 16u);
+  if (avail_in != 0) {
+    if (!mango_guest_range_ok(lib, next_in, avail_in)) {
+      return Z_STREAM_ERROR;
+    }
+    s->zs.next_in = mem + next_in;
+    s->zs.avail_in = avail_in;
+  } else {
+    s->zs.next_in = Z_NULL;
+    s->zs.avail_in = 0;
+  }
+  if (avail_out != 0) {
+    if (!mango_guest_range_ok(lib, next_out, avail_out)) {
+      return Z_STREAM_ERROR;
+    }
+    s->zs.next_out = mem + next_out;
+    s->zs.avail_out = avail_out;
+  } else {
+    s->zs.next_out = Z_NULL;
+    s->zs.avail_out = 0;
+  }
+  return Z_OK;
+}
+
+static int mango_z_process(MangoLoadedLibrary* lib, uint32_t guest, int flush, int want) {
+  MangoZSlot* s = mango_z_find(guest);
+  int rc;
+  if (s == NULL || s->mode != want || !mango_guest_range_ok(lib, guest, MANGO_Z_GUEST)) {
+    mango_z_log(want == MANGO_Z_INFLATE ? "inflate" : "deflate", Z_STREAM_ERROR, guest, 1);
+    return Z_STREAM_ERROR;
+  }
+  rc = mango_z_bind(lib, s);
+  if (rc != Z_OK) {
+    mango_z_log(want == MANGO_Z_INFLATE ? "inflate" : "deflate", rc, guest, 1);
+    return rc;
+  }
+  if (want == MANGO_Z_INFLATE) {
+    rc = inflate(&s->zs, flush);
+  } else {
+    rc = deflate(&s->zs, flush);
+  }
+  mango_z_writeback(lib, s, 1);
+  if (rc != Z_OK && rc != Z_STREAM_END) {
+    mango_z_log(want == MANGO_Z_INFLATE ? "inflate" : "deflate", rc, guest, 1);
+  }
+  return rc;
 }
 
 static MangoGfd* mango_gfd_lookup(uint32_t guest_fd) {
@@ -5122,6 +5346,232 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = 0;
       break;
     }
+    case MANGO_LIBC_INFLATEINIT_: {
+      /* inflateInit_(strm, version, stream_size). Guest stream_size is 56.
+       * Call inflateInit on the host stream so zlib sees the host size. */
+      MangoZSlot* slot = NULL;
+      int rc;
+      if (r0 == 0 || !mango_guest_range_ok(lib, r0, MANGO_Z_GUEST)) {
+        cpu->r[0] = (uint32_t)Z_STREAM_ERROR;
+        break;
+      }
+      slot = mango_z_acquire(r0);
+      if (slot == NULL) {
+        cpu->r[0] = (uint32_t)Z_MEM_ERROR;
+        mango_z_log("inflateInit_", Z_MEM_ERROR, r0, 1);
+        break;
+      }
+      rc = inflateInit(&slot->zs);
+      if (rc != Z_OK) {
+        mango_z_end_slot(slot);
+        cpu->r[0] = (uint32_t)rc;
+        mango_z_log("inflateInit_", rc, r0, 1);
+        break;
+      }
+      slot->mode = MANGO_Z_INFLATE;
+      mango_z_writeback(lib, slot, 0);
+      mango_z_log("inflateInit_", rc, r0, 0);
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_INFLATEINIT2_: {
+      /* inflateInit2_(strm, windowBits, version, stream_size). */
+      MangoZSlot* slot = NULL;
+      int window = (int)r1;
+      int rc;
+      if (r0 == 0 || !mango_guest_range_ok(lib, r0, MANGO_Z_GUEST)) {
+        cpu->r[0] = (uint32_t)Z_STREAM_ERROR;
+        break;
+      }
+      slot = mango_z_acquire(r0);
+      if (slot == NULL) {
+        cpu->r[0] = (uint32_t)Z_MEM_ERROR;
+        break;
+      }
+      rc = inflateInit2(&slot->zs, window);
+      if (rc != Z_OK) {
+        mango_z_end_slot(slot);
+        cpu->r[0] = (uint32_t)rc;
+        mango_z_log("inflateInit2_", rc, r0, 1);
+        break;
+      }
+      slot->mode = MANGO_Z_INFLATE;
+      mango_z_writeback(lib, slot, 0);
+      mango_z_log("inflateInit2_", rc, r0, 0);
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_INFLATE:
+      cpu->r[0] = (uint32_t)mango_z_process(lib, r0, (int)r1, MANGO_Z_INFLATE);
+      break;
+    case MANGO_LIBC_INFLATEEND: {
+      MangoZSlot* slot = mango_z_find(r0);
+      int rc = Z_STREAM_ERROR;
+      if (slot != NULL && slot->mode == MANGO_Z_INFLATE) {
+        rc = inflateEnd(&slot->zs);
+        if (mango_guest_range_ok(lib, r0, MANGO_Z_GUEST)) {
+          mango_store_u32_guest(lib->guest_mem, r0 + 28u, 0);
+        }
+        memset(slot, 0, sizeof(*slot));
+      }
+      mango_z_log("inflateEnd", rc, r0, rc != Z_OK);
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_INFLATERESET: {
+      MangoZSlot* slot = mango_z_find(r0);
+      int rc = Z_STREAM_ERROR;
+      if (slot != NULL && slot->mode == MANGO_Z_INFLATE) {
+        rc = inflateReset(&slot->zs);
+        if (rc == Z_OK) {
+          mango_z_writeback(lib, slot, 0);
+        }
+      }
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_INFLATECOPY: {
+      /* inflateCopy(dest, source). */
+      MangoZSlot* src = mango_z_find(r1);
+      MangoZSlot* dst;
+      z_stream copied;
+      int rc;
+      if (src == NULL || src->mode != MANGO_Z_INFLATE || r0 == 0 ||
+          !mango_guest_range_ok(lib, r0, MANGO_Z_GUEST)) {
+        cpu->r[0] = (uint32_t)Z_STREAM_ERROR;
+        break;
+      }
+      memset(&copied, 0, sizeof(copied));
+      rc = inflateCopy(&copied, &src->zs);
+      if (rc != Z_OK) {
+        cpu->r[0] = (uint32_t)rc;
+        mango_z_log("inflateCopy", rc, r0, 1);
+        break;
+      }
+      dst = mango_z_acquire(r0);
+      if (dst == NULL) {
+        inflateEnd(&copied);
+        cpu->r[0] = (uint32_t)Z_MEM_ERROR;
+        break;
+      }
+      dst->zs = copied;
+      dst->mode = MANGO_Z_INFLATE;
+      mango_z_writeback(lib, dst, 1);
+      cpu->r[0] = Z_OK;
+      break;
+    }
+    case MANGO_LIBC_DEFLATEINIT_: {
+      /* deflateInit_(strm, level, version, stream_size). */
+      MangoZSlot* slot = NULL;
+      int level = (int)r1;
+      int rc;
+      if (r0 == 0 || !mango_guest_range_ok(lib, r0, MANGO_Z_GUEST)) {
+        cpu->r[0] = (uint32_t)Z_STREAM_ERROR;
+        break;
+      }
+      slot = mango_z_acquire(r0);
+      if (slot == NULL) {
+        cpu->r[0] = (uint32_t)Z_MEM_ERROR;
+        break;
+      }
+      rc = deflateInit(&slot->zs, level);
+      if (rc != Z_OK) {
+        mango_z_end_slot(slot);
+        cpu->r[0] = (uint32_t)rc;
+        mango_z_log("deflateInit_", rc, r0, 1);
+        break;
+      }
+      slot->mode = MANGO_Z_DEFLATE;
+      mango_z_writeback(lib, slot, 0);
+      mango_z_log("deflateInit_", rc, r0, 0);
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_DEFLATEINIT2_: {
+      /* deflateInit2_(strm, level, method, windowBits, memLevel, strategy,
+       * version, stream_size). Args 5..8 are on the guest stack. */
+      MangoZSlot* slot = NULL;
+      uint32_t sp = cpu->r[MANGO_REG_SP];
+      int level = (int)r1;
+      int method = (int)r2;
+      int window = (int)cpu->r[3];
+      int mem_level;
+      int strategy;
+      int rc;
+      if (r0 == 0 || !mango_guest_range_ok(lib, r0, MANGO_Z_GUEST) ||
+          !mango_guest_range_ok(lib, sp, 8u)) {
+        cpu->r[0] = (uint32_t)Z_STREAM_ERROR;
+        break;
+      }
+      mem_level = (int)mango_load_u32_guest(lib->guest_mem, sp);
+      strategy = (int)mango_load_u32_guest(lib->guest_mem, sp + 4u);
+      slot = mango_z_acquire(r0);
+      if (slot == NULL) {
+        cpu->r[0] = (uint32_t)Z_MEM_ERROR;
+        break;
+      }
+      rc = deflateInit2(&slot->zs, level, method, window, mem_level, strategy);
+      if (rc != Z_OK) {
+        mango_z_end_slot(slot);
+        cpu->r[0] = (uint32_t)rc;
+        mango_z_log("deflateInit2_", rc, r0, 1);
+        break;
+      }
+      slot->mode = MANGO_Z_DEFLATE;
+      mango_z_writeback(lib, slot, 0);
+      mango_z_log("deflateInit2_", rc, r0, 0);
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_DEFLATE:
+      cpu->r[0] = (uint32_t)mango_z_process(lib, r0, (int)r1, MANGO_Z_DEFLATE);
+      break;
+    case MANGO_LIBC_DEFLATEEND: {
+      MangoZSlot* slot = mango_z_find(r0);
+      int rc = Z_STREAM_ERROR;
+      if (slot != NULL && slot->mode == MANGO_Z_DEFLATE) {
+        rc = deflateEnd(&slot->zs);
+        if (mango_guest_range_ok(lib, r0, MANGO_Z_GUEST)) {
+          mango_store_u32_guest(lib->guest_mem, r0 + 28u, 0);
+        }
+        memset(slot, 0, sizeof(*slot));
+      }
+      mango_z_log("deflateEnd", rc, r0, rc != Z_OK);
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_DEFLATERESET: {
+      MangoZSlot* slot = mango_z_find(r0);
+      int rc = Z_STREAM_ERROR;
+      if (slot != NULL && slot->mode == MANGO_Z_DEFLATE) {
+        rc = deflateReset(&slot->zs);
+        if (rc == Z_OK) {
+          mango_z_writeback(lib, slot, 0);
+        }
+      }
+      cpu->r[0] = (uint32_t)rc;
+      break;
+    }
+    case MANGO_LIBC_CRC32: {
+      /* crc32(crc, buf, len). A NULL buf returns the initial value. */
+      uLong crc = (uLong)r0;
+      if (r1 == 0 || r2 == 0) {
+        cpu->r[0] = (uint32_t)crc32(crc, Z_NULL, 0);
+      } else if (!mango_guest_range_ok(lib, r1, r2)) {
+        cpu->r[0] = r0;
+      } else {
+        cpu->r[0] = (uint32_t)crc32(crc, lib->guest_mem + r1, r2);
+      }
+      break;
+    }
+    case MANGO_LIBC_ZLIBVERSION: {
+      const char* ver = zlibVersion();
+      if (g_zver_guest == 0 && ver != NULL) {
+        g_zver_guest = mango_guest_strdup(lib, ver);
+      }
+      cpu->r[0] = g_zver_guest;
+      break;
+    }
     case MANGO_LIBC_SETJMP: {
       /* Bionic ARM: stm {r4-r11, sp, lr} into jmp_buf (10 words). */
       if (!mango_guest_range_ok(lib, r0, 40u)) {
@@ -7569,6 +8019,7 @@ static int mango_unload_library(void* handle) {
         g_nslots = 0;
         g_nkeys = 1;
         memset(g_tsd, 0, sizeof(g_tsd));
+        mango_z_reset_all();
       }
       return 0;
     }
