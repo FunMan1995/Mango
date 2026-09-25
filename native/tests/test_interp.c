@@ -4522,6 +4522,78 @@ static int test_t32_ldrsb_w_imm12(void) {
   return 0;
 }
 
+static int test_t32_ldrsb_w_imm8(void) {
+  /* Q-OTTD-0cv: ldrsb r4, [lr, #1]! = f91e 4f01 (llvm-mc [1e,f9,01,4f]).
+   * Sign-extend the byte at lr+1, then lr = lr+1. NZCV hold.
+   * Post is f91e 4b01. Negative pre is f91e 4d01. BX r0 stops so LR
+   * can be the base. LDRSBT, Rt/Rn=PC, WB into Rt, and the register
+   * form stay closed. */
+  static const uint16_t kPre[] = {0xF91Eu, 0x4F01u, 0x4700u};
+  static const uint16_t kPost[] = {0xF91Eu, 0x4B01u, 0x4700u};
+  static const uint16_t kNeg[] = {0xF91Eu, 0x4D01u, 0x4700u};
+  uint8_t mem_buf[64];
+  MangoInsn di;
+  if (mango_decode_t32(0xF91Eu, 0x4F01u, &di) != 0 || di.op != MANGO_OP_LDRSB || di.rd != 4 ||
+      di.rn != 14 || di.is_imm != 1 || di.imm != 1 || di.p != 1 || di.u != 1 || di.w != 1) {
+    fprintf(stderr, "FAIL(t32_ldrsb_imm8): decode op=%d rd=%u rn=%u imm=%u p=%d u=%d w=%d\n", di.op,
+            di.rd, di.rn, di.imm, di.p, di.u, di.w);
+    return 1;
+  }
+  if (mango_decode_t32(0xF91Eu, 0x4B01u, &di) != 0 || di.p != 0 || di.u != 1 || di.w != 1) {
+    fprintf(stderr, "FAIL(t32_ldrsb_imm8): post p=%d u=%d w=%d\n", di.p, di.u, di.w);
+    return 1;
+  }
+  if (mango_decode_t32(0xF91Eu, 0x4D01u, &di) != 0 || di.p != 1 || di.u != 0 || di.w != 1) {
+    fprintf(stderr, "FAIL(t32_ldrsb_imm8): neg p=%d u=%d w=%d\n", di.p, di.u, di.w);
+    return 1;
+  }
+  if (mango_decode_t32(0xF91Eu, 0x4A01u, &di) == 0 || mango_decode_t32(0xF91Eu, 0xFF01u, &di) == 0 ||
+      mango_decode_t32(0xF91Fu, 0x4F01u, &di) == 0 || mango_decode_t32(0xF914u, 0x4F01u, &di) == 0 ||
+      mango_decode_t32(0xF91Eu, 0x4001u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_ldrsb_imm8): LDRSBT, PC, WB-into-Rt, or register decoded\n");
+    return 1;
+  }
+
+  struct {
+    const uint16_t* prog;
+    uint32_t base;
+    uint32_t at;
+    uint8_t byte;
+    uint32_t want;
+    uint32_t lr_after;
+  } cases[] = {
+      {kPre, 0x20u, 0x21u, 0x80u, 0xffffff80u, 0x21u},
+      {kPre, 0x20u, 0x21u, 0x7fu, 0x7fu, 0x21u},
+      {kPre, 0x20u, 0x21u, 0x00u, 0u, 0x21u},
+      {kPost, 0x20u, 0x20u, 0xfeu, 0xfffffffeu, 0x21u},
+      {kNeg, 0x21u, 0x20u, 0x01u, 0x01u, 0x20u},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    memset(mem_buf, 0, sizeof(mem_buf));
+    load_halfwords(mem_buf, sizeof(mem_buf), cases[c].prog, 3);
+    mem_buf[cases[c].at] = cases[c].byte;
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = 0xABCDu;
+    cpu.r[4] = 0x11111111u;
+    cpu.r[14] = cases[c].base;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    uint32_t want_nzcv = cpsr_before & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[4] != cases[c].want || cpu.r[14] != cases[c].lr_after ||
+        cpu.r[0] != 0xABCDu || nzcv != want_nzcv) {
+      fprintf(stderr, "FAIL(t32_ldrsb_imm8#%u): rc=%d r4=%x want %x lr=%x want %x nzcv=%x\n", c, rc,
+              cpu.r[4], cases[c].want, cpu.r[14], cases[c].lr_after, nzcv);
+      return 1;
+    }
+  }
+  printf("ok: T32 LDRSB r4, [lr, #1]! (Q-OTTD-0cv)\n");
+  return 0;
+}
+
 static int test_t32_adds_w_imm0(void) {
   /* Q-OTTD-0ak: adds.w r6,r10,#0 = f11a 0600. r6 = r10; NZCV from the add.
    * Adding zero clears C and V. Rn=PC stays closed. CMN is Q-OTTD-0cp. */
@@ -12487,6 +12559,7 @@ int main(void) {
   failures += test_t32_stmdb();
   failures += test_t32_stmia_r12_wb();
   failures += test_t32_ldrsb_w_imm12();
+  failures += test_t32_ldrsb_w_imm8();
   failures += test_t32_adds_w_imm0();
   failures += test_t32_subs_w_imm16();
   failures += test_t32_ldrex_strex();

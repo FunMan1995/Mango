@@ -2748,8 +2748,8 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0aj: T32 LDRSB.W Rt,[Rn,#imm12] T1 — F990 class.
    * OpenTTD f992 3000 = ldrsb.w r3,[r2] (imm12=0). Mirror 0g LDRSH (F9B0).
-   * Reuse MANGO_OP_LDRSB (byte sign-extend). Reject Rt/Rn=PC. Not the
-   * register form (F910 bit11=0) and not writeback. */
+   * Reuse MANGO_OP_LDRSB (byte sign-extend). Reject Rt/Rn=PC. Imm8
+   * P/U/W is Q-OTTD-0cv. Register form (F910 bit11=0) stays closed. */
   if ((hw1 & 0xFFF0u) == 0xF990u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rt = (hw2 >> 12) & 0xFu;
@@ -2765,6 +2765,38 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->p = 1;
     out->u = 1;
     out->w = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0cv: T32 LDRSB.W Rt,[Rn,#±imm8]!? T4 — F910 class, bit11=1.
+   * RecomputePrices f91e 4f01 = ldrsb r4, [lr, #1]! (llvm-mc
+   * [1e,f9,01,4f]). Sign-extend the byte. Mirror 0bn LDRSH imm8.
+   * Distinct from F990 imm12 and from the register form (bit11=0).
+   * Reject LDRSBT (P=0 W=0), Rt/Rn=PC, and writeback into Rt. */
+  if ((hw1 & 0xFFF0u) == 0xF910u && (hw2 & 0x0800u) != 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rt = (hw2 >> 12) & 0xFu;
+    uint32_t imm8 = hw2 & 0xFFu;
+    int p = (int)((hw2 >> 10) & 1u);
+    int u = (int)((hw2 >> 9) & 1u);
+    int w = (int)((hw2 >> 8) & 1u);
+    if (p == 0 && w == 0) {
+      return -1; /* LDRSBT */
+    }
+    if (rt == MANGO_REG_PC || rn == MANGO_REG_PC) {
+      return -1;
+    }
+    if (w && rt == rn) {
+      return -1;
+    }
+    out->op = MANGO_OP_LDRSB;
+    out->rd = rt;
+    out->rn = rn;
+    out->is_imm = 1;
+    out->imm = imm8;
+    out->p = p;
+    out->u = u;
+    out->w = w;
     return 0;
   }
 
