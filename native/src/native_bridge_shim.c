@@ -34,7 +34,10 @@
 #include "mango/native_bridge.h"
 
 #define MANGO_STACK_SIZE 0x10000u
-#define MANGO_HEAP_SIZE 0x1000000u
+/* 40 MiB bump heap. 32 MiB still died on a 38080-byte calloc after
+ * the 16 MiB sprite cache. ICU (~23 MiB) is mapped after heap+stack
+ * and still fits in the 96 MiB guest space. */
+#define MANGO_HEAP_SIZE 0x2800000u
 #define MANGO_JNI_TABLE_LEN 256u
 #define MANGO_JVM_TABLE_LEN 8u
 #define MANGO_JNI_THUNK_SIZE 16u
@@ -2121,14 +2124,40 @@ static const char* mango_fake_jstring_chars(MangoLoadedLibrary* lib, void* js) {
   return (const char*)js;
 }
 
+/* Every loaded library snapshots heap_used at setup, then bumps its
+ * own copy. Allocations share one cursor: the highest heap_used. */
+static MangoLoadedLibrary* mango_bump_owner(MangoLoadedLibrary* hint) {
+  MangoLoadedLibrary* best = hint;
+  for (int i = 0; i < g_nlibs; i++) {
+    if (g_libs[i] != NULL && (best == NULL || g_libs[i]->heap_used > best->heap_used)) {
+      best = g_libs[i];
+    }
+  }
+  return best;
+}
+
+static void mango_bump_set(MangoLoadedLibrary* hint, uint32_t used) {
+  int any = 0;
+  for (int i = 0; i < g_nlibs; i++) {
+    if (g_libs[i] != NULL) {
+      g_libs[i]->heap_used = used;
+      any = 1;
+    }
+  }
+  if (!any && hint != NULL) {
+    hint->heap_used = used;
+  }
+}
+
 static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n) {
+  MangoLoadedLibrary* heap = mango_bump_owner(lib);
   n = (n + 7u) & ~7u;
-  if (n == 0 || lib->heap_used + n > MANGO_HEAP_SIZE) {
+  if (heap == NULL || n == 0 || n > MANGO_HEAP_SIZE || heap->heap_used > MANGO_HEAP_SIZE - n) {
     return 0;
   }
-  uint32_t a = lib->heap_base + lib->heap_used;
-  memset(lib->guest_mem + a, 0, n);
-  lib->heap_used += n;
+  uint32_t a = heap->heap_base + heap->heap_used;
+  memset(heap->guest_mem + a, 0, n);
+  mango_bump_set(heap, heap->heap_used + n);
   return a;
 }
 
@@ -2725,16 +2754,20 @@ static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, ui
 }
 
 static uint32_t mango_guest_strdup(MangoLoadedLibrary* lib, const char* s) {
+  MangoLoadedLibrary* heap;
+  uint32_t n;
+  uint32_t addr;
   if (s == NULL) {
     return 0;
   }
-  size_t n = strlen(s) + 1;
-  if (lib->heap_used + n > MANGO_HEAP_SIZE) {
+  heap = mango_bump_owner(lib);
+  n = (uint32_t)((strlen(s) + 1u + 3u) & ~3u);
+  if (heap == NULL || n > MANGO_HEAP_SIZE || heap->heap_used > MANGO_HEAP_SIZE - n) {
     return 0;
   }
-  uint32_t addr = lib->heap_base + lib->heap_used;
-  memcpy(lib->guest_mem + addr, s, n);
-  lib->heap_used += (uint32_t)((n + 3u) & ~3u);
+  addr = heap->heap_base + heap->heap_used;
+  memcpy(heap->guest_mem + addr, s, strlen(s) + 1u);
+  mango_bump_set(heap, heap->heap_used + n);
   return addr;
 }
 
@@ -3025,52 +3058,64 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
   uint32_t r2 = cpu->r[2];
   switch (fn) {
     case MANGO_LIBC_MALLOC: {
+      MangoLoadedLibrary* heap = mango_bump_owner(lib);
       uint32_t n = (r0 + 7u) & ~7u;
+      uint32_t used = heap->heap_used;
       if (n == 0) {
         n = 8u;
       }
-      if (n > MANGO_HEAP_SIZE || lib->heap_used > MANGO_HEAP_SIZE - n) {
+      if (n > MANGO_HEAP_SIZE || used > MANGO_HEAP_SIZE - n) {
         if (!mango_new_fail_to_spritecache(cpu)) {
+          static int s_malloc_fail;
+          if (s_malloc_fail < 4) {
+            fprintf(stderr, "mango: malloc fail n=%u heap=%u/%u\n", n, used, MANGO_HEAP_SIZE);
+            s_malloc_fail++;
+          }
           cpu->r[0] = 0;
         }
       } else {
-        cpu->r[0] = lib->heap_base + lib->heap_used;
-        lib->heap_used += n;
+        cpu->r[0] = heap->heap_base + used;
+        mango_bump_set(heap, used + n);
         g_bump_last = cpu->r[0];
         g_bump_last_n = n;
-        g_bump_lib = lib;
+        g_bump_lib = heap;
       }
       break;
     }
     case MANGO_LIBC_REALLOC: {
       /* Unity MemoryManager realloc: r0=old (may be 0), r1=new bytes. */
+      MangoLoadedLibrary* heap = mango_bump_owner(lib);
       uint32_t old = r0;
       uint32_t n = (r1 + 7u) & ~7u;
+      uint32_t used = heap->heap_used;
       uint32_t neu;
       if (n == 0) {
         n = 8u;
       }
-      if (n > MANGO_HEAP_SIZE || lib->heap_used > MANGO_HEAP_SIZE - n) {
+      if (n > MANGO_HEAP_SIZE || used > MANGO_HEAP_SIZE - n) {
         cpu->r[0] = 0;
         break;
       }
-      neu = lib->heap_base + lib->heap_used;
-      if (old != 0 && old >= lib->heap_base && old < lib->heap_base + lib->heap_used) {
-        uint32_t avail = (lib->heap_base + lib->heap_used) - old;
+      neu = heap->heap_base + used;
+      if (old != 0 && old >= heap->heap_base && old < heap->heap_base + used) {
+        uint32_t avail = (heap->heap_base + used) - old;
         uint32_t copy = n < avail ? n : avail;
-        memmove(lib->guest_mem + neu, lib->guest_mem + old, copy);
+        memmove(heap->guest_mem + neu, heap->guest_mem + old, copy);
       }
-      lib->heap_used += n;
+      mango_bump_set(heap, used + n);
+      g_bump_last = neu;
+      g_bump_last_n = n;
+      g_bump_lib = heap;
       cpu->r[0] = neu;
       break;
     }
     case MANGO_LIBC_FREE:
       /* delete[] of the sprite-cache probe is the most recent bump.
        * Rewind that block so the following smaller new can fit. */
-      if (r0 != 0 && r0 == g_bump_last && lib == g_bump_lib && g_bump_last_n != 0 &&
-          lib->heap_used >= g_bump_last_n &&
-          r0 + g_bump_last_n == lib->heap_base + lib->heap_used) {
-        lib->heap_used -= g_bump_last_n;
+      if (r0 != 0 && r0 == g_bump_last && g_bump_lib != NULL && g_bump_last_n != 0 &&
+          g_bump_lib->heap_used >= g_bump_last_n &&
+          r0 + g_bump_last_n == g_bump_lib->heap_base + g_bump_lib->heap_used) {
+        mango_bump_set(g_bump_lib, g_bump_lib->heap_used - g_bump_last_n);
         g_bump_last = 0;
         g_bump_last_n = 0;
       }
@@ -3553,17 +3598,28 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = 1;
       break;
     case MANGO_LIBC_CALLOC: {
+      MangoLoadedLibrary* heap = mango_bump_owner(lib);
       uint64_t n = (uint64_t)r0 * (uint64_t)r1;
+      uint32_t used = heap->heap_used;
       if (n == 0) {
         n = 8;
       }
       n = (n + 7ull) & ~7ull;
-      if (n > MANGO_HEAP_SIZE || lib->heap_used > MANGO_HEAP_SIZE - (uint32_t)n) {
+      if (n > MANGO_HEAP_SIZE || used > MANGO_HEAP_SIZE - (uint32_t)n) {
+        static int s_calloc_fail;
+        if (s_calloc_fail < 4) {
+          fprintf(stderr, "mango: calloc fail n=%u heap=%u/%u\n", (unsigned)n, used,
+                  MANGO_HEAP_SIZE);
+          s_calloc_fail++;
+        }
         cpu->r[0] = 0;
       } else {
-        cpu->r[0] = lib->heap_base + lib->heap_used;
-        memset(lib->guest_mem + cpu->r[0], 0, (size_t)n);
-        lib->heap_used += (uint32_t)n;
+        cpu->r[0] = heap->heap_base + used;
+        memset(heap->guest_mem + cpu->r[0], 0, (size_t)n);
+        mango_bump_set(heap, used + (uint32_t)n);
+        g_bump_last = cpu->r[0];
+        g_bump_last_n = (uint32_t)n;
+        g_bump_lib = heap;
       }
       break;
     }
