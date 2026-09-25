@@ -3650,6 +3650,56 @@ static int test_t32_and_w_reg(void) {
   return 0;
 }
 
+static int test_t32_tst_w_reg(void) {
+  /* Q-OTTD-0co: tst.w r8, r3 = ea18 0f03 (llvm-mc [18,ea,03,0f]).
+   * Flags from r8 & r3. LSL #0 leaves C. V holds. Registers hold.
+   * ANDS Rd≠15 stays closed. */
+  static const uint16_t kProg[] = {0xEA18u, 0x0F03u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t rn, rm, extra, nzcv;
+  } cases[] = {
+      {0xff00u, 0x0ff0u, MANGO_CPSR_C | MANGO_CPSR_V, MANGO_CPSR_C | MANGO_CPSR_V},
+      {0u, 0xffffffffu, MANGO_CPSR_C | MANGO_CPSR_V, MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V},
+      {0x80000000u, 0x80000000u, MANGO_CPSR_V, MANGO_CPSR_N | MANGO_CPSR_V},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xEA18u, 0x0F03u, &di) != 0 || di.op != MANGO_OP_TST || di.rn != 8 ||
+      di.rm != 3 || di.is_imm != 0 || di.shift_amount != 0 || di.sets_flags != 1) {
+    fprintf(stderr, "FAIL(t32_tst_w): decode op=%d rn=%u rm=%u amt=%u s=%d\n", di.op, di.rn, di.rm,
+            di.shift_amount, di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xEA18u, 0x0F83u, &di) != 0 || di.shift_amount != 2 || di.shift_type != 0) {
+    fprintf(stderr, "FAIL(t32_tst_w): lsl #2 amt=%u type=%u\n", di.shift_amount, di.shift_type);
+    return 1;
+  }
+  if (mango_decode_t32(0xEA18u, 0x0103u, &di) == 0 || mango_decode_t32(0xEA1Fu, 0x0F03u, &di) == 0 ||
+      mango_decode_t32(0xEA18u, 0x0F0Fu, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_tst_w): ANDS or PC decoded\n");
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | cases[c].extra;
+    cpu.r[8] = cases[c].rn;
+    cpu.r[3] = cases[c].rm;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[8] != cases[c].rn || cpu.r[3] != cases[c].rm || nzcv != cases[c].nzcv) {
+      fprintf(stderr, "FAIL(t32_tst_w#%u): rc=%d r8=%x r3=%x nzcv=%x want %x\n", c, rc, cpu.r[8],
+              cpu.r[3], nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+  printf("ok: T32 TST.W r8, r3 (Q-OTTD-0co)\n");
+  return 0;
+}
+
 static int test_t32_mvn_w_reg(void) {
   /* Q-OTTD-0bl: mvn.w r10,r2 = ea6f 0a02. r10 = ~r2. Flags and r2 hold.
    * MVNS (ea7f) stays closed. ORN is Q-OTTD-0bm. */
@@ -12043,6 +12093,7 @@ int main(void) {
   failures += test_t32_orr_w_reg_lsl6();
   failures += test_t32_eor_w_reg();
   failures += test_t32_and_w_reg();
+  failures += test_t32_tst_w_reg();
   failures += test_t32_mvn_w_reg();
   failures += test_t32_orn_w_reg();
   failures += test_t32_lsl_w_reg();
