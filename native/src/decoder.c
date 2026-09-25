@@ -2160,7 +2160,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0bk: AND.W Rd,Rn,Rm{,shift} register, S=0.
    * MD5 ea0b 0303 = and.w r3,r11,r3 (llvm-mc [0b,ea,03,03]);
    * next in the same round is ea08 030b = and.w r3,r8,r11.
-   * ANDS with Rd≠15 stays closed. TST (Rd=15, S=1) is Q-OTTD-0co.
+   * ANDS Rd≠15 is Q-OTTD-0cu. TST (Rd=15, S=1) is Q-OTTD-0co.
    * Reject Rd/Rn/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEA00u && (hw1 & 0x10u) == 0 && (hw2 & 0x8000u) == 0) {
     uint32_t rn = hw1 & 0xFu;
@@ -2185,7 +2185,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
 
   /* Q-OTTD-0co: T32 TST.W Rn,Rm{,shift}. GetGlobalVariable ea18 0f03 =
    * tst.w r8, r3 (llvm-mc [18,ea,03,0f]). ANDS with Rd=15: flags only.
-   * LSL #0 leaves C. ANDS Rd≠15 stays closed. Reject Rn/Rm=PC. */
+   * LSL #0 leaves C. ANDS Rd≠15 is Q-OTTD-0cu. Reject Rn/Rm=PC. */
   if ((hw1 & 0xFFE0u) == 0xEA00u && (hw1 & 0x10u) != 0 && (hw2 & 0x8F00u) == 0x0F00u) {
     uint32_t rn = hw1 & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -2195,6 +2195,31 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       return -1;
     }
     out->op = MANGO_OP_TST;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 1;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0cu: T32 ANDS.W Rd,Rn,Rm{,shift}. AfterLoadGame ea18 0606 =
+   * ands.w r6, r8, r6 (llvm-mc [18,ea,06,06]). Rd = Rn & shifted Rm.
+   * NZ from the result, C from the shifter, V unchanged. LSL #0 leaves
+   * C. Rd=15 stays TST (block above). Reject Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA00u && (hw1 & 0x10u) != 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_AND;
+    out->rd = rd;
     out->rn = rn;
     out->rm = rm;
     out->is_imm = 0;
