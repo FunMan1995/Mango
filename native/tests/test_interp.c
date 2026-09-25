@@ -8920,15 +8920,83 @@ static int test_t32_uxtb_w(void) {
   return 0;
 }
 
+static int test_t32_sxtb_w(void) {
+  /* Q-OTTD-0cw: sxtb.w r9, r3 = fa4f f983 (llvm-mc [4f,fa,83,f9]).
+   * r9 = sign_extend(r3[7:0]). Flags and r3 hold. ror #8 is fa4f f993.
+   * SXTAB and SXTH.W stay closed. */
+  static const uint16_t kProg[] = {0xFA4Fu, 0xF983u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t in, want;
+  } cases[] = {
+      {0x80u, 0xffffff80u},
+      {0x7fu, 0x7fu},
+      {0u, 0u},
+      {0x12345600u, 0u},
+      {0xffffffffu, 0xffffffffu},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xFA4Fu, 0xF983u, &di) != 0 || di.op != MANGO_OP_XTEND || di.rd != 9 ||
+      di.rm != 3 || di.rn != 15 || di.imm != 0 || di.u != 0 || di.b != 0 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_sxtb): decode op=%d rd=%u rm=%u u=%d b=%d imm=%u\n", di.op, di.rd,
+            di.rm, di.u, di.b, di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xFA4Fu, 0xFF83u, &di) == 0 || mango_decode_t32(0xFA4Fu, 0xF98Fu, &di) == 0 ||
+      mango_decode_t32(0xFA43u, 0xF983u, &di) == 0 || mango_decode_t32(0xFA0Fu, 0xF983u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_sxtb): PC, SXTAB, or SXTH decoded\n");
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[3] = cases[c].in;
+    cpu.r[9] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[9] != cases[c].want || cpu.r[3] != cases[c].in || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_sxtb#%u): rc=%d r9=%x want %x cpsr %x->%x\n", c, rc, cpu.r[9],
+              cases[c].want, cpsr_before, cpu.cpsr);
+      return 1;
+    }
+  }
+  static const uint16_t kRot[] = {0xFA4Fu, 0xF993u, 0x4770u};
+  load_halfwords(mem_buf, sizeof(mem_buf), kRot, 3);
+  if (mango_decode_t32(0xFA4Fu, 0xF993u, &di) != 0 || di.imm != 8 || di.u != 0 || di.b != 0) {
+    fprintf(stderr, "FAIL(t32_sxtb ror): imm=%u u=%d b=%d\n", di.imm, di.u, di.b);
+    return 1;
+  }
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_V;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[3] = 0x00008000u;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[9] != 0xffffff80u || cpu.r[3] != 0x00008000u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_sxtb ror): rc=%d r9=%x cpsr %x->%x\n", rc, cpu.r[9], cpsr_before,
+            cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 SXTB.W r9, r3 (Q-OTTD-0cw)\n");
+  return 0;
+}
+
 static int test_t32_uxth_w_reject(void) {
-  /* SXTH.W / SXTB.W stay closed; UXTH Rd/Rm=PC reject. UXTB.W is 0bg. */
+  /* SXTH.W stays closed. SXTB.W is Q-OTTD-0cw. UXTH Rd/Rm=PC reject. */
   MangoInsn di;
   if (mango_decode_t32(0xFA0Fu, 0xFA81u, &di) == 0) {
     fprintf(stderr, "FAIL(t32_uxth_w_reject): SXTH.W fa0ffa81 decoded as op=%d\n", di.op);
     return 1;
   }
-  if (mango_decode_t32(0xFA4Fu, 0xFA81u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_uxth_w_reject): SXTB.W fa4ffa81 decoded as op=%d\n", di.op);
+  if (mango_decode_t32(0xFA4Fu, 0xFA81u, &di) != 0 || di.op != MANGO_OP_XTEND || di.rd != 10 ||
+      di.rm != 1 || di.u != 0 || di.b != 0) {
+    fprintf(stderr, "FAIL(t32_uxth_w_reject): SXTB.W fa4ffa81 is Q-OTTD-0cw op=%d\n", di.op);
     return 1;
   }
   /* fa1f ff81 = UXTH.W pc,r1 — Rd=PC */
@@ -8941,7 +9009,7 @@ static int test_t32_uxth_w_reject(void) {
     fprintf(stderr, "FAIL(t32_uxth_w_reject): Rm=PC fa1ffa8f decoded as op=%d\n", di.op);
     return 1;
   }
-  printf("ok: T32 UXTH.W reject SXTH/SXTB/PC; UXTB.W is 0bg (Q-OTTD-0o)\n");
+  printf("ok: T32 UXTH.W reject SXTH/PC; SXTB.W is 0cw (Q-OTTD-0o)\n");
   return 0;
 }
 
@@ -12639,6 +12707,7 @@ int main(void) {
   failures += test_t32_uxth_w_ror8();
   failures += test_t32_uxth_w_reject();
   failures += test_t32_uxtb_w();
+  failures += test_t32_sxtb_w();
   failures += test_t32_dmb_sy_nop();
   failures += test_t32_dmb_ish_sib();
   failures += test_a32_dmb_sy_still_nop();

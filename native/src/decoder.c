@@ -3593,8 +3593,9 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * Guest fa1f fa81 = uxth.w r10,r1 (rot=0); sib fa1f fa8a = uxth.w r10,r10.
    * Encoding (hw2): 1111 | Rd | 10 | rotate | Rm — rot in bits[5:4];
    * bits[7:6] fixed 10. imm=((hw2>>4)&3)*8 (execute already RORs).
-   * Map → XTEND u=1 b=1 rn=15. UXTB.W is Q-OTTD-0bg. SXTH.W/SXTB.W
-   * (FA0F/FA4F) and accumulate Rn≠15 stay closed. Reject Rd/Rm=PC. */
+   * Map → XTEND u=1 b=1 rn=15. UXTB.W is Q-OTTD-0bg. SXTB.W is
+   * Q-OTTD-0cw. SXTH.W (FA0F) and accumulate Rn≠15 stay closed.
+   * Reject Rd/Rm=PC. */
   if (hw1 == 0xFA1Fu && (hw2 & 0xF0C0u) == 0xF080u) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -3615,7 +3616,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0bg: T32 UXTB.W Rd,Rm{,ROR#} — Rn=15, unsigned byte.
    * SDL fa5f f588 = uxtb.w r5,r8 (llvm-mc [5f,fa,88,f5]); sib fa5f fb86.
    * Same hw2 shape as UXTH.W. b=0. UXTAB (Rn≠15) is Q-OTTD-0ch.
-   * SXTB and SXTAH stay closed. */
+   * SXTB.W is Q-OTTD-0cw. SXTAH stays closed. */
   if (hw1 == 0xFA5Fu && (hw2 & 0xF0C0u) == 0xF080u) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
@@ -3628,6 +3629,27 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     out->rn = 15u;
     out->imm = ((hw2 >> 4) & 3u) * 8u;
     out->u = 1;
+    out->b = 0; /* byte */
+    out->sets_flags = 0;
+    return 0;
+  }
+
+  /* Q-OTTD-0cw: T32 SXTB.W Rd,Rm{,ROR#} — Rn=15, signed byte.
+   * DrawCommonTileSeq fa4f f983 = sxtb.w r9, r3 (llvm-mc [4f,fa,83,f9]).
+   * Same hw2 shape as UXTB.W with u=0 so bit 7 sign-extends. Flags hold.
+   * SXTAB (Rn≠15) and SXTH.W stay closed. Reject Rd/Rm=PC. */
+  if (hw1 == 0xFA4Fu && (hw2 & 0xF0C0u) == 0xF080u) {
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_XTEND;
+    out->rd = rd;
+    out->rm = rm;
+    out->rn = 15u;
+    out->imm = ((hw2 >> 4) & 3u) * 8u;
+    out->u = 0;
     out->b = 0; /* byte */
     out->sets_flags = 0;
     return 0;
