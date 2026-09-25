@@ -4081,13 +4081,75 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_PTHREAD_CREATE: {
       /* SDL_OpenAudio treats EAGAIN as fatal ("Couldn't create audio
        * thread") and the guest exits. Store a pthread_t and return 0.
-       * The start routine is not run: the interpreter stays single-threaded
-       * and SDL's audio loop does not return. sem_wait is still a zero stub,
-       * so SDL_CreateThread's SemWait does not block. */
+       * SDL's audio start routine is not run: it loops and the interpreter
+       * stays single-threaded. sem_wait is still a zero stub, so
+       * SDL_CreateThread's SemWait does not block.
+       * libapplication ThreadObject_pthread::stThreadProc (file 0x351f48)
+       * is different: ScanNewGRFFiles uses it and then waits on the modal
+       * dialog. Run that payload on this thread so the scan finishes. */
       static uint32_t next_id = 2;
       uint32_t id = next_id++;
+      uint32_t start = r2 & ~1u;
+      uint32_t obj = cpu->r[3];
+      int thread_obj = 0;
       if (id == 0u) {
         id = next_id++;
+      }
+      /* stThreadProc is push {r4,lr}; mov r4,r0; ldr r3,[r0,#8].
+       * Match the bytes so the libc thunk's load bias does not matter. */
+      if (start != 0 && mango_guest_range_ok(lib, start, 6u)) {
+        uint16_t h0 = (uint16_t)(lib->guest_mem[start] | (lib->guest_mem[start + 1u] << 8));
+        uint16_t h1 = (uint16_t)(lib->guest_mem[start + 2u] | (lib->guest_mem[start + 3u] << 8));
+        uint16_t h2 = (uint16_t)(lib->guest_mem[start + 4u] | (lib->guest_mem[start + 5u] << 8));
+        if (h0 == 0xb510u && h1 == 0x4604u && h2 == 0x6883u) {
+          thread_obj = 1;
+        }
+      }
+      if (thread_obj && obj != 0 && mango_guest_range_ok(lib, obj, 16u)) {
+        uint32_t payload = mango_load_u32_guest(lib->guest_mem, obj + 8u);
+        uint32_t arg = mango_load_u32_guest(lib->guest_mem, obj + 12u);
+        int is_scan = 0;
+        uint32_t pay_off = payload & ~1u;
+        for (int i = 0; i < g_nlibs; i++) {
+          if (g_libs[i] != NULL && pay_off == g_libs[i]->load_bias + 0x27f680u) {
+            is_scan = 1;
+            break;
+          }
+        }
+        /* Only DoScanNewGRFFiles. Other stThreadProc payloads (world-gen
+         * abort, SDL audio) must not run here: audio never returns, and a
+         * bare mango_interp_run stops at the first SVC. */
+        if (is_scan) {
+          MangoCpu nested = *cpu;
+          fprintf(stderr, "mango: DoScanNewGRFFiles inline arg=%#x\n", arg);
+          fflush(stderr);
+          nested.r[0] = arg;
+          nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+          nested.cpsr |= MANGO_CPSR_T;
+          nested.r[MANGO_REG_PC] = pay_off;
+          {
+            int rc = mango_run_guest(lib, &nested, NULL);
+            uint32_t modal_addr = 0;
+            for (int i = 0; i < g_nlibs; i++) {
+              if (g_libs[i] != NULL && strstr(g_libs[i]->path, "libapplication.so") != NULL) {
+                modal_addr = g_libs[i]->load_bias + 0x970721u;
+                break;
+              }
+            }
+            /* DoScan calls SetModalProgress(false) on the way out, but the
+             * byte is still 1 when it returns. The main thread then redraws
+             * the 0% dialog forever. Clear it so that redraw is not modal. */
+            if (modal_addr != 0 && mango_guest_range_ok(lib, modal_addr, 1u)) {
+              lib->guest_mem[modal_addr] = 0;
+            }
+            fprintf(stderr, "mango: DoScanNewGRFFiles rc=%d pc=%#x modal=%u\n", rc,
+                    nested.r[MANGO_REG_PC],
+                    (modal_addr != 0 && mango_guest_range_ok(lib, modal_addr, 1u))
+                        ? lib->guest_mem[modal_addr]
+                        : 0xffu);
+            fflush(stderr);
+          }
+        }
       }
       if (r0 != 0 && mango_guest_range_ok(lib, r0, 4u)) {
         mango_store_u32_guest(lib->guest_mem, r0, id);
