@@ -3594,7 +3594,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
    * Encoding (hw2): 1111 | Rd | 10 | rotate | Rm — rot in bits[5:4];
    * bits[7:6] fixed 10. imm=((hw2>>4)&3)*8 (execute already RORs).
    * Map → XTEND u=1 b=1 rn=15. UXTB.W is Q-OTTD-0bg. SXTB.W is
-   * Q-OTTD-0cw. SXTH.W (FA0F) and accumulate Rn≠15 stay closed.
+   * Q-OTTD-0cw. SXTH.W is Q-OTTD-0cy. Accumulate Rn≠15 stays closed.
    * Reject Rd/Rm=PC. */
   if (hw1 == 0xFA1Fu && (hw2 & 0xF0C0u) == 0xF080u) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -3613,9 +3613,30 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0cy: T32 SXTH.W Rd,Rm{,ROR#} — Rn=15, signed halfword.
+   * Hash::Get fa0f f888 = sxth.w r8, r8 (llvm-mc [0f,fa,88,f8]).
+   * Same hw2 shape as UXTH.W with u=0. SXTAH (Rn≠15) is Q-OTTD-0cx.
+   * Reject Rd/Rm=PC. */
+  if (hw1 == 0xFA0Fu && (hw2 & 0xF0C0u) == 0xF080u) {
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_XTEND;
+    out->rd = rd;
+    out->rm = rm;
+    out->rn = 15u;
+    out->imm = ((hw2 >> 4) & 3u) * 8u;
+    out->u = 0;
+    out->b = 1; /* halfword */
+    out->sets_flags = 0;
+    return 0;
+  }
+
   /* Q-OTTD-0bg: T32 UXTB.W Rd,Rm{,ROR#} — Rn=15, unsigned byte.
    * SDL fa5f f588 = uxtb.w r5,r8 (llvm-mc [5f,fa,88,f5]); sib fa5f fb86.
-   * Same hw2 shape as UXTH.W. b=0. UXTAB (Rn≠15) is Q-OTTD-0ch.
+   * Same hw2 shape as UXTH.W. b=0. UXTAB (Rn!=15) is Q-OTTD-0ch.
    * SXTB.W is Q-OTTD-0cw. SXTAH is Q-OTTD-0cx. */
   if (hw1 == 0xFA5Fu && (hw2 & 0xF0C0u) == 0xF080u) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
@@ -3637,7 +3658,7 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
   /* Q-OTTD-0cw: T32 SXTB.W Rd,Rm{,ROR#} — Rn=15, signed byte.
    * DrawCommonTileSeq fa4f f983 = sxtb.w r9, r3 (llvm-mc [4f,fa,83,f9]).
    * Same hw2 shape as UXTB.W with u=0 so bit 7 sign-extends. Flags hold.
-   * SXTAB (Rn≠15) and SXTH.W stay closed. Reject Rd/Rm=PC. */
+   * SXTAB (Rn≠15) stays closed. SXTH.W is Q-OTTD-0cy. Reject Rd/Rm=PC. */
   if (hw1 == 0xFA4Fu && (hw2 & 0xF0C0u) == 0xF080u) {
     uint32_t rd = (hw2 >> 8) & 0xFu;
     uint32_t rm = hw2 & 0xFu;
