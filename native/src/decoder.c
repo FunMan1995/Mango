@@ -3608,6 +3608,25 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* Q-OTTD-0cm: T32 REV.W Rd,Rm. grfmsg fa93 fc83 = rev.w r12, r3
+   * (llvm-mc [93,fa,83,fc]). Same bytes as A32 REV. REV16 is hw2 bit4
+   * (fc93), REVSH is bits[5:4]=11 (fcb3). bits[5:4]=10 stays closed.
+   * Both halfwords name Rm. Reject Rd/Rm=PC. */
+  if ((hw1 & 0xFFF0u) == 0xFA90u && (hw2 & 0xF0C0u) == 0xF080u) {
+    uint32_t rm = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm2 = hw2 & 0xFu;
+    uint32_t kind = (hw2 >> 4) & 3u;
+    if (rd == MANGO_REG_PC || rm == MANGO_REG_PC || rm != rm2 || kind == 2u) {
+      return -1;
+    }
+    out->op = MANGO_OP_REV;
+    out->rd = rd;
+    out->rm = rm;
+    out->imm = (kind == 3u) ? 2u : kind;
+    return 0;
+  }
+
   /* Q-OTTD-0af: T32 CLZ Rd,Rm (DDI0597). OpenTTD SDL_main stop
    * pc=0x26f430 word 0xf080fab0 = clz r0,r0 (llvm-mc [0xb0,0xfa,0x80,0xf0]).
    * hw1 1111 1010 1011 Rm, hw2 1111 Rd 1000 Rm. Both Rm fields must match.

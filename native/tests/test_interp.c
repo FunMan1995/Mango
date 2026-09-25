@@ -9711,6 +9711,47 @@ static int test_t32_lsls_w_reg(void) {
   return 0;
 }
 
+static int test_t32_rev_w(void) {
+  /* Q-OTTD-0cm: rev.w r12, r3 = fa93 fc83 (llvm-mc [93,fa,83,fc]).
+   * 0x12345678 → 0x78563412. NZCV unchanged. */
+  static const uint16_t kProg[] = {0xFA93u, 0xFC83u, 0x4770u};
+  uint8_t mem_buf[16];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  MangoInsn di;
+  if (mango_decode_t32(0xFA93u, 0xFC83u, &di) != 0 || di.op != MANGO_OP_REV || di.rd != 12 ||
+      di.rm != 3 || di.imm != 0) {
+    fprintf(stderr, "FAIL(t32_rev_w): decode op=%d rd=%u rm=%u imm=%u\n", di.op, di.rd, di.rm,
+            di.imm);
+    return 1;
+  }
+  if (mango_decode_t32(0xFA93u, 0xFC93u, &di) != 0 || di.imm != 1 ||
+      mango_decode_t32(0xFA93u, 0xFCB3u, &di) != 0 || di.imm != 2) {
+    fprintf(stderr, "FAIL(t32_rev_w): REV16/REVSH decode\n");
+    return 1;
+  }
+  if (mango_decode_t32(0xFA93u, 0xFCA3u, &di) == 0 || mango_decode_t32(0xFA93u, 0xFF83u, &di) == 0 ||
+      mango_decode_t32(0xFA9Fu, 0xFC8Fu, &di) == 0 || mango_decode_t32(0xFA93u, 0xFC81u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_rev_w): kind 2, PC, or mismatched Rm decoded\n");
+    return 1;
+  }
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_V;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[3] = 0x12345678u;
+  cpu.r[12] = 0;
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  if (rc != 0 || cpu.r[12] != 0x78563412u || cpu.r[3] != 0x12345678u || cpu.cpsr != cpsr_before) {
+    fprintf(stderr, "FAIL(t32_rev_w): rc=%d r12=%x cpsr %x->%x\n", rc, cpu.r[12], cpsr_before,
+            cpu.cpsr);
+    return 1;
+  }
+  printf("ok: T32 REV.W r12, r3 (Q-OTTD-0cm)\n");
+  return 0;
+}
+
 static int test_t32_ands_w_modimm_1(void) {
   /* Q-OTTD-0ac: ands.w r3,r3,#1 = f013 0301.
    * ThumbExpandImm(0x001)=1. R3 = R3 & 1; S=1 updates NZCV; pc+=4. */
@@ -12065,6 +12106,7 @@ int main(void) {
   failures += test_t32_ldrd_post_32();
   failures += test_t32_umlal();
   failures += test_t32_lsls_w_reg();
+  failures += test_t32_rev_w();
   failures += test_t32_ands_w_modimm_1();
   failures += test_t32_and_w_modimm_s0();
   failures += test_t32_ands_w_modimm_ff();
