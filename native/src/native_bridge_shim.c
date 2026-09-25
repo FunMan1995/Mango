@@ -2135,6 +2135,10 @@ static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n) {
 /* File-backed mmap lives after the heap reservation. Anonymous GC maps
  * stay in the heap (see MANGO_LIBC_MMAP). */
 static uint32_t g_filemap_next;
+/* Most recent bump allocation, so free can rewind that one block. */
+static uint32_t g_bump_last;
+static uint32_t g_bump_last_n;
+static MangoLoadedLibrary* g_bump_lib;
 
 static uint32_t mango_file_mmap(MangoLoadedLibrary* lib, int host_fd, uint32_t length,
                                 uint32_t offset) {
@@ -3032,6 +3036,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       } else {
         cpu->r[0] = lib->heap_base + lib->heap_used;
         lib->heap_used += n;
+        g_bump_last = cpu->r[0];
+        g_bump_last_n = n;
+        g_bump_lib = lib;
       }
       break;
     }
@@ -3058,6 +3065,15 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_FREE:
+      /* delete[] of the sprite-cache probe is the most recent bump.
+       * Rewind that block so the following smaller new can fit. */
+      if (r0 != 0 && r0 == g_bump_last && lib == g_bump_lib && g_bump_last_n != 0 &&
+          lib->heap_used >= g_bump_last_n &&
+          r0 + g_bump_last_n == lib->heap_base + lib->heap_used) {
+        lib->heap_used -= g_bump_last_n;
+        g_bump_last = 0;
+        g_bump_last_n = 0;
+      }
       break;
     case MANGO_LIBC_MEMCPY:
     case MANGO_LIBC_AEABI_MEMCPY:
