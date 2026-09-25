@@ -9890,6 +9890,74 @@ static int test_t32_lsls_w_imm1(void) {
   return 0;
 }
 
+static int test_t32_sxtah(void) {
+  /* Q-OTTD-0cx: sxtah r3, r0, r3 = fa00 f383 (llvm-mc [00,fa,83,f3]).
+   * r3 = r0 + sign-extended low halfword of r3. Flags and r0 hold.
+   * ror #8 is fa00 f393. SXTH.W and SXTAB stay closed. */
+  static const uint16_t kProg[] = {0xFA00u, 0xF383u, 0x4770u};
+  uint8_t mem_buf[32];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  struct {
+    uint32_t r0, r3, want;
+  } cases[] = {
+      {0x4a0u, 0x59u, 0x4f9u},
+      {1u, 0x8000u, 0xffff8001u},
+      {5u, 0xffffu, 4u},
+      {0u, 0x7fffu, 0x7fffu},
+  };
+  MangoInsn di;
+  if (mango_decode_t32(0xFA00u, 0xF383u, &di) != 0 || di.op != MANGO_OP_XTEND || di.rd != 3 ||
+      di.rn != 0 || di.rm != 3 || di.u != 0 || di.b != 1 || di.imm != 0 || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_sxtah): decode op=%d rd=%u rn=%u u=%d b=%d\n", di.op, di.rd, di.rn,
+            di.u, di.b);
+    return 1;
+  }
+  if (mango_decode_t32(0xFA00u, 0xFF83u, &di) == 0 || mango_decode_t32(0xFA0Fu, 0xF383u, &di) == 0 ||
+      mango_decode_t32(0xFA00u, 0xF38Fu, &di) == 0 || mango_decode_t32(0xFA40u, 0xF383u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_sxtah): PC, SXTH, or SXTAB decoded\n");
+    return 1;
+  }
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = cases[c].r0;
+    cpu.r[3] = cases[c].r3;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[3] != cases[c].want || cpu.r[0] != cases[c].r0 || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_sxtah#%u): rc=%d r3=%x want %x cpsr=%x\n", c, rc, cpu.r[3],
+              cases[c].want, cpu.cpsr);
+      return 1;
+    }
+  }
+  static const uint16_t kRot[] = {0xFA00u, 0xF393u, 0x4770u};
+  load_halfwords(mem_buf, sizeof(mem_buf), kRot, 3);
+  if (mango_decode_t32(0xFA00u, 0xF393u, &di) != 0 || di.imm != 8 || di.u != 0 || di.b != 1) {
+    fprintf(stderr, "FAIL(t32_sxtah ror): imm=%u u=%d b=%d\n", di.imm, di.u, di.b);
+    return 1;
+  }
+  {
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_V;
+    uint32_t cpsr_before = cpu.cpsr;
+    cpu.r[0] = 1u;
+    cpu.r[3] = 0x00800000u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[3] != 0xffff8001u || cpu.r[0] != 1u || cpu.cpsr != cpsr_before) {
+      fprintf(stderr, "FAIL(t32_sxtah ror): rc=%d r3=%x cpsr=%x\n", rc, cpu.r[3], cpu.cpsr);
+      return 1;
+    }
+  }
+  printf("ok: T32 SXTAH r3, r0, r3 (Q-OTTD-0cx)\n");
+  return 0;
+}
+
 static int test_t32_uxtab(void) {
   /* Q-OTTD-0ch: uxtab r3, r3, r1 = fa53 f381 (llvm-mc [53,fa,81,f3]).
    * r3 = r3 + zero-extended byte of r1. Flags hold. */
@@ -12726,6 +12794,7 @@ int main(void) {
   failures += test_t32_sbcs_w_reg();
   failures += test_t32_sbc_w_reg();
   failures += test_t32_lsls_w_imm1();
+  failures += test_t32_sxtah();
   failures += test_t32_uxtab();
   failures += test_t32_adds_w_reg();
   failures += test_t32_ldrd_neg16();
