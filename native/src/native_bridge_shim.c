@@ -2979,6 +2979,42 @@ static uint32_t mango_dir_intern(MangoLoadedLibrary* lib, DIR* dir) {
   return 0;
 }
 
+/* Sprite-cache new[] is inside try/catch (bad_alloc). On failure, skip
+ * the throw and resume at the handler that stores NULL and halves the size.
+ * new[] frame is push {r3, lr}; its caller LR has the Thumb bit. */
+static int mango_new_fail_to_spritecache(MangoCpu* cpu) {
+  MangoLoadedLibrary* app = NULL;
+  uint32_t bias, sp, caller;
+  int i;
+  for (i = 0; i < g_nlibs; i++) {
+    if (g_libs[i] != NULL && strstr(g_libs[i]->path, "libapplication.so") != NULL) {
+      app = g_libs[i];
+      break;
+    }
+  }
+  if (app == NULL || cpu->r[MANGO_REG_LR] != app->load_bias + 0x459c94u) {
+    return 0;
+  }
+  bias = app->load_bias;
+  sp = cpu->r[MANGO_REG_SP];
+  if (!mango_guest_range_ok(app, sp, 8u)) {
+    return 0;
+  }
+  caller = mango_load_u32_guest(app->guest_mem, sp + 4u);
+  if (caller != ((bias + 0x32c21cu) | 1u) && caller != ((bias + 0x32c22cu) | 1u)) {
+    return 0;
+  }
+  cpu->r[MANGO_REG_SP] = sp + 8u;
+  cpu->r[7] = 0;
+  if (cpu->r[4] != 0 && mango_guest_range_ok(app, cpu->r[4] + 4u, 4u)) {
+    mango_store_u32_guest(app->guest_mem, cpu->r[4] + 4u, 0);
+  }
+  cpu->cpsr |= MANGO_CPSR_T;
+  /* SVC epilogue adds 2 while T is set. */
+  cpu->r[MANGO_REG_PC] = (bias + 0x32c2b4u) - 2u;
+  return 1;
+}
+
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
@@ -2989,8 +3025,10 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       if (n == 0) {
         n = 8u;
       }
-      if (lib->heap_used + n > MANGO_HEAP_SIZE) {
-        cpu->r[0] = 0;
+      if (n > MANGO_HEAP_SIZE || lib->heap_used > MANGO_HEAP_SIZE - n) {
+        if (!mango_new_fail_to_spritecache(cpu)) {
+          cpu->r[0] = 0;
+        }
       } else {
         cpu->r[0] = lib->heap_base + lib->heap_used;
         lib->heap_used += n;
@@ -3005,7 +3043,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       if (n == 0) {
         n = 8u;
       }
-      if (lib->heap_used + n > MANGO_HEAP_SIZE) {
+      if (n > MANGO_HEAP_SIZE || lib->heap_used > MANGO_HEAP_SIZE - n) {
         cpu->r[0] = 0;
         break;
       }
@@ -3504,7 +3542,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         n = 8;
       }
       n = (n + 7ull) & ~7ull;
-      if (n > MANGO_HEAP_SIZE || lib->heap_used + (uint32_t)n > MANGO_HEAP_SIZE) {
+      if (n > MANGO_HEAP_SIZE || lib->heap_used > MANGO_HEAP_SIZE - (uint32_t)n) {
         cpu->r[0] = 0;
       } else {
         cpu->r[0] = lib->heap_base + lib->heap_used;
@@ -6887,6 +6925,22 @@ static int mango_is_ofdp_unity(const MangoLoadedLibrary* lib) {
   return strcmp(base, "libunity.so") == 0;
 }
 
+/* Sprite cache does new byte[size + size/2] inside try/catch (bad_alloc)
+ * and halves the size until it fits. There is no unwinder, so operator new
+ * returns NULL instead of throwing. new[] is a tail into this function. */
+static void mango_patch_openttd_new(MangoLoadedLibrary* lib) {
+  uint32_t fn;
+  if (lib == NULL || lib->path[0] == '\0' || strstr(lib->path, "libapplication.so") == NULL) {
+    return;
+  }
+  fn = lib->load_bias + 0x459c10u;
+  if (!mango_guest_range_ok(lib, fn, MANGO_JNI_THUNK_SIZE) ||
+      mango_load_u32_guest(lib->guest_mem, fn) != 0xe3500000u) {
+    return;
+  }
+  mango_write_jni_thunk(lib->guest_mem, fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_MALLOC);
+}
+
 static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
   uint32_t alloc_fn, alloc2_fn, realloc_fn, hdr, sen;
   if (!mango_is_ofdp_unity(lib)) {
@@ -7163,6 +7217,7 @@ static void* mango_load_library(const char* libpath, int flag) {
     return NULL;
   }
   mango_patch_ofdp_unity(lib);
+  mango_patch_openttd_new(lib);
   mango_patch_meritous_img_load(lib);
   mango_patch_meritous_skip_plasma(lib);
   mango_seed_ofdp_mono_gc(lib);
