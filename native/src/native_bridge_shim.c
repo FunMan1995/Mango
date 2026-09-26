@@ -4945,9 +4945,16 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
        * window up. Then one click on New Game: motion, left down, left up
        * at the 640x480 menu interior pixel (240,160). Button-down copies
        * x/y only on the right-click-emulate path, so the motion is what
-       * places the cursor. That click calls ShowGenerateLandscape. */
+       * places the cursor. That click calls ShowGenerateLandscape.
+       * The generate window is created in that frame's GameLoop, after the
+       * drain returns 0. Eight more empty polls are frames with the window
+       * laid out. Then one click on the green Generate button (widget 8):
+       * screen (480,280), window origin (31,91) plus pos (330,120) and
+       * size 238x140. That click calls StartGeneratingLandscape. */
       static int s_quiet_left = 8;
       static int s_click = 0;
+      static int s_gen_quiet = 8;
+      static int s_gen_click = 0;
       uint32_t ev = r0;
       int openttd = mango_loaded_lib_named("libapplication.so");
       if (s_inject_left > 0 && ev != 0 && mango_guest_range_ok(lib, ev, 16u)) {
@@ -4987,6 +4994,34 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           fflush(stderr);
         }
         s_click++;
+        cpu->r[0] = 1;
+      } else if (openttd && s_gen_quiet > 0) {
+        s_gen_quiet--;
+        cpu->r[0] = 0;
+      } else if (openttd && s_gen_click < 3 && ev != 0 && mango_guest_range_ok(lib, ev, 16u)) {
+        uint8_t type = 4u; /* SDL_MOUSEMOTION */
+        uint8_t button = 0u;
+        uint8_t state = 0u;
+        if (s_gen_click == 1) {
+          type = 5u; /* SDL_MOUSEBUTTONDOWN */
+          button = 1u; /* SDL_BUTTON_LEFT */
+          state = 1u; /* SDL_PRESSED */
+        } else if (s_gen_click == 2) {
+          type = 6u; /* SDL_MOUSEBUTTONUP */
+          button = 1u;
+          state = 0u; /* SDL_RELEASED */
+        }
+        memset(lib->guest_mem + ev, 0, 16u);
+        lib->guest_mem[ev + 0u] = type;
+        lib->guest_mem[ev + 2u] = button;
+        lib->guest_mem[ev + 3u] = state;
+        /* Screen pixel, not window-relative. Interior of widget 8. */
+        mango_store_u32_guest(lib->guest_mem, ev + 4u, 480u | (280u << 16));
+        if (s_gen_click == 0) {
+          fprintf(stderr, "mango: generate click at 480,280\n");
+          fflush(stderr);
+        }
+        s_gen_click++;
         cpu->r[0] = 1;
       } else {
         cpu->r[0] = 0;
