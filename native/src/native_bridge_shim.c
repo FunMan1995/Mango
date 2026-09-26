@@ -34,10 +34,12 @@
 #include "mango/native_bridge.h"
 
 #define MANGO_STACK_SIZE 0x10000u
-/* 40 MiB bump heap. 32 MiB still died on a 38080-byte calloc after
- * the 16 MiB sprite cache. ICU (~23 MiB) is mapped after heap+stack
- * and still fits in the 96 MiB guest space. */
-#define MANGO_HEAP_SIZE 0x2800000u
+/* 128 MiB bump heap. OpenTTD probes new[] of cache*3/2, frees it, then
+ * keeps `cache`. A 40 MiB heap only fit the 16 MiB cache (the 32 MiB
+ * step's probe is 48 MiB). That 16 MiB pool stays full and evicts
+ * sprites the menu still draws. 128 MiB lets the 64 MiB cache's 96 MiB
+ * probe succeed, and the 128 MiB step still fails closed. */
+#define MANGO_HEAP_SIZE 0x8000000u
 #define MANGO_JNI_TABLE_LEN 256u
 #define MANGO_JVM_TABLE_LEN 8u
 #define MANGO_JNI_THUNK_SIZE 16u
@@ -327,9 +329,11 @@
 #define MANGO_SL_CREATE_AUDIO_PLAYER 2
 #define MANGO_SL_COUNT 3
 
-/* 96 MiB: libraries use the low 32 MiB, the heap is 16 MiB, and a
- * file-backed mmap of icudt52l.dat is about 23 MiB past the heap. */
-#define MANGO_AS_SIZE 0x6000000u
+/* 256 MiB. Libraries use the low 32 MiB and the heap reservation is
+ * 128 MiB. icudt52l.dat (~23 MiB) is mapped after that reservation;
+ * the OpenTTD drive placed it at 0xa013000, ending near 0xb680000,
+ * with room left for another file map. */
+#define MANGO_AS_SIZE 0x10000000u
 #define MANGO_LIB_CAP 0x2000000u
 #define MANGO_MAX_LIBS 16
 
