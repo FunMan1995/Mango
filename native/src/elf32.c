@@ -3,8 +3,16 @@
 #include <string.h>
 
 #define MANGO_PT_LOAD 1u
+#define MANGO_PT_DYNAMIC 2u
 #define MANGO_PF_X 1u
 #define MANGO_SHT_DYNSYM 11u
+#define MANGO_DT_PLTRELSZ 2u
+#define MANGO_DT_INIT 12u
+#define MANGO_DT_REL 17u
+#define MANGO_DT_RELSZ 18u
+#define MANGO_DT_JMPREL 23u
+#define MANGO_DT_INIT_ARRAY 25u
+#define MANGO_DT_INIT_ARRAYSZ 27u
 
 static int read_u16(const uint8_t* data, uint32_t size, uint32_t off, uint16_t* out) {
   if (off + 2 > size) {
@@ -23,14 +31,16 @@ static int read_u32(const uint8_t* data, uint32_t size, uint32_t off, uint32_t* 
   return 0;
 }
 
-int mango_elf32_parse(const uint8_t* data, uint32_t size, uint16_t expected_machine, MangoElf32Image* out) {
+int mango_elf32_parse(const uint8_t* data, uint32_t size, uint16_t expected_machine,
+                      MangoElf32Image* out) {
   uint16_t e_machine, e_phentsize, e_phnum, e_shentsize, e_shnum;
   uint32_t e_entry, e_phoff, e_shoff;
 
   memset(out, 0, sizeof(*out));
-  if (size < 52 || memcmp(data, "\x7f"
-                                 "ELF",
-                           4) != 0) {
+  if (size < 52 || memcmp(data,
+                          "\x7f"
+                          "ELF",
+                          4) != 0) {
     return -1; /* too small to even hold an ELF32 header, or not an ELF file at all */
   }
   if (data[4] != 1 || data[5] != 1) {
@@ -68,6 +78,38 @@ int mango_elf32_parse(const uint8_t* data, uint32_t size, uint16_t expected_mach
         read_u32(data, size, (uint32_t)phdr_off + 20, &p_memsz) != 0 ||
         read_u32(data, size, (uint32_t)phdr_off + 24, &p_flags) != 0) {
       return -1;
+    }
+    if (p_type == MANGO_PT_DYNAMIC) {
+      uint32_t dyn_off = p_offset;
+      uint32_t dyn_end = p_offset + p_filesz;
+      if (dyn_end < dyn_off || dyn_end > size) {
+        return -1;
+      }
+      for (uint32_t off = dyn_off; off + 8u <= dyn_end; off += 8u) {
+        uint32_t tag, val;
+        if (read_u32(data, size, off, &tag) != 0 || read_u32(data, size, off + 4u, &val) != 0) {
+          return -1;
+        }
+        if (tag == 0) {
+          break;
+        }
+        if (tag == MANGO_DT_REL) {
+          out->rel_vaddr = val;
+        } else if (tag == MANGO_DT_RELSZ) {
+          out->rel_size = val;
+        } else if (tag == MANGO_DT_JMPREL) {
+          out->jmprel_vaddr = val;
+        } else if (tag == MANGO_DT_PLTRELSZ) {
+          out->jmprel_size = val;
+        } else if (tag == MANGO_DT_INIT) {
+          out->init_fn = val;
+        } else if (tag == MANGO_DT_INIT_ARRAY) {
+          out->init_array_vaddr = val;
+        } else if (tag == MANGO_DT_INIT_ARRAYSZ) {
+          out->init_array_size = val;
+        }
+      }
+      continue;
     }
     if (p_type != MANGO_PT_LOAD) {
       continue;
@@ -145,4 +187,108 @@ uint32_t mango_elf32_find_symbol(const MangoElf32Image* image, const char* name)
     }
   }
   return 0;
+}
+
+static void store_u32_le(uint8_t* p, uint32_t v) {
+  p[0] = (uint8_t)(v & 0xFFu);
+  p[1] = (uint8_t)((v >> 8) & 0xFFu);
+  p[2] = (uint8_t)((v >> 16) & 0xFFu);
+  p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static int mango_elf32_sym_at(const MangoElf32Image* image, uint32_t idx, uint32_t* st_value,
+                              uint16_t* st_shndx, const char** name) {
+  if (idx >= image->symtab_count) {
+    return -1;
+  }
+  uint32_t sym_off = image->symtab_offset + idx * 16u;
+  uint32_t st_name;
+  uint32_t value;
+  uint16_t shndx;
+  if (read_u32(image->data, image->size, sym_off + 0u, &st_name) != 0 ||
+      read_u32(image->data, image->size, sym_off + 4u, &value) != 0 ||
+      read_u16(image->data, image->size, sym_off + 14u, &shndx) != 0) {
+    return -1;
+  }
+  *st_value = value;
+  *st_shndx = shndx;
+  *name = "";
+  if (st_name != 0) {
+    uint32_t name_off = image->strtab_offset + st_name;
+    if (name_off < image->size) {
+      *name = (const char*)image->data + name_off;
+    }
+  }
+  return 0;
+}
+
+static int mango_elf32_apply_rel_table(const MangoElf32Image* image, uint8_t* mem,
+                                       uint32_t mem_size, uint32_t table_vaddr, uint32_t table_size,
+                                       uint32_t load_bias, MangoElf32ResolveFn resolve, void* ctx) {
+  if (table_size == 0) {
+    return 0;
+  }
+  uint32_t table_at = table_vaddr + load_bias;
+  if (table_size % 8u != 0 || (uint64_t)table_at + table_size > mem_size) {
+    return -1;
+  }
+  for (uint32_t i = 0; i < table_size; i += 8u) {
+    uint32_t r_offset =
+        (uint32_t)mem[table_at + i] | ((uint32_t)mem[table_at + i + 1u] << 8) |
+        ((uint32_t)mem[table_at + i + 2u] << 16) | ((uint32_t)mem[table_at + i + 3u] << 24);
+    uint32_t r_info =
+        (uint32_t)mem[table_at + i + 4u] | ((uint32_t)mem[table_at + i + 5u] << 8) |
+        ((uint32_t)mem[table_at + i + 6u] << 16) | ((uint32_t)mem[table_at + i + 7u] << 24);
+    uint32_t type = r_info & 0xFFu;
+    uint32_t sym = r_info >> 8;
+    uint32_t loc = r_offset + load_bias;
+    if ((uint64_t)loc + 4u > mem_size) {
+      return -1;
+    }
+    uint32_t addend = (uint32_t)mem[loc] | ((uint32_t)mem[loc + 1u] << 8) |
+                      ((uint32_t)mem[loc + 2u] << 16) | ((uint32_t)mem[loc + 3u] << 24);
+    if (type == 0) {
+      continue;
+    }
+    if (type == MANGO_R_ARM_RELATIVE) {
+      store_u32_le(mem + loc, addend + load_bias);
+      continue;
+    }
+    if (type != MANGO_R_ARM_ABS32 && type != MANGO_R_ARM_GLOB_DAT &&
+        type != MANGO_R_ARM_JUMP_SLOT) {
+      continue; /* skip unknown types rather than fail the whole image */
+    }
+    uint32_t st_value = 0;
+    uint16_t st_shndx = 0;
+    const char* name = "";
+    if (sym != 0 && mango_elf32_sym_at(image, sym, &st_value, &st_shndx, &name) != 0) {
+      return -1;
+    }
+    uint32_t addr;
+    if (st_shndx != 0) {
+      addr = st_value + load_bias;
+    } else if (resolve != NULL) {
+      addr = resolve(ctx, name, st_value, st_shndx);
+    } else {
+      addr = 0;
+    }
+    if (type == MANGO_R_ARM_ABS32) {
+      addr += addend;
+    }
+    store_u32_le(mem + loc, addr);
+  }
+  return 0;
+}
+
+int mango_elf32_apply_relocs(const MangoElf32Image* image, uint8_t* mem, uint32_t mem_size,
+                             uint32_t load_bias, MangoElf32ResolveFn resolve, void* ctx) {
+  if (image == NULL || mem == NULL) {
+    return -1;
+  }
+  if (mango_elf32_apply_rel_table(image, mem, mem_size, image->rel_vaddr, image->rel_size,
+                                  load_bias, resolve, ctx) != 0) {
+    return -1;
+  }
+  return mango_elf32_apply_rel_table(image, mem, mem_size, image->jmprel_vaddr, image->jmprel_size,
+                                     load_bias, resolve, ctx);
 }
