@@ -5103,7 +5103,7 @@ static int test_t32_bfi(void) {
 
 static int test_t32_rsb_w_imm1(void) {
   /* Q-OTTD-0am: rsb.w r4,r0,#1 = f1c0 0401. r4 = 1 - r0; NZCV unchanged.
-   * RSBS f1d0 0401 and Rd/Rn=PC stay closed. */
+   * RSBS f1d0 0401 is Q-OTTD-0da. Rd/Rn=PC stay closed. */
   static const uint16_t kProg[] = {0xF1C0u, 0x0401u, 0x4770u};
   uint8_t mem_buf[32];
   load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
@@ -5114,9 +5114,13 @@ static int test_t32_rsb_w_imm1(void) {
             di.imm, di.sets_flags);
     return 1;
   }
-  if (mango_decode_t32(0xF1D0u, 0x0401u, &di) == 0 || mango_decode_t32(0xF1C0u, 0x0F01u, &di) == 0 ||
-      mango_decode_t32(0xF1CFu, 0x0401u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_rsb_w): RSBS, Rd=PC, or Rn=PC decoded\n");
+  if (mango_decode_t32(0xF1D0u, 0x0401u, &di) != 0 || di.op != MANGO_OP_RSB || di.sets_flags != 1 ||
+      di.rd != 4 || di.rn != 0 || di.imm != 1u) {
+    fprintf(stderr, "FAIL(t32_rsb_w): RSBS f1d00401 is Q-OTTD-0da op=%d s=%d\n", di.op, di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xF1C0u, 0x0F01u, &di) == 0 || mango_decode_t32(0xF1CFu, 0x0401u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_rsb_w): Rd=PC or Rn=PC decoded\n");
     return 1;
   }
 
@@ -5145,6 +5149,63 @@ static int test_t32_rsb_w_imm1(void) {
     }
   }
   printf("ok: T32 RSB.W r4,r0,#1 (Q-OTTD-0am)\n");
+  return 0;
+}
+
+static int test_t32_rsbs_w_imm0(void) {
+  /* Q-OTTD-0da: rsbs.w r10, r0, #0 = f1d0 0a00 (llvm-mc [d0,f1,00,0a]).
+   * r10 = 0 - r0. NZCV from the subtract. #1 is f1d0 0a01. */
+  struct {
+    uint16_t hw2;
+    uint32_t imm, in, want, nzcv;
+  } cases[] = {
+      {0x0A00u, 0u, 0u, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0x0A00u, 0u, 1u, 0xffffffffu, MANGO_CPSR_N},
+      {0x0A00u, 0u, 0x80000000u, 0x80000000u, MANGO_CPSR_N | MANGO_CPSR_V},
+      {0x0A00u, 0u, 0xffffffffu, 1u, 0u},
+      {0x0A01u, 1u, 0u, 1u, MANGO_CPSR_C},
+      {0x0A01u, 1u, 1u, 0u, MANGO_CPSR_Z | MANGO_CPSR_C},
+      {0x0A01u, 1u, 2u, 0xffffffffu, MANGO_CPSR_N},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    uint8_t mem_buf[32];
+    uint16_t prog[3] = {0xF1D0u, cases[c].hw2, 0x4770u};
+    MangoInsn di;
+    load_halfwords(mem_buf, sizeof(mem_buf), prog, 3);
+    if (mango_decode_t32(0xF1D0u, cases[c].hw2, &di) != 0 || di.op != MANGO_OP_RSB || di.rd != 10 ||
+        di.rn != 0 || di.is_imm != 1 || di.imm != cases[c].imm || di.sets_flags != 1) {
+      fprintf(stderr, "FAIL(t32_rsbs_w#%u): decode op=%d imm=%u s=%d\n", c, di.op, di.imm,
+              di.sets_flags);
+      return 1;
+    }
+    MangoCpu cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_V;
+    cpu.r[0] = cases[c].in;
+    cpu.r[10] = 0x11111111u;
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    uint32_t nzcv = cpu.cpsr & (MANGO_CPSR_N | MANGO_CPSR_Z | MANGO_CPSR_C | MANGO_CPSR_V);
+    if (rc != 0 || cpu.r[10] != cases[c].want || cpu.r[0] != cases[c].in || nzcv != cases[c].nzcv ||
+        (cpu.cpsr & MANGO_CPSR_T) == 0) {
+      fprintf(stderr, "FAIL(t32_rsbs_w#%u): rc=%d r10=%x want %x nzcv=%x want %x\n", c, rc, cpu.r[10],
+              cases[c].want, nzcv, cases[c].nzcv);
+      return 1;
+    }
+  }
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF1C0u, 0x0A00u, &di) != 0 || di.op != MANGO_OP_RSB || di.sets_flags != 0) {
+    fprintf(stderr, "FAIL(t32_rsbs_w): S=0 f1c00a00 should stay RSB s=%d\n", di.sets_flags);
+    return 1;
+  }
+  if (mango_decode_t32(0xF1D0u, 0x0F00u, &di) == 0 || mango_decode_t32(0xF1DFu, 0x0A00u, &di) == 0 ||
+      mango_decode_t32(0xEBD0u, 0x0A00u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_rsbs_w): PC or register RSBS decoded\n");
+    return 1;
+  }
+  printf("ok: T32 RSBS.W r10, r0, #0 (Q-OTTD-0da)\n");
   return 0;
 }
 
@@ -12845,6 +12906,7 @@ int main(void) {
   failures += test_t16_rev16();
   failures += test_t32_bfi();
   failures += test_t32_rsb_w_imm1();
+  failures += test_t32_rsbs_w_imm0();
   failures += test_t32_rsb_w_reg_lsl();
   failures += test_t32_tbb_pc();
   failures += test_t32_mov_w_modimm_0();
