@@ -3142,6 +3142,15 @@ static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, ui
   return n == 0 || ((uint64_t)addr + n <= lib->guest_mem_size);
 }
 
+static int mango_loaded_lib_named(const char* needle) {
+  for (int i = 0; i < g_nlibs; i++) {
+    if (g_libs[i] != NULL && strstr(g_libs[i]->path, needle) != NULL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static uint32_t mango_guest_strdup(MangoLoadedLibrary* lib, const char* s) {
   MangoLoadedLibrary* heap;
   uint32_t n;
@@ -4928,10 +4937,19 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       break;
     }
     case MANGO_LIBC_SDL_POLL_EVENT: {
-      /* Title waits for KEYDOWN after logo. Logo SkipLogoEvents also polls, so
-       * inject SPACE (keysym.sym at event+8 per Meritous HandleEvents) repeatedly. */
+      /* Meritous title and OpenTTD both drain SDL_PollEvent until it returns
+       * 0. SPACE is SDLK at keysym.sym (event+8, SDL 1.2). */
       static int s_inject_left = 64;
+      /* OpenTTD: the first 0 ends that drain and MainLoop's GameLoop creates
+       * the select-game window. The next empty polls are frames with the
+       * window up. Then one click on New Game: motion, left down, left up
+       * at the 640x480 menu interior pixel (240,160). Button-down copies
+       * x/y only on the right-click-emulate path, so the motion is what
+       * places the cursor. That click calls ShowGenerateLandscape. */
+      static int s_quiet_left = 8;
+      static int s_click = 0;
       uint32_t ev = r0;
+      int openttd = mango_loaded_lib_named("libapplication.so");
       if (s_inject_left > 0 && ev != 0 && mango_guest_range_ok(lib, ev, 16u)) {
         lib->guest_mem[ev + 0u] = 2u; /* SDL_KEYDOWN */
         lib->guest_mem[ev + 1u] = 0u; /* which */
@@ -4941,6 +4959,34 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         mango_store_u32_guest(lib->guest_mem, ev + 8u, 32u);
         mango_store_u32_guest(lib->guest_mem, ev + 12u, 0u); /* mod */
         s_inject_left--;
+        cpu->r[0] = 1;
+      } else if (openttd && s_quiet_left > 0) {
+        s_quiet_left--;
+        cpu->r[0] = 0;
+      } else if (openttd && s_click < 3 && ev != 0 && mango_guest_range_ok(lib, ev, 16u)) {
+        uint8_t type = 4u; /* SDL_MOUSEMOTION */
+        uint8_t button = 0u;
+        uint8_t state = 0u;
+        if (s_click == 1) {
+          type = 5u; /* SDL_MOUSEBUTTONDOWN */
+          button = 1u; /* SDL_BUTTON_LEFT */
+          state = 1u; /* SDL_PRESSED */
+        } else if (s_click == 2) {
+          type = 6u; /* SDL_MOUSEBUTTONUP */
+          button = 1u;
+          state = 0u; /* SDL_RELEASED */
+        }
+        memset(lib->guest_mem + ev, 0, 16u);
+        lib->guest_mem[ev + 0u] = type;
+        lib->guest_mem[ev + 2u] = button;
+        lib->guest_mem[ev + 3u] = state;
+        /* x at event+4, y at event+6 (ldrh in VideoDriver_SDL::PollEvent). */
+        mango_store_u32_guest(lib->guest_mem, ev + 4u, 240u | (160u << 16));
+        if (s_click == 0) {
+          fprintf(stderr, "mango: menu click New Game at 240,160\n");
+          fflush(stderr);
+        }
+        s_click++;
         cpu->r[0] = 1;
       } else {
         cpu->r[0] = 0;
