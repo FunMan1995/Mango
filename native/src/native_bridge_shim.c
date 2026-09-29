@@ -3484,10 +3484,19 @@ static int g_openttd_genworld_return_logged;
 static int g_openttd_post_complete_sm_handoff_logged;
 static int g_openttd_softfloat_stall_logged;
 static uint64_t g_openttd_softfloat_at_complete;
+/* research/83: calendar / modal-reassert residual after SM handoff. */
+static int g_openttd_post_complete_calendar_logged;
+static int g_openttd_first_modal_reassert_logged;
+static int g_openttd_set_modal_progress_logged;
+static uint32_t g_openttd_last_first_modal = 0xffffffffu;
+static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
+#define MANGO_OPENTTD_BSS_DATE_FRACT       0x57d11eu
 #define MANGO_OPENTTD_BSS_DATE             0x57d120u
+#define MANGO_OPENTTD_BSS_CUR_MONTH        0x57d124u
+#define MANGO_OPENTTD_BSS_CUR_YEAR         0x57d128u
 #define MANGO_OPENTTD_BSS_GENERATING_WORLD 0x585c1cu
 #define MANGO_OPENTTD_BSS_GW               0x585c20u
 #define MANGO_OPENTTD_BSS_PAUSE_MODE       0x587e34u
@@ -3515,6 +3524,12 @@ static uint64_t g_openttd_softfloat_at_complete;
 #define MANGO_OPENTTD_MAP_DEFAULT          8u
 #define MANGO_OPENTTD_MAP_MIN              6u
 #define MANGO_OPENTTD_MAP_MAX              12u
+/* research/83: game_creation.starting_year at settings+24 (InitializeGame
+ * ldr r0,[settings,#24] → ConvertYMDToDate); default 1950. Do NOT touch map
+ * seed at +28/+29 (Invalid map must stay GONE). */
+#define MANGO_OPENTTD_STARTING_YEAR_OFF    24u
+#define MANGO_OPENTTD_DEFAULT_START_YEAR   1950u
+#define MANGO_OPENTTD_MAX_START_YEAR       5000u
 
 /* OpenTTD code file VAs (libapplication.so) — research/75. */
 #define MANGO_OPENTTD_VA_SWMODE_HELPER     0x22eee8u
@@ -3541,6 +3556,9 @@ static uint64_t g_openttd_softfloat_at_complete;
 #define MANGO_OPENTTD_VA_CLEANUP_GEN_END     0x22dd38u
 #define MANGO_OPENTTD_VA_WAIT_TILL_GEN       0x22dd70u
 #define MANGO_OPENTTD_VA_WAIT_TILL_GEN_END   0x22dde0u
+/* research/83: SetModalProgress always stores _first_in_modal_loop=1. */
+#define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS     0x2d4ff0u
+#define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS_END 0x2d500cu
 
 /* Resolve libapplication.so load bias into *out_bias; return that library or NULL. */
 static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
@@ -3557,6 +3575,10 @@ static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
   }
   return NULL;
 }
+
+/* research/83: forward — soft calendar + modal clear after SM handoff. */
+static void mango_openttd_post_complete_calendar_modal(MangoLoadedLibrary* lib,
+                                                      const char* where);
 
 /* Peer DoScan: clear leftover _in_modal_progress so HasModalProgress() does
  * not early-out a later GenerateWorld (research/74). */
@@ -3757,6 +3779,12 @@ static void mango_openttd_post_complete_leave_wait(MangoLoadedLibrary* lib) {
                          : 0xffu));
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, "post-complete leave-wait");
+  /* research/83: leave-wait cleared first→0; arm reassert watch baseline. */
+  g_openttd_last_first_modal = 0u;
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_DATE, 4u)) {
+    g_openttd_last_date_watch =
+        mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_DATE);
+  }
 }
 
 /* research/82: after genworld complete / leave-wait, _switch_mode may still be
@@ -3789,6 +3817,114 @@ static void mango_openttd_post_complete_sm_handoff(MangoLoadedLibrary* lib) {
           (unsigned)sw_before, (unsigned)MANGO_OPENTTD_SM_NONE);
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, "post-complete SM handoff");
+  /* research/83: seed calendar + keep modal loop clear past SM handoff. */
+  mango_openttd_post_complete_calendar_modal(lib, "post-complete SM handoff");
+}
+
+/* research/83: OpenTTD AccumulDaysOfLeapYears + Jan 1 (mirror ConvertYMDToDate
+ * year/1/1). Month table day-1 cancels for January 1st. */
+static uint32_t mango_openttd_date_jan1(uint32_t year) {
+  uint32_t y;
+  uint32_t leaps;
+  if (year == 0u) {
+    return 0u;
+  }
+  y = year - 1u;
+  leaps = (y / 4u) - (y / 100u) + (y / 400u);
+  return year * 365u + leaps;
+}
+
+/* research/83: soft residual after SM handoff — re-clear modal/first (SetModalProgress
+ * always reasserts _first_in_modal_loop=1) and seed _date/_cur_year from
+ * settings.starting_year (or 1950) when calendar stuck at 0. Map seed untouched. */
+static void mango_openttd_post_complete_calendar_modal(MangoLoadedLibrary* lib,
+                                                      const char* where) {
+  uint32_t bias = 0;
+  uint32_t first_addr;
+  uint32_t modal_addr;
+  uint32_t date_addr;
+  uint32_t year_addr;
+  uint32_t cur_year_addr;
+  uint32_t cur_month_addr;
+  uint32_t fract_addr;
+  uint32_t date_before = 0xffffffffu;
+  uint32_t year = 0;
+  uint32_t date_new = 0;
+  uint32_t first_before = 0xffu;
+  uint32_t modal_before = 0xffu;
+  int seeded = 0;
+  int cleared = 0;
+  if (mango_openttd_app(&bias) == NULL || bias == 0 || lib == NULL ||
+      lib->guest_mem == NULL) {
+    return;
+  }
+  first_addr = bias + MANGO_OPENTTD_BSS_FIRST_MODAL;
+  modal_addr = bias + MANGO_OPENTTD_BSS_IN_MODAL;
+  date_addr = bias + MANGO_OPENTTD_BSS_DATE;
+  year_addr = bias + MANGO_OPENTTD_BSS_SETTINGS_GAME + MANGO_OPENTTD_STARTING_YEAR_OFF;
+  cur_year_addr = bias + MANGO_OPENTTD_BSS_CUR_YEAR;
+  cur_month_addr = bias + MANGO_OPENTTD_BSS_CUR_MONTH;
+  fract_addr = bias + MANGO_OPENTTD_BSS_DATE_FRACT;
+
+  if (mango_guest_range_ok(lib, first_addr, 1u)) {
+    first_before = lib->guest_mem[first_addr];
+    if (first_before != 0u) {
+      lib->guest_mem[first_addr] = 0;
+      cleared = 1;
+    }
+  }
+  if (mango_guest_range_ok(lib, modal_addr, 1u)) {
+    modal_before = lib->guest_mem[modal_addr];
+    if (modal_before != 0u) {
+      lib->guest_mem[modal_addr] = 0;
+      cleared = 1;
+    }
+  }
+
+  if (mango_guest_range_ok(lib, date_addr, 4u)) {
+    date_before = mango_load_u32_guest(lib->guest_mem, date_addr);
+  }
+  if (date_before == 0u && !g_openttd_post_complete_calendar_logged) {
+    if (mango_guest_range_ok(lib, year_addr, 4u)) {
+      year = mango_load_u32_guest(lib->guest_mem, year_addr);
+    }
+    if (year == 0u || year > MANGO_OPENTTD_MAX_START_YEAR) {
+      year = MANGO_OPENTTD_DEFAULT_START_YEAR;
+      if (mango_guest_range_ok(lib, year_addr, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, year_addr, year);
+      }
+    }
+    date_new = mango_openttd_date_jan1(year);
+    mango_store_u32_guest(lib->guest_mem, date_addr, date_new);
+    if (mango_guest_range_ok(lib, cur_year_addr, 4u)) {
+      mango_store_u32_guest(lib->guest_mem, cur_year_addr, year);
+    }
+    if (mango_guest_range_ok(lib, cur_month_addr, 1u)) {
+      lib->guest_mem[cur_month_addr] = 1; /* January (upstream Month 1-based) */
+    }
+    if (mango_guest_range_ok(lib, fract_addr, 2u)) {
+      lib->guest_mem[fract_addr] = 0;
+      lib->guest_mem[fract_addr + 1u] = 0;
+    }
+    seeded = 1;
+    g_openttd_post_complete_calendar_logged = 1;
+    g_openttd_last_date_watch = date_new;
+  }
+
+  if (seeded) {
+    fprintf(stderr,
+            "mango: OpenTTD post-complete calendar/modal (%s) "
+            "first %u->0 modal %u->0 _date %u->%u year=%u\n",
+            where ? where : "?", (unsigned)first_before, (unsigned)modal_before,
+            (unsigned)date_before, (unsigned)date_new, (unsigned)year);
+    fflush(stderr);
+    mango_openttd_log_mode_snapshot(lib, where ? where : "post-complete calendar/modal");
+  } else if (cleared) {
+    fprintf(stderr,
+            "mango: OpenTTD re-clear modal loop (%s) first %u->0 modal %u->0\n",
+            where ? where : "?", (unsigned)first_before, (unsigned)modal_before);
+    fflush(stderr);
+  }
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
@@ -3810,6 +3946,8 @@ static void mango_openttd_note_softfloat_stall(MangoLoadedLibrary* lib, const ch
           (unsigned long long)g_aeabi_calls_total, where ? where : "?");
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, where ? where : "softfloat stall");
+  /* research/83: at stall, _first may be reasserted and _date still 0 — soft again. */
+  mango_openttd_post_complete_calendar_modal(lib, where ? where : "softfloat stall");
 }
 
 /* research/75: poll BSS _switch_mode + PC/LR against helper / SwitchToMode /
@@ -4039,9 +4177,67 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
       fflush(stderr);
     }
   }
-  /* research/82: after leave-wait, detect softfloat freeze during PaletteAnimate. */
+  /* research/83: after SM handoff, watch who reasserts _first_in_modal_loop /
+   * who writes _date, and SetModalProgress (always stores first=1). Soft-clear
+   * on first reassert; seed calendar is one-shot via calendar_modal. */
   if (g_openttd_post_complete_sm_handoff_logged) {
+    uint32_t first_now = 0xffu;
+    uint32_t date_now = 0xffffffffu;
+    int in_set_modal;
+    if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_FIRST_MODAL, 1u)) {
+      first_now = lib->guest_mem[bias + MANGO_OPENTTD_BSS_FIRST_MODAL];
+    }
+    if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_DATE, 4u)) {
+      date_now = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_DATE);
+    }
+    if (first_now != g_openttd_last_first_modal && first_now != 0xffu) {
+      fprintf(stderr,
+              "mango: OpenTTD _first_in_modal_loop change %u -> %u "
+              "(post-SM) pc_off=%#x lr_off=%#x\n",
+              (unsigned)g_openttd_last_first_modal, (unsigned)first_now,
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+      if (g_openttd_last_first_modal == 0u && first_now == 1u &&
+          !g_openttd_first_modal_reassert_logged) {
+        g_openttd_first_modal_reassert_logged = 1;
+        fprintf(stderr,
+                "mango: OpenTTD _first_in_modal_loop reassert after leave-wait "
+                "pc_off=%#x lr_off=%#x\n",
+                (unsigned)pc_off, (unsigned)lr_off);
+        fflush(stderr);
+        mango_openttd_post_complete_calendar_modal(lib, "first-modal reassert");
+      }
+      g_openttd_last_first_modal = first_now;
+    }
+    if (date_now != g_openttd_last_date_watch && date_now != 0xffffffffu) {
+      fprintf(stderr,
+              "mango: OpenTTD _date change %u -> %u (post-SM) pc_off=%#x lr_off=%#x\n",
+              (unsigned)g_openttd_last_date_watch, (unsigned)date_now,
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+      g_openttd_last_date_watch = date_now;
+    }
+    in_set_modal =
+        (pc_off >= MANGO_OPENTTD_VA_SET_MODAL_PROGRESS &&
+         pc_off < MANGO_OPENTTD_VA_SET_MODAL_PROGRESS_END) ||
+        (lr_off >= MANGO_OPENTTD_VA_SET_MODAL_PROGRESS &&
+         lr_off < MANGO_OPENTTD_VA_SET_MODAL_PROGRESS_END);
+    if (in_set_modal && !g_openttd_set_modal_progress_logged) {
+      g_openttd_set_modal_progress_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD SetModalProgress hit (post-SM) pc_off=%#x lr_off=%#x "
+              "r0=%u\n",
+              (unsigned)pc_off, (unsigned)lr_off, (unsigned)cpu->r[0]);
+      fflush(stderr);
+    }
     mango_openttd_note_softfloat_stall(lib, "softfloat stall post-leave-wait");
+  } else if (g_openttd_post_complete_leave_logged) {
+    /* Arm last-first tracker once leave-wait has cleared it to 0. */
+    if (g_openttd_last_first_modal == 0xffffffffu &&
+        mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_FIRST_MODAL, 1u)) {
+      g_openttd_last_first_modal =
+          lib->guest_mem[bias + MANGO_OPENTTD_BSS_FIRST_MODAL];
+    }
   }
 }
 
