@@ -6774,6 +6774,17 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         /* Keep going — mapgen is long; sample already recorded. Cap wall via driver timeout. */
         continue;
       }
+      /* research/76: same continue for OpenTTD post-Generate watches — 2M quanta
+       * alone is fatal in PaletteAnimate before path instruments can fire. Cap
+       * wall via existing OpenTTD driver/watchdog timeout. */
+      if (g_openttd_postgen_armed) {
+        static int s_openttd_postgen_steplimit_logged;
+        if (!s_openttd_postgen_steplimit_logged) {
+          s_openttd_postgen_steplimit_logged = 1;
+          fprintf(stderr, "mango: OpenTTD postgen step-limit continue\n");
+        }
+        continue;
+      }
       fprintf(stderr, "mango: step-limit pc=0x%x lr=0x%x r0=%x r1=%x\n",
               cpu->r[MANGO_REG_PC], cpu->r[MANGO_REG_LR], cpu->r[0], cpu->r[1]);
       return -1;
