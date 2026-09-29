@@ -3486,6 +3486,8 @@ static int g_openttd_mark_screen_dirty_logged;
 static int g_openttd_draw_dirty_blocks_logged;
 /* research/88: MainLoop UpdateWindows after exhausted SVW+MWSD+DDB softs. */
 static int g_openttd_update_windows_logged;
+/* research/89: MainWindow+viewport bring-up after exhausted window-update softs. */
+static int g_openttd_setup_colours_logged;
 static int g_openttd_wait_till_gen_logged;
 static int g_openttd_switchtomode_exit_logged;
 static int g_openttd_genworld_return_logged;
@@ -3590,6 +3592,14 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
  * DrawDirtyBlocks then UpdateViewportPosition). Outside Mark-star/DrawDirty softs. */
 #define MANGO_OPENTTD_VA_UPDATE_WINDOWS     0x39215cu
 #define MANGO_OPENTTD_VA_UPDATE_WINDOWS_END 0x392288u
+/* research/89: SetupColoursAndInitialWindow — no-arg MainWindow+viewport peer (nm
+ * _Z28SetupColoursAndInitialWindowv @ 0x25b281 Thumb; Window ctor + InitNested +
+ * NWidgetViewport::InitializeViewport; GM_NORMAL falls through to ShowVitalWindows).
+ * Outside Mark-star/DrawDirty/UpdateWindows softs. Not ViewportDoDraw (needs
+ * ViewPort-star + iiii), not StartScenario (absent; editor only), not
+ * SwitchToMode(SM_NONE) (disasm hits error()). */
+#define MANGO_OPENTTD_VA_SETUP_COLOURS     0x25b280u
+#define MANGO_OPENTTD_VA_SETUP_COLOURS_END 0x25b3f4u
 /* research/83: SetModalProgress always stores _first_in_modal_loop=1. */
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS     0x2d4ff0u
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS_END 0x2d500cu
@@ -4036,9 +4046,13 @@ static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
  * draw; keep prior vital/dirty softs FIRED; do not re-enter SM_NEWGAME.
  * research/88: SVW+MWSD+DDB exhausted without ViewportDoDraw — soft UpdateWindows
  * (0x39215c) once after DDB (invalidations + DDB + UpdateViewportPosition).
- * Not ViewportDoDraw (needs ViewPort*+iiii), not StartScenario (absent; editor
- * only), not SwitchToMode(SM_NONE) (disasm hits error()); do not re-enter
- * SM_NEWGAME. Keep as nested guest execution; no opcode invent; map seed untouched. */
+ * research/89: SVW+MWSD+DDB+UW exhausted without ViewportDoDraw — soft
+ * SetupColoursAndInitialWindow (0x25b280) once after UpdateWindows (MainWindow +
+ * InitializeViewport; GM_NORMAL → ShowVitalWindows). Not ViewportDoDraw (needs
+ * ViewPort-star + iiii), not StartScenario (absent; editor only), not
+ * SwitchToMode(SM_NONE) (disasm hits error()); do not re-enter SM_NEWGAME.
+ * Outside Mark-star/DrawDirty/UpdateWindows softs. Keep as nested guest
+ * execution; no opcode invent; map seed untouched. */
 static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
                                                 MangoCpu* cpu,
                                                 const char* where) {
@@ -4122,7 +4136,25 @@ static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
           "pc=%#x r0=%#x\n",
           rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
   fflush(stderr);
-  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after UpdateWindows");
+
+  /* research/89: MainWindow + InitializeViewport after exhausted dirty and
+   * window-update softs (SVW+MWSD+DDB+UW). No-arg; GM_NORMAL takes vital path. */
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up SetupColoursAndInitialWindow entry "
+          "pc=%#x lr=%#x\n",
+          (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR]);
+  fflush(stderr);
+  nested = *cpu;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_SETUP_COLOURS;
+  rc = mango_run_guest(lib, &nested, NULL);
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up SetupColoursAndInitialWindow exit "
+          "rc=%d pc=%#x r0=%#x\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after SetupColoursAndInitialWindow");
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
@@ -4308,6 +4340,21 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
       g_openttd_update_windows_logged = 1;
       fprintf(stderr,
               "mango: OpenTTD UpdateWindows watch pc_off=%#x lr_off=%#x\n",
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+    }
+  }
+  {
+    int in_setup_colours =
+        (pc_off >= MANGO_OPENTTD_VA_SETUP_COLOURS &&
+         pc_off < MANGO_OPENTTD_VA_SETUP_COLOURS_END) ||
+        (lr_off >= MANGO_OPENTTD_VA_SETUP_COLOURS &&
+         lr_off < MANGO_OPENTTD_VA_SETUP_COLOURS_END);
+    if (in_setup_colours && !g_openttd_setup_colours_logged) {
+      g_openttd_setup_colours_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD SetupColoursAndInitialWindow watch "
+              "pc_off=%#x lr_off=%#x\n",
               (unsigned)pc_off, (unsigned)lr_off);
       fflush(stderr);
     }
@@ -6259,6 +6306,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_mark_screen_dirty_logged = 0;
           g_openttd_draw_dirty_blocks_logged = 0;
           g_openttd_update_windows_logged = 0;
+          g_openttd_setup_colours_logged = 0;
           g_openttd_wait_till_gen_logged = 0;
           g_openttd_switchtomode_exit_logged = 0;
           g_openttd_genworld_return_logged = 0;
