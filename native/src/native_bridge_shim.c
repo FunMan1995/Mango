@@ -3488,6 +3488,12 @@ static uint64_t g_openttd_softfloat_at_complete;
 static int g_openttd_post_complete_calendar_logged;
 static int g_openttd_first_modal_reassert_logged;
 static int g_openttd_set_modal_progress_logged;
+/* research/84: pin the residual window and real post-calendar draw peers. */
+static int g_openttd_palette_animate_logged;
+static int g_openttd_viewport_draw_logged;
+static int g_openttd_softfloat_window_started_logged;
+static int g_openttd_softfloat_window_ceiling_logged;
+static uint64_t g_openttd_softfloat_window_next_log = 12922253ull;
 static uint32_t g_openttd_last_first_modal = 0xffffffffu;
 static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 
@@ -3556,6 +3562,11 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 #define MANGO_OPENTTD_VA_CLEANUP_GEN_END     0x22dd38u
 #define MANGO_OPENTTD_VA_WAIT_TILL_GEN       0x22dd70u
 #define MANGO_OPENTTD_VA_WAIT_TILL_GEN_END   0x22dde0u
+/* research/84: residual blit and playable landscape draw peers. */
+#define MANGO_OPENTTD_VA_PALETTE_ANIMATE       0x1da234u
+#define MANGO_OPENTTD_VA_PALETTE_ANIMATE_END   0x1da3b4u
+#define MANGO_OPENTTD_VA_VIEWPORT_DRAW         0x38246cu
+#define MANGO_OPENTTD_VA_VIEWPORT_DRAW_END     0x3831d4u
 /* research/83: SetModalProgress always stores _first_in_modal_loop=1. */
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS     0x2d4ff0u
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS_END 0x2d500cu
@@ -3950,6 +3961,43 @@ static void mango_openttd_note_softfloat_stall(MangoLoadedLibrary* lib, const ch
   mango_openttd_post_complete_calendar_modal(lib, where ? where : "softfloat stall");
 }
 
+/* research/84: log progress through the known softfloat freeze window rather
+ * than collapsing it to the first step-limit sample. The PC/LR pair on each
+ * milestone distinguishes the PaletteAnimate blit from a playable draw peer. */
+static void mango_openttd_note_softfloat_window(MangoLoadedLibrary* lib,
+                                                  uint32_t pc_off,
+                                                  uint32_t lr_off) {
+  uint64_t now = g_aeabi_calls_total;
+  const uint64_t start = 12922253ull;
+  const uint64_t ceiling = 13631488ull;
+  (void)lib;
+  if (!g_openttd_softfloat_stall_logged || now < start) {
+    return;
+  }
+  if (!g_openttd_softfloat_window_started_logged) {
+    g_openttd_softfloat_window_started_logged = 1;
+    g_openttd_softfloat_window_next_log = start + 500000ull;
+    fprintf(stderr,
+            "mango: OpenTTD softfloat window start @ %llu pc_off=%#x lr_off=%#x\n",
+            (unsigned long long)now, (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
+  }
+  if (now >= g_openttd_softfloat_window_next_log && now < ceiling) {
+    fprintf(stderr,
+            "mango: OpenTTD softfloat window progress @ %llu pc_off=%#x lr_off=%#x\n",
+            (unsigned long long)now, (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
+    g_openttd_softfloat_window_next_log = now + 500000ull;
+  }
+  if (now >= ceiling && !g_openttd_softfloat_window_ceiling_logged) {
+    g_openttd_softfloat_window_ceiling_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD softfloat window ceiling @ %llu pc_off=%#x lr_off=%#x\n",
+            (unsigned long long)now, (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
+  }
+}
+
 /* research/75: poll BSS _switch_mode + PC/LR against helper / SwitchToMode /
  * GenerateWorld / OnClick widget-8 path. Armed after Generate BUTTONUP. */
 static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
@@ -3964,6 +4012,8 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
   int in_stm;
   int in_gw;
   int in_w8;
+  int in_palette;
+  int in_viewport_draw;
   if (!g_openttd_postgen_armed || lib == NULL || lib->guest_mem == NULL || cpu == NULL) {
     return;
   }
@@ -3992,6 +4042,34 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
   }
   if (lr >= bias) {
     lr_off = lr - bias;
+  }
+  mango_openttd_note_softfloat_window(lib, pc_off, lr_off);
+  in_palette = (pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE &&
+                pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE_END) ||
+               (lr_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE &&
+                lr_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE_END);
+  if (in_palette && g_openttd_genworld_complete_logged &&
+      !g_openttd_palette_animate_logged) {
+    g_openttd_palette_animate_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD PaletteAnimate hit pc_off=%#x lr_off=%#x softfloat=%llu\n",
+            (unsigned)pc_off, (unsigned)lr_off,
+            (unsigned long long)g_aeabi_calls_total);
+    fflush(stderr);
+  }
+  in_viewport_draw = (pc_off >= MANGO_OPENTTD_VA_VIEWPORT_DRAW &&
+                      pc_off < MANGO_OPENTTD_VA_VIEWPORT_DRAW_END) ||
+                     (lr_off >= MANGO_OPENTTD_VA_VIEWPORT_DRAW &&
+                      lr_off < MANGO_OPENTTD_VA_VIEWPORT_DRAW_END);
+  if (in_viewport_draw && g_openttd_genworld_complete_logged &&
+      !g_openttd_viewport_draw_logged) {
+    g_openttd_viewport_draw_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD landscape ViewportDoDraw hit pc_off=%#x lr_off=%#x "
+            "softfloat=%llu\n",
+            (unsigned)pc_off, (unsigned)lr_off,
+            (unsigned long long)g_aeabi_calls_total);
+    fflush(stderr);
   }
   in_helper = (pc_off >= MANGO_OPENTTD_VA_SWMODE_HELPER && pc_off < MANGO_OPENTTD_VA_SWMODE_HELPER_END) ||
               (lr_off >= MANGO_OPENTTD_VA_SWMODE_HELPER && lr_off < MANGO_OPENTTD_VA_SWMODE_HELPER_END);
@@ -5937,6 +6015,19 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_wait_till_gen_logged = 0;
           g_openttd_switchtomode_exit_logged = 0;
           g_openttd_genworld_return_logged = 0;
+          g_openttd_post_complete_sm_handoff_logged = 0;
+          g_openttd_softfloat_stall_logged = 0;
+          g_openttd_softfloat_at_complete = 0;
+          g_openttd_post_complete_calendar_logged = 0;
+          g_openttd_first_modal_reassert_logged = 0;
+          g_openttd_set_modal_progress_logged = 0;
+          g_openttd_palette_animate_logged = 0;
+          g_openttd_viewport_draw_logged = 0;
+          g_openttd_softfloat_window_started_logged = 0;
+          g_openttd_softfloat_window_ceiling_logged = 0;
+          g_openttd_softfloat_window_next_log = 12922253ull;
+          g_openttd_last_first_modal = 0xffffffffu;
+          g_openttd_last_date_watch = 0xffffffffu;
           mango_openttd_clear_in_modal_progress(lib, "generate click button-up");
           mango_openttd_log_mode_snapshot(lib, "generate button-up");
           {
