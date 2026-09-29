@@ -3467,6 +3467,11 @@ static int g_openttd_switchtomode_logged;
 static int g_openttd_genworld_logged;
 static int g_openttd_onclick_w8_logged;
 static uint32_t g_openttd_last_switch_mode = 0xffffffffu;
+/* research/80: post-2nd-force worker instrument. */
+static int g_openttd_genworld_force_count;
+static int g_openttd_genworld_worker_logged;
+static int g_openttd_genworld_worker_exit_logged;
+static uint32_t g_openttd_last_generating_world = 0xffffffffu;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_GENERATING_WORLD 0x585c1cu
@@ -3498,6 +3503,14 @@ static uint32_t g_openttd_last_switch_mode = 0xffffffffu;
 /* research/79: AllocateMap entry (file VA) — size gate before free/calloc. */
 #define MANGO_OPENTTD_VA_ALLOCATEMAP       0x25b428u
 #define MANGO_OPENTTD_VA_ALLOCATEMAP_END   0x25bc28u
+/* research/80: _GenerateWorld worker (ThreadObject payload off 0x22de4c).
+ * Not the stThreadProc trampoline (file 0x351f48, which blx's [obj,#8]).
+ * ThreadObject::New epilogue is `ldmia.w sp!, {r4-r8,pc}` — pthread rc is
+ * ignored and r0 is forced to 1 before that pop. */
+#define MANGO_OPENTTD_VA_GENWORLD_WORKER     0x22de4cu
+#define MANGO_OPENTTD_VA_GENWORLD_WORKER_END 0x22e27cu
+#define MANGO_OPENTTD_VA_THREAD_NEW_RET      0x35201au
+#define MANGO_OPENTTD_VA_THREAD_NEW_EPILOGUE 0x352020u
 
 /* Resolve libapplication.so load bias into *out_bias; return that library or NULL. */
 static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
@@ -3745,6 +3758,39 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
               "r0=%u r1=%u\n",
               (unsigned)pc_off, (unsigned)lr_off, (unsigned)cpu->r[0],
               (unsigned)cpu->r[1]);
+      fflush(stderr);
+    }
+  }
+  /* research/80: _generating_world + _GenerateWorld body. GenerateWorld's
+   * own VA often misses SVC-poll; the worker payload is the completion site. */
+  {
+    uint32_t genw = 0xffu;
+    int in_worker;
+    if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GENERATING_WORLD, 1u)) {
+      genw = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GENERATING_WORLD];
+    }
+    if (genw != g_openttd_last_generating_world) {
+      fprintf(stderr, "mango: OpenTTD _generating_world change %u -> %u\n",
+              (unsigned)g_openttd_last_generating_world, (unsigned)genw);
+      fflush(stderr);
+      if (g_openttd_genworld_worker_logged && genw == 0u &&
+          !g_openttd_genworld_worker_exit_logged) {
+        g_openttd_genworld_worker_exit_logged = 1;
+        fprintf(stderr, "mango: OpenTTD genworld worker exit _generating_world=0\n");
+        fflush(stderr);
+      }
+      g_openttd_last_generating_world = genw;
+    }
+    in_worker = (pc_off >= MANGO_OPENTTD_VA_GENWORLD_WORKER &&
+                 pc_off < MANGO_OPENTTD_VA_GENWORLD_WORKER_END) ||
+                (lr_off >= MANGO_OPENTTD_VA_GENWORLD_WORKER &&
+                 lr_off < MANGO_OPENTTD_VA_GENWORLD_WORKER_END);
+    if (in_worker && !g_openttd_genworld_worker_logged) {
+      g_openttd_genworld_worker_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD genworld worker entry pc_off=%#x lr_off=%#x "
+              "_generating_world=%u\n",
+              (unsigned)pc_off, (unsigned)lr_off, (unsigned)genw);
       fflush(stderr);
     }
   }
@@ -4430,9 +4476,10 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
        * libapplication ThreadObject_pthread::stThreadProc (file 0x351f48)
        * is different: ScanNewGRFFiles uses it and then waits on the modal
        * dialog. Run that payload on this thread so the scan finishes.
-       * Other ThreadObject payloads (genworld) must NOT fake-succeed:
-       * return EAGAIN so ThreadObject::New fails and GenerateWorld takes
-       * the in-process single-thread fallback (research/73). */
+       * Other ThreadObject payloads (genworld) must NOT fake-succeed.
+       * research/73 returned EAGAIN, but OpenTTD 1.6 ThreadObject::New
+       * ignores that rc. research/80: post-Generate, return 0 from New so
+       * GenerateWorld's own fallthrough runs _GenerateWorld (off 0x22de4c). */
       static uint32_t next_id = 2;
       uint32_t id = next_id++;
       uint32_t start = r2 & ~1u;
@@ -4462,9 +4509,11 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
             break;
           }
         }
-        /* Only DoScanNewGRFFiles. Other stThreadProc payloads (world-gen)
-         * must not run here: a bare mango_interp_run stops at the first SVC.
-         * Fail the create so GenerateWorld falls back to single-threaded. */
+        /* Only DoScanNewGRFFiles is inlined here (nested mango_run_guest).
+         * The genworld payload off 0x22de4c is _GenerateWorld itself, not the
+         * stThreadProc trampoline. Pre-menu: EAGAIN (New ignores it; menu
+         * still appears). Post-Generate: New is forced to return 0 so
+         * GenerateWorld's fallthrough runs that worker (research/80). */
         if (is_scan) {
           MangoCpu nested = *cpu;
           fprintf(stderr, "mango: DoScanNewGRFFiles inline arg=%#x\n", arg);
@@ -4497,22 +4546,56 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           }
         } else {
           uint32_t pay_rel = 0;
+          uint32_t app_bias = 0;
+          uint32_t lr_off = 0xffffffffu;
+          int nth;
           for (int i = 0; i < g_nlibs; i++) {
             if (g_libs[i] != NULL && strstr(g_libs[i]->path, "libapplication.so") != NULL &&
                 pay_off >= g_libs[i]->load_bias) {
               pay_rel = pay_off - g_libs[i]->load_bias;
+              app_bias = g_libs[i]->load_bias;
               break;
             }
           }
+          nth = ++g_openttd_genworld_force_count;
           fprintf(stderr,
                   "mango: OpenTTD genworld force single-thread payload=%#x off=%#x\n",
                   (unsigned)pay_off, (unsigned)pay_rel);
           fflush(stderr);
           g_openttd_allocmap_watch = 1;
+          /* Snapshot before clearing modal so the 2nd force shows the live
+           * _generating_world / _in_modal_progress pair (research/80). */
+          {
+            char where[64];
+            snprintf(where, sizeof(where), "genworld force #%d", nth);
+            mango_openttd_log_mode_snapshot(lib, where);
+          }
           /* research/74: peer DoScan — title leftover modal must not block a
            * later GenerateWorld via HasModalProgress() early-out. */
           mango_openttd_clear_in_modal_progress(lib, "genworld force");
-          /* Do not store a fake pthread_t; ThreadObject::New checks rc. */
+          /* OpenTTD 1.6 ThreadObject::New ignores pthread_create's rc and
+           * always returns true (movs r0,#1; pop). EAGAIN never selects
+           * GenerateWorld's single-thread arm, so the worker at 0x22de4c
+           * (_GenerateWorld, not the stThreadProc trampoline) never runs and
+           * GameLoop idles in PaletteAnimate. Post-Generate only: return 0
+           * from New's epilogue so the existing fallthrough calls the worker
+           * to completion (CleanupGeneration clears the wait). Title force
+           * (pre-button) stays EAGAIN — that path already reaches the menu. */
+          lr_off = (cpu->r[MANGO_REG_LR] & ~1u);
+          if (g_openttd_postgen_armed && pay_rel == MANGO_OPENTTD_VA_GENWORLD_WORKER &&
+              app_bias != 0 && lr_off == app_bias + MANGO_OPENTTD_VA_THREAD_NEW_RET) {
+            fprintf(stderr,
+                    "mango: OpenTTD genworld force New rc=0 (_GenerateWorld off=%#x)\n",
+                    (unsigned)pay_rel);
+            fflush(stderr);
+            cpu->r[0] = 0;
+            cpu->cpsr |= MANGO_CPSR_T;
+            /* SVC epilogue adds 2 while T is set. */
+            cpu->r[MANGO_REG_PC] = (app_bias + MANGO_OPENTTD_VA_THREAD_NEW_EPILOGUE) - 2u;
+            break;
+          }
+          /* Do not store a fake pthread_t. Pre-menu force still fails the
+           * create (New ignores it; menu path does not wait on the worker). */
           cpu->r[0] = (uint32_t)EAGAIN;
           break;
         }
@@ -5399,6 +5482,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_switchtomode_logged = 0;
           g_openttd_genworld_logged = 0;
           g_openttd_onclick_w8_logged = 0;
+          g_openttd_genworld_worker_logged = 0;
+          g_openttd_genworld_worker_exit_logged = 0;
+          g_openttd_last_generating_world = 0xffffffffu;
           mango_openttd_clear_in_modal_progress(lib, "generate click button-up");
           mango_openttd_log_mode_snapshot(lib, "generate button-up");
           {
