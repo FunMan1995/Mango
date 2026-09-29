@@ -4061,11 +4061,18 @@ static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
  * research/90: SCAIW soft+watch FIRED but ViewportDoDraw still N — soft
  * ViewportDoDraw (0x38246c) once after SetupColours with ViewPort-star + iiii
  * from FindWindowById(WC_MAIN_WINDOW=0,0)->viewport (+0x40) full-rect args.
- * Rejected: StartScenario (absent; StartScenarioEditor→SM_EDITOR only);
- * SwitchToMode(SM_NONE) (disasm hits error()); blind ViewportDoDraw (needs args);
- * another colours/window/dirty soft (SVW+MWSD+DDB+UW+SCAIW exhausted; prior
- * DDB/UW predated viewport). Do not re-enter SM_NEWGAME. Keep SCAIW+UW+DDB+
- * SVW+MWSD. Nested guest execution; no opcode invent; map seed untouched. */
+ * research/91: soft VDD entry/exit FIRED (real rect, skip=0) but landscape hit
+ * still N and PaletteAnimate remains — soft nested VDD is not the natural
+ * MainLoop landscape-hit path. Prior MWSD+DDB+UW ran before SCAIW created the
+ * viewport, so dirty bits were consumed with no viewport to paint. After soft
+ * VDD, re-arm MarkWholeScreenDirty (0x232c08) then soft UpdateWindows (0x39215c)
+ * once (MainLoop draw consumer: invalidations + DDB + UpdateViewportPosition +
+ * window paint → ViewportDoDraw via helper). Rejected: blind re-soft VDD;
+ * SwitchToMode(SM_NONE) (error path); SwitchToMode(SM_NEWGAME) (re-enter);
+ * StartScenario (absent; StartScenarioEditor→SM_EDITOR only); another
+ * colours/window/dirty soft without the post-viewport evidence. Do not re-enter
+ * SM_NEWGAME. Keep soft VDD+SCAIW+UW+DDB+SVW+MWSD + CleanupGeneration path.
+ * Nested guest execution; no opcode invent; map seed untouched. */
 static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
                                                 MangoCpu* cpu,
                                                 const char* where) {
@@ -4274,7 +4281,46 @@ static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
       }
     }
   }
-  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after ViewportDoDraw");
+
+  /* research/91: dirty→draw AFTER soft VDD — prior MWSD+DDB+UW consumed dirty
+   * bits before SCAIW created MainWindow viewport. Re-arm whole-screen dirty
+   * then soft UpdateWindows (no-arg MainLoop draw consumer) so natural
+   * invalidations→DDB→UpdateViewportPosition→window paint can reach
+   * ViewportDoDraw with the viewport that now exists. Not blind re-soft VDD;
+   * not SwitchToMode SM_NONE/SM_NEWGAME; not StartScenarioEditor. */
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up post-VDD MarkWholeScreenDirty entry "
+          "pc=%#x lr=%#x\n",
+          (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR]);
+  fflush(stderr);
+  nested = *cpu;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY;
+  rc = mango_run_guest(lib, &nested, NULL);
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up post-VDD MarkWholeScreenDirty exit "
+          "rc=%d pc=%#x r0=%#x\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+  fflush(stderr);
+
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up post-VDD UpdateWindows entry "
+          "pc=%#x lr=%#x\n",
+          (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR]);
+  fflush(stderr);
+  nested = *cpu;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_UPDATE_WINDOWS;
+  rc = mango_run_guest(lib, &nested, NULL);
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up post-VDD UpdateWindows exit "
+          "rc=%d pc=%#x r0=%#x\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+  fflush(stderr);
+
+  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after dirty-draw post-VDD");
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
