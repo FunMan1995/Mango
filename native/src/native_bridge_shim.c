@@ -3456,6 +3456,7 @@ static int mango_new_fail_to_spritecache(MangoCpu* cpu) {
  * research/75: reset moves to Generate BUTTONUP (post-OnClick). */
 static int g_openttd_allocmap_watch;
 static int g_openttd_allocmap_logged;
+static int g_openttd_allocmap_entry_logged;
 static int g_openttd_invalid_map_logged;
 
 /* research/75: post-Generate BUTTONUP arms PC/BSS watches for the
@@ -3475,6 +3476,15 @@ static uint32_t g_openttd_last_switch_mode = 0xffffffffu;
  * Guest SO StartNewGameWithoutGUI / helper 0x22eee8 store #1 when
  * _game_mode != GM_EDITOR (research/77 path reentry). */
 #define MANGO_OPENTTD_SM_NEWGAME           1u
+/* research/79: GameSettings BSS (MakeNewgameSettingsLive memcpy 488 B).
+ * game_creation.map_x/y at settings+28/+29; defaults 8/8, valid [6,12]. */
+#define MANGO_OPENTTD_BSS_SETTINGS_NEWGAME 0x977360u
+#define MANGO_OPENTTD_BSS_SETTINGS_GAME    0x977548u
+#define MANGO_OPENTTD_SETTINGS_SIZE        488u
+#define MANGO_OPENTTD_MAP_XY_OFF           28u
+#define MANGO_OPENTTD_MAP_DEFAULT          8u
+#define MANGO_OPENTTD_MAP_MIN              6u
+#define MANGO_OPENTTD_MAP_MAX              12u
 
 /* OpenTTD code file VAs (libapplication.so) — research/75. */
 #define MANGO_OPENTTD_VA_SWMODE_HELPER     0x22eee8u
@@ -3485,6 +3495,9 @@ static uint32_t g_openttd_last_switch_mode = 0xffffffffu;
 #define MANGO_OPENTTD_VA_SWITCHTOMODE_END  0x2ad2e4u
 #define MANGO_OPENTTD_VA_ONCLICK_W8        0x2301deu
 #define MANGO_OPENTTD_VA_ONCLICK_W8_END    0x2302e4u
+/* research/79: AllocateMap entry (file VA) — size gate before free/calloc. */
+#define MANGO_OPENTTD_VA_ALLOCATEMAP       0x25b428u
+#define MANGO_OPENTTD_VA_ALLOCATEMAP_END   0x25bc28u
 
 /* Resolve libapplication.so load bias into *out_bias; return that library or NULL. */
 static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
@@ -3523,10 +3536,26 @@ static void mango_openttd_clear_in_modal_progress(MangoLoadedLibrary* lib, const
 
 /* research/77: OnClick w8 / helper never store _switch_mode (path watches N
  * across ≥4.75 min live window). Force SM_NEWGAME so GameLoop→SwitchToMode
- * can consume. One-shot log. */
+ * can consume. One-shot log.
+ * research/79: mirror helper 0x22eee8 prologue — MakeNewgameSettingsLive
+ * (memcpy 488 B newgame→game) + ensure map_x/y in [6,12] (default 8/8)
+ * before/with the SM_NEWGAME store so AllocateMap accepts 1<<map_*. */
+static void mango_openttd_seed_map_xy_byte(uint8_t* p) {
+  if (p == NULL) {
+    return;
+  }
+  if (*p < MANGO_OPENTTD_MAP_MIN || *p > MANGO_OPENTTD_MAP_MAX) {
+    *p = (uint8_t)MANGO_OPENTTD_MAP_DEFAULT;
+  }
+}
+
 static void mango_openttd_force_switch_mode_newgame(MangoLoadedLibrary* lib) {
   uint32_t bias = 0;
   uint32_t addr;
+  uint32_t ng_base;
+  uint32_t game_base;
+  uint8_t map_x = 0;
+  uint8_t map_y = 0;
   static int s_forced;
   if (s_forced) {
     return;
@@ -3539,8 +3568,40 @@ static void mango_openttd_force_switch_mode_newgame(MangoLoadedLibrary* lib) {
   if (!mango_guest_range_ok(lib, addr, 4u)) {
     return;
   }
+  /* Faithful MakeNewgameSettingsLive: copy _settings_newgame → _settings_game. */
+  ng_base = bias + MANGO_OPENTTD_BSS_SETTINGS_NEWGAME;
+  game_base = bias + MANGO_OPENTTD_BSS_SETTINGS_GAME;
+  if (mango_guest_range_ok(lib, ng_base, MANGO_OPENTTD_SETTINGS_SIZE) &&
+      mango_guest_range_ok(lib, game_base, MANGO_OPENTTD_SETTINGS_SIZE)) {
+    memcpy(lib->guest_mem + game_base, lib->guest_mem + ng_base,
+           MANGO_OPENTTD_SETTINGS_SIZE);
+    /* Ensure map_x/y on both copies are in [6,12]; seed 8/8 if out of range. */
+    mango_openttd_seed_map_xy_byte(lib->guest_mem + ng_base + MANGO_OPENTTD_MAP_XY_OFF);
+    mango_openttd_seed_map_xy_byte(lib->guest_mem + ng_base + MANGO_OPENTTD_MAP_XY_OFF + 1u);
+    mango_openttd_seed_map_xy_byte(lib->guest_mem + game_base + MANGO_OPENTTD_MAP_XY_OFF);
+    mango_openttd_seed_map_xy_byte(lib->guest_mem + game_base + MANGO_OPENTTD_MAP_XY_OFF + 1u);
+    map_x = lib->guest_mem[game_base + MANGO_OPENTTD_MAP_XY_OFF];
+    map_y = lib->guest_mem[game_base + MANGO_OPENTTD_MAP_XY_OFF + 1u];
+  } else {
+    /* Fallback: poke game (+newgame if present) map_x/y to 8/8 only. */
+    uint32_t gx = bias + MANGO_OPENTTD_BSS_SETTINGS_GAME + MANGO_OPENTTD_MAP_XY_OFF;
+    uint32_t nx = bias + MANGO_OPENTTD_BSS_SETTINGS_NEWGAME + MANGO_OPENTTD_MAP_XY_OFF;
+    if (mango_guest_range_ok(lib, gx, 2u)) {
+      lib->guest_mem[gx] = (uint8_t)MANGO_OPENTTD_MAP_DEFAULT;
+      lib->guest_mem[gx + 1u] = (uint8_t)MANGO_OPENTTD_MAP_DEFAULT;
+      map_x = map_y = (uint8_t)MANGO_OPENTTD_MAP_DEFAULT;
+    }
+    if (mango_guest_range_ok(lib, nx, 2u)) {
+      lib->guest_mem[nx] = (uint8_t)MANGO_OPENTTD_MAP_DEFAULT;
+      lib->guest_mem[nx + 1u] = (uint8_t)MANGO_OPENTTD_MAP_DEFAULT;
+    }
+  }
   mango_store_u32_guest(lib->guest_mem, addr, MANGO_OPENTTD_SM_NEWGAME);
   s_forced = 1;
+  fprintf(stderr,
+          "mango: OpenTTD seed map_x/y=%u/%u (1<< = %u/%u) (+ live-settings)\n",
+          (unsigned)map_x, (unsigned)map_y, 1u << map_x, 1u << map_y);
+  fflush(stderr);
   fprintf(stderr, "mango: OpenTTD force _switch_mode=SM_NEWGAME (path reentry)\n");
   fflush(stderr);
 }
@@ -3669,6 +3730,23 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
             "mango: OpenTTD OnClick widget 8 path pc_off=%#x lr_off=%#x\n",
             (unsigned)pc_off, (unsigned)lr_off);
     fflush(stderr);
+  }
+  /* research/79: AllocateMap entry watch on PC/LR (not only post-free LR on
+   * SVC) — log r0/r1 sizes so a 2nd call is visible even if SVC-sparse. */
+  {
+    int in_am = (pc_off >= MANGO_OPENTTD_VA_ALLOCATEMAP &&
+                 pc_off < (MANGO_OPENTTD_VA_ALLOCATEMAP_END)) ||
+                (lr_off >= MANGO_OPENTTD_VA_ALLOCATEMAP &&
+                 lr_off < (MANGO_OPENTTD_VA_ALLOCATEMAP_END));
+    if (in_am && !g_openttd_allocmap_entry_logged) {
+      g_openttd_allocmap_entry_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD AllocateMap entry pc_off=%#x lr_off=%#x "
+              "r0=%u r1=%u\n",
+              (unsigned)pc_off, (unsigned)lr_off, (unsigned)cpu->r[0],
+              (unsigned)cpu->r[1]);
+      fflush(stderr);
+    }
   }
 }
 
@@ -5314,6 +5392,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           fflush(stderr);
           g_openttd_allocmap_watch = 1;
           g_openttd_allocmap_logged = 0;
+          g_openttd_allocmap_entry_logged = 0;
           g_openttd_invalid_map_logged = 0;
           g_openttd_postgen_armed = 1;
           g_openttd_swmode_store_logged = 0;
