@@ -3472,15 +3472,31 @@ static int g_openttd_genworld_force_count;
 static int g_openttd_genworld_worker_logged;
 static int g_openttd_genworld_worker_exit_logged;
 static uint32_t g_openttd_last_generating_world = 0xffffffffu;
+/* research/81: post-complete leave-wait (after _generating_world 0→1→0). */
+static int g_openttd_genworld_seen_rise;
+static int g_openttd_genworld_complete_logged;
+static int g_openttd_post_complete_leave_logged;
+static int g_openttd_cleanup_gen_logged;
+static int g_openttd_wait_till_gen_logged;
+static int g_openttd_switchtomode_exit_logged;
+static int g_openttd_genworld_return_logged;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_GENERATING_WORLD 0x585c1cu
+#define MANGO_OPENTTD_BSS_GW               0x585c20u
+#define MANGO_OPENTTD_BSS_PAUSE_MODE       0x587e34u
 #define MANGO_OPENTTD_BSS_SWITCH_MODE      0x587e38u
+#define MANGO_OPENTTD_BSS_GAME_MODE        0x587e3cu
+#define MANGO_OPENTTD_BSS_FIRST_MODAL      0x970720u
 #define MANGO_OPENTTD_BSS_IN_MODAL         0x970721u
 /* OpenTTD 1.6.0 SwitchMode (src/openttd.h): SM_NONE=0, SM_NEWGAME=1, ...
  * Guest SO StartNewGameWithoutGUI / helper 0x22eee8 store #1 when
- * _game_mode != GM_EDITOR (research/77 path reentry). */
+ * _game_mode != GM_EDITOR (research/77 path reentry).
+ * GameMode: GM_MENU=0, GM_NORMAL=1, GM_EDITOR=2, GM_BOOTSTRAP=3. */
 #define MANGO_OPENTTD_SM_NEWGAME           1u
+#define MANGO_OPENTTD_GM_NORMAL            1u
+/* GenWorldInfo._gw.threaded at +2 (bool). */
+#define MANGO_OPENTTD_GW_THREADED_OFF      2u
 /* research/79: GameSettings BSS (MakeNewgameSettingsLive memcpy 488 B).
  * game_creation.map_x/y at settings+28/+29; defaults 8/8, valid [6,12]. */
 #define MANGO_OPENTTD_BSS_SETTINGS_NEWGAME 0x977360u
@@ -3511,6 +3527,11 @@ static uint32_t g_openttd_last_generating_world = 0xffffffffu;
 #define MANGO_OPENTTD_VA_GENWORLD_WORKER_END 0x22e27cu
 #define MANGO_OPENTTD_VA_THREAD_NEW_RET      0x35201au
 #define MANGO_OPENTTD_VA_THREAD_NEW_EPILOGUE 0x352020u
+/* research/81: post-complete generation-done / wait peers. */
+#define MANGO_OPENTTD_VA_CLEANUP_GEN         0x22dcccu
+#define MANGO_OPENTTD_VA_CLEANUP_GEN_END     0x22dd38u
+#define MANGO_OPENTTD_VA_WAIT_TILL_GEN       0x22dd70u
+#define MANGO_OPENTTD_VA_WAIT_TILL_GEN_END   0x22dde0u
 
 /* Resolve libapplication.so load bias into *out_bias; return that library or NULL. */
 static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
@@ -3620,12 +3641,17 @@ static void mango_openttd_force_switch_mode_newgame(MangoLoadedLibrary* lib) {
 }
 
 /* research/74: post-Generate instrument — snapshot mode / modal / gen flags.
- * research/75: prefer Generate BUTTONUP (after OnClick) over motion. */
+ * research/75: prefer Generate BUTTONUP (after OnClick) over motion.
+ * research/81: also _game_mode / _pause_mode (StateGameLoop wait peers). */
 static void mango_openttd_log_mode_snapshot(MangoLoadedLibrary* lib, const char* where) {
   uint32_t bias = 0;
   uint32_t modal = 0xffu;
   uint32_t genw = 0xffu;
   uint32_t sw = 0xffffffffu;
+  uint32_t gm = 0xffu;
+  uint32_t pause = 0xffu;
+  uint32_t first_modal = 0xffu;
+  uint32_t gw_thr = 0xffu;
   if (mango_openttd_app(&bias) == NULL || lib == NULL || lib->guest_mem == NULL) {
     fprintf(stderr, "mango: OpenTTD mode snapshot (%s) (no app)\n", where ? where : "?");
     fflush(stderr);
@@ -3634,17 +3660,81 @@ static void mango_openttd_log_mode_snapshot(MangoLoadedLibrary* lib, const char*
   if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_IN_MODAL, 1u)) {
     modal = lib->guest_mem[bias + MANGO_OPENTTD_BSS_IN_MODAL];
   }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_FIRST_MODAL, 1u)) {
+    first_modal = lib->guest_mem[bias + MANGO_OPENTTD_BSS_FIRST_MODAL];
+  }
   if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GENERATING_WORLD, 1u)) {
     genw = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GENERATING_WORLD];
   }
   if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_SWITCH_MODE, 4u)) {
     sw = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_SWITCH_MODE);
   }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GAME_MODE, 1u)) {
+    gm = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GAME_MODE];
+  }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_PAUSE_MODE, 1u)) {
+    pause = lib->guest_mem[bias + MANGO_OPENTTD_BSS_PAUSE_MODE];
+  }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GW + MANGO_OPENTTD_GW_THREADED_OFF, 1u)) {
+    gw_thr = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GW + MANGO_OPENTTD_GW_THREADED_OFF];
+  }
   fprintf(stderr,
-          "mango: OpenTTD mode snapshot (%s) _switch_mode=%u _in_modal_progress=%u "
-          "_generating_world=%u\n",
-          where ? where : "?", (unsigned)sw, (unsigned)modal, (unsigned)genw);
+          "mango: OpenTTD mode snapshot (%s) _switch_mode=%u _game_mode=%u "
+          "_in_modal_progress=%u _first_in_modal_loop=%u _pause_mode=%u "
+          "_generating_world=%u _gw.threaded=%u\n",
+          where ? where : "?", (unsigned)sw, (unsigned)gm, (unsigned)modal,
+          (unsigned)first_modal, (unsigned)pause, (unsigned)genw, (unsigned)gw_thr);
   fflush(stderr);
+}
+
+/* research/81: after genworld complete, StateGameLoop early-outs on
+ * HasModalProgress() and GameLoop idles in PaletteAnimate. Mirror CleanupGeneration
+ * leave-wait: clear modal/first-modal; ensure GM_NORMAL for a live world. */
+static void mango_openttd_post_complete_leave_wait(MangoLoadedLibrary* lib) {
+  uint32_t bias = 0;
+  uint32_t modal_addr;
+  uint32_t first_addr;
+  uint32_t gm_addr;
+  uint32_t thr_addr;
+  uint32_t gm_before = 0xffu;
+  uint32_t modal_before = 0xffu;
+  if (g_openttd_post_complete_leave_logged) {
+    return;
+  }
+  if (mango_openttd_app(&bias) == NULL || bias == 0 || lib == NULL ||
+      lib->guest_mem == NULL) {
+    return;
+  }
+  g_openttd_post_complete_leave_logged = 1;
+  modal_addr = bias + MANGO_OPENTTD_BSS_IN_MODAL;
+  first_addr = bias + MANGO_OPENTTD_BSS_FIRST_MODAL;
+  gm_addr = bias + MANGO_OPENTTD_BSS_GAME_MODE;
+  thr_addr = bias + MANGO_OPENTTD_BSS_GW + MANGO_OPENTTD_GW_THREADED_OFF;
+  if (mango_guest_range_ok(lib, modal_addr, 1u)) {
+    modal_before = lib->guest_mem[modal_addr];
+    lib->guest_mem[modal_addr] = 0;
+  }
+  if (mango_guest_range_ok(lib, first_addr, 1u)) {
+    lib->guest_mem[first_addr] = 0;
+  }
+  if (mango_guest_range_ok(lib, gm_addr, 1u)) {
+    gm_before = lib->guest_mem[gm_addr];
+    if (gm_before != MANGO_OPENTTD_GM_NORMAL) {
+      lib->guest_mem[gm_addr] = (uint8_t)MANGO_OPENTTD_GM_NORMAL;
+    }
+  }
+  if (mango_guest_range_ok(lib, thr_addr, 1u) && lib->guest_mem[thr_addr] != 0) {
+    lib->guest_mem[thr_addr] = 0;
+  }
+  fprintf(stderr,
+          "mango: OpenTTD post-complete leave-wait "
+          "(modal %u->0 game_mode %u->%u)\n",
+          (unsigned)modal_before, (unsigned)gm_before,
+          (unsigned)(mango_guest_range_ok(lib, gm_addr, 1u)
+                         ? lib->guest_mem[gm_addr]
+                         : 0xffu));
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "post-complete leave-wait");
 }
 
 /* research/75: poll BSS _switch_mode + PC/LR against helper / SwitchToMode /
@@ -3714,6 +3804,14 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
             "mango: OpenTTD SwitchToMode entry mode_r0=%u mode_r5=%u pc_off=%#x lr_off=%#x\n",
             (unsigned)cpu->r[0], (unsigned)cpu->r[5], (unsigned)pc_off, (unsigned)lr_off);
     fflush(stderr);
+  } else if (g_openttd_switchtomode_logged && !in_stm && !g_openttd_switchtomode_exit_logged &&
+             g_openttd_genworld_complete_logged) {
+    /* research/81: exit after genworld complete (entry may SVC-poll miss). */
+    g_openttd_switchtomode_exit_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD SwitchToMode exit (post-complete) pc_off=%#x lr_off=%#x\n",
+            (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
   }
   in_gw = (pc_off >= MANGO_OPENTTD_VA_GENWORLD && pc_off < MANGO_OPENTTD_VA_GENWORLD_END) ||
           (lr_off >= MANGO_OPENTTD_VA_GENWORLD && lr_off < MANGO_OPENTTD_VA_GENWORLD_END);
@@ -3734,6 +3832,13 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
               (unsigned)modal);
       fflush(stderr);
     }
+  } else if (g_openttd_genworld_logged && !in_gw && !g_openttd_genworld_return_logged &&
+             g_openttd_genworld_complete_logged) {
+    g_openttd_genworld_return_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD GenerateWorld return (post-complete) pc_off=%#x lr_off=%#x\n",
+            (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
   }
   in_w8 = (pc_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && pc_off < MANGO_OPENTTD_VA_ONCLICK_W8_END) ||
           (lr_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && lr_off < MANGO_OPENTTD_VA_ONCLICK_W8_END);
@@ -3762,10 +3867,13 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
     }
   }
   /* research/80: _generating_world + _GenerateWorld body. GenerateWorld's
-   * own VA often misses SVC-poll; the worker payload is the completion site. */
+   * own VA often misses SVC-poll; the worker payload is the completion site.
+   * research/81: on 0→1→0 snapshot + leave-wait so StateGameLoop exits modal. */
   {
     uint32_t genw = 0xffu;
     int in_worker;
+    int in_cleanup;
+    int in_wait;
     if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GENERATING_WORLD, 1u)) {
       genw = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GENERATING_WORLD];
     }
@@ -3773,8 +3881,33 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
       fprintf(stderr, "mango: OpenTTD _generating_world change %u -> %u\n",
               (unsigned)g_openttd_last_generating_world, (unsigned)genw);
       fflush(stderr);
-      if (g_openttd_genworld_worker_logged && genw == 0u &&
-          !g_openttd_genworld_worker_exit_logged) {
+      if (g_openttd_last_generating_world == 0u && genw == 1u) {
+        g_openttd_genworld_seen_rise = 1;
+        /* Arm worker_logged on rise so exit can fire even if PC watch is late. */
+        if (!g_openttd_genworld_worker_logged) {
+          g_openttd_genworld_worker_logged = 1;
+          fprintf(stderr,
+                  "mango: OpenTTD genworld worker entry (via _generating_world 0->1)\n");
+          fflush(stderr);
+        }
+      }
+      if (g_openttd_genworld_seen_rise && genw == 0u &&
+          g_openttd_last_generating_world == 1u) {
+        if (!g_openttd_genworld_complete_logged) {
+          g_openttd_genworld_complete_logged = 1;
+          fprintf(stderr, "mango: OpenTTD genworld complete (_generating_world 0->1->0)\n");
+          fflush(stderr);
+          mango_openttd_log_mode_snapshot(lib, "genworld complete");
+          /* Soft residual: clear modal wait so GameLoop leaves PaletteAnimate. */
+          mango_openttd_post_complete_leave_wait(lib);
+        }
+        if (!g_openttd_genworld_worker_exit_logged) {
+          g_openttd_genworld_worker_exit_logged = 1;
+          fprintf(stderr, "mango: OpenTTD genworld worker exit _generating_world=0\n");
+          fflush(stderr);
+        }
+      } else if (g_openttd_genworld_worker_logged && genw == 0u &&
+                 !g_openttd_genworld_worker_exit_logged) {
         g_openttd_genworld_worker_exit_logged = 1;
         fprintf(stderr, "mango: OpenTTD genworld worker exit _generating_world=0\n");
         fflush(stderr);
@@ -3791,6 +3924,37 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
               "mango: OpenTTD genworld worker entry pc_off=%#x lr_off=%#x "
               "_generating_world=%u\n",
               (unsigned)pc_off, (unsigned)lr_off, (unsigned)genw);
+      fflush(stderr);
+    }
+    in_cleanup = (pc_off >= MANGO_OPENTTD_VA_CLEANUP_GEN &&
+                  pc_off < MANGO_OPENTTD_VA_CLEANUP_GEN_END) ||
+                 (lr_off >= MANGO_OPENTTD_VA_CLEANUP_GEN &&
+                  lr_off < MANGO_OPENTTD_VA_CLEANUP_GEN_END);
+    if (in_cleanup && !g_openttd_cleanup_gen_logged) {
+      g_openttd_cleanup_gen_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD CleanupGeneration hit pc_off=%#x lr_off=%#x\n",
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+      /* Prefer leave-wait at true generation-done site (may race mid 1→0). */
+      if (!g_openttd_genworld_complete_logged) {
+        g_openttd_genworld_complete_logged = 1;
+        g_openttd_genworld_seen_rise = 1;
+        fprintf(stderr, "mango: OpenTTD genworld complete (CleanupGeneration)\n");
+        fflush(stderr);
+        mango_openttd_log_mode_snapshot(lib, "genworld complete");
+      }
+      mango_openttd_post_complete_leave_wait(lib);
+    }
+    in_wait = (pc_off >= MANGO_OPENTTD_VA_WAIT_TILL_GEN &&
+               pc_off < MANGO_OPENTTD_VA_WAIT_TILL_GEN_END) ||
+              (lr_off >= MANGO_OPENTTD_VA_WAIT_TILL_GEN &&
+               lr_off < MANGO_OPENTTD_VA_WAIT_TILL_GEN_END);
+    if (in_wait && !g_openttd_wait_till_gen_logged) {
+      g_openttd_wait_till_gen_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD WaitTillGeneratedWorld hit pc_off=%#x lr_off=%#x\n",
+              (unsigned)pc_off, (unsigned)lr_off);
       fflush(stderr);
     }
   }
@@ -5485,6 +5649,13 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_genworld_worker_logged = 0;
           g_openttd_genworld_worker_exit_logged = 0;
           g_openttd_last_generating_world = 0xffffffffu;
+          g_openttd_genworld_seen_rise = 0;
+          g_openttd_genworld_complete_logged = 0;
+          g_openttd_post_complete_leave_logged = 0;
+          g_openttd_cleanup_gen_logged = 0;
+          g_openttd_wait_till_gen_logged = 0;
+          g_openttd_switchtomode_exit_logged = 0;
+          g_openttd_genworld_return_logged = 0;
           mango_openttd_clear_in_modal_progress(lib, "generate click button-up");
           mango_openttd_log_mode_snapshot(lib, "generate button-up");
           {
