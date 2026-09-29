@@ -3450,10 +3450,37 @@ static int mango_new_fail_to_spritecache(MangoCpu* cpu) {
   return 1;
 }
 
+/* research/73: after genworld ThreadObject create is forced to fail, watch
+ * for AllocateMap / Invalid map size via existing libc hooks (one-shot). */
+static int g_openttd_allocmap_watch;
+static int g_openttd_allocmap_logged;
+static int g_openttd_invalid_map_logged;
+
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
   uint32_t r2 = cpu->r[2];
+  /* research/73: one-shot AllocateMap sighting via LR when guest SVC's from
+   * inside AllocateMap (file VA 0x25b428). Gated by genworld force-fail. */
+  if (g_openttd_allocmap_watch && !g_openttd_allocmap_logged) {
+    uint32_t lr = cpu->r[MANGO_REG_LR] & ~1u;
+    for (int i = 0; i < g_nlibs; i++) {
+      uint32_t bias;
+      uint32_t off;
+      if (g_libs[i] == NULL || strstr(g_libs[i]->path, "libapplication.so") == NULL) {
+        continue;
+      }
+      bias = g_libs[i]->load_bias;
+      if (lr < bias + 0x25b428u || lr >= bias + 0x25b428u + 0x800u) {
+        continue;
+      }
+      off = lr - bias;
+      fprintf(stderr, "mango: OpenTTD AllocateMap (lr off=%#x)\n", (unsigned)off);
+      fflush(stderr);
+      g_openttd_allocmap_logged = 1;
+      break;
+    }
+  }
   switch (fn) {
     case MANGO_LIBC_MALLOC: {
       MangoLoadedLibrary* heap = mango_bump_owner(lib);
@@ -3977,6 +4004,11 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         mango_guest_format(lib, tmp, sizeof(tmp), fmt, &va);
       }
       fprintf(stderr, "mango: alog %u %s: %s\n", r0, tag ? tag : "(null)", tmp);
+      if (!g_openttd_invalid_map_logged && strstr(tmp, "Invalid map size") != NULL) {
+        fprintf(stderr, "mango: OpenTTD observed Invalid map size\n");
+        fflush(stderr);
+        g_openttd_invalid_map_logged = 1;
+      }
       {
         const char* arg = mango_guest_cstr(lib, cpu->r[3]);
         if (arg == NULL || arg[0] == '\0' || strstr(tmp, arg) == NULL) {
@@ -4099,7 +4131,10 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
        * SDL_CreateThread's SemWait does not block.
        * libapplication ThreadObject_pthread::stThreadProc (file 0x351f48)
        * is different: ScanNewGRFFiles uses it and then waits on the modal
-       * dialog. Run that payload on this thread so the scan finishes. */
+       * dialog. Run that payload on this thread so the scan finishes.
+       * Other ThreadObject payloads (genworld) must NOT fake-succeed:
+       * return EAGAIN so ThreadObject::New fails and GenerateWorld takes
+       * the in-process single-thread fallback (research/73). */
       static uint32_t next_id = 2;
       uint32_t id = next_id++;
       uint32_t start = r2 & ~1u;
@@ -4129,9 +4164,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
             break;
           }
         }
-        /* Only DoScanNewGRFFiles. Other stThreadProc payloads (world-gen
-         * abort, SDL audio) must not run here: audio never returns, and a
-         * bare mango_interp_run stops at the first SVC. */
+        /* Only DoScanNewGRFFiles. Other stThreadProc payloads (world-gen)
+         * must not run here: a bare mango_interp_run stops at the first SVC.
+         * Fail the create so GenerateWorld falls back to single-threaded. */
         if (is_scan) {
           MangoCpu nested = *cpu;
           fprintf(stderr, "mango: DoScanNewGRFFiles inline arg=%#x\n", arg);
@@ -4162,7 +4197,32 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
                         : 0xffu);
             fflush(stderr);
           }
+        } else {
+          uint32_t pay_rel = 0;
+          for (int i = 0; i < g_nlibs; i++) {
+            if (g_libs[i] != NULL && strstr(g_libs[i]->path, "libapplication.so") != NULL &&
+                pay_off >= g_libs[i]->load_bias) {
+              pay_rel = pay_off - g_libs[i]->load_bias;
+              break;
+            }
+          }
+          fprintf(stderr,
+                  "mango: OpenTTD genworld force single-thread payload=%#x off=%#x\n",
+                  (unsigned)pay_off, (unsigned)pay_rel);
+          fflush(stderr);
+          g_openttd_allocmap_watch = 1;
+          /* Do not store a fake pthread_t; ThreadObject::New checks rc. */
+          cpu->r[0] = (uint32_t)EAGAIN;
+          break;
         }
+      } else if (thread_obj) {
+        /* Matched stThreadProc but payload unreadable — still fail rather
+         * than fake-succeed a genworld ThreadObject::New. */
+        fprintf(stderr, "mango: OpenTTD genworld force single-thread (no payload)\n");
+        fflush(stderr);
+        g_openttd_allocmap_watch = 1;
+        cpu->r[0] = (uint32_t)EAGAIN;
+        break;
       }
       if (r0 != 0 && mango_guest_range_ok(lib, r0, 4u)) {
         mango_store_u32_guest(lib->guest_mem, r0, id);
