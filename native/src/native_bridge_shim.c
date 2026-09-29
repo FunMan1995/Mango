@@ -3508,6 +3508,22 @@ static uint64_t g_openttd_softfloat_window_next_log = 12922253ull;
 static uint32_t g_openttd_last_first_modal = 0xffffffffu;
 static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 
+/* research/92: instrument why soft VDD + post-VDD dirty-draw leave landscape hit N.
+ * Soft-mid samples must NOT set g_openttd_viewport_draw_logged (keep landscape hit
+ * watch separate from soft-nested mid-body marker). */
+static int g_openttd_soft_vdd_active;
+static int g_openttd_soft_vdd_mid_logged;
+static uint32_t g_openttd_soft_vdd_polls;
+static uint32_t g_openttd_soft_vdd_in_vdd_polls;
+static uint32_t g_openttd_soft_vdd_in_palette_polls;
+static uint64_t g_openttd_soft_vdd_sf_before;
+static int g_openttd_post_bringup_armed;
+static int g_openttd_post_bu_palette_logged;
+static int g_openttd_post_bu_vdd_logged;
+static int g_openttd_post_bu_uw_logged;
+static int g_openttd_post_bu_ddb_logged;
+static int g_openttd_post_bu_uvp_logged;
+
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
 #define MANGO_OPENTTD_BSS_DATE_FRACT       0x57d11eu
@@ -3578,6 +3594,10 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 #define MANGO_OPENTTD_VA_PALETTE_ANIMATE_END   0x1da3b4u
 #define MANGO_OPENTTD_VA_VIEWPORT_DRAW         0x38246cu
 #define MANGO_OPENTTD_VA_VIEWPORT_DRAW_END     0x3831d4u
+/* research/92: UpdateViewportPosition(Window*) — MainLoop draw-path peer after DDB
+ * (nm _Z22UpdateViewportPositionP6Window @ 0x383689 Thumb; size 2120). */
+#define MANGO_OPENTTD_VA_UPDATE_VIEWPORT_POS     0x383688u
+#define MANGO_OPENTTD_VA_UPDATE_VIEWPORT_POS_END 0x383ed0u
 /* research/90: FindWindowById(WindowClass, int) — recover MainWindow after SCAIW
  * (ResetViewportAfterLoadGame uses WC_MAIN_WINDOW=0, number=0). */
 #define MANGO_OPENTTD_VA_FIND_WINDOW_BY_ID     0x390a44u
@@ -4072,7 +4092,12 @@ static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
  * StartScenario (absent; StartScenarioEditor→SM_EDITOR only); another
  * colours/window/dirty soft without the post-viewport evidence. Do not re-enter
  * SM_NEWGAME. Keep soft VDD+SCAIW+UW+DDB+SVW+MWSD + CleanupGeneration path.
- * Nested guest execution; no opcode invent; map seed untouched. */
+ * research/92: post-VDD MWSD+UW FIRED but landscape hit still N — instrument why
+ * soft VDD exit + post-VDD dirty-draw do not trip landscape hit (A soft-nested
+ * STOP-before-poll / B MainLoop never re-enters VDD / C soft VDD wrong path).
+ * Soft-mid VDD sample + post-bringup paint watches; NOT blind re-soft VDD; NOT
+ * another SCAIW/UW/DDB/SVW/MWSD soft. Nested guest; no opcode invent; map seed
+ * untouched. */
 static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
                                                 MangoCpu* cpu,
                                                 const char* where) {
@@ -4271,12 +4296,31 @@ static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
         nested.r[MANGO_REG_SP] = sp;
         nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
         nested.cpsr |= MANGO_CPSR_T;
+        /* research/92: sample landscape-hit DURING soft VDD body via postgen_poll
+         * while soft_vdd_active (do not set viewport_draw_logged from soft-mid). */
+        g_openttd_soft_vdd_active = 1;
+        g_openttd_soft_vdd_mid_logged = 0;
+        g_openttd_soft_vdd_polls = 0;
+        g_openttd_soft_vdd_in_vdd_polls = 0;
+        g_openttd_soft_vdd_in_palette_polls = 0;
+        g_openttd_soft_vdd_sf_before = g_aeabi_calls_total;
         nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_VIEWPORT_DRAW;
         rc = mango_run_guest(lib, &nested, NULL);
+        g_openttd_soft_vdd_active = 0;
         fprintf(stderr,
                 "mango: OpenTTD postgen bring-up ViewportDoDraw exit "
                 "rc=%d pc=%#x r0=%#x\n",
                 rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+        fflush(stderr);
+        fprintf(stderr,
+                "mango: OpenTTD soft-VDD body summary polls=%u in_vdd=%u "
+                "in_palette=%u mid_hit=%d softfloat_delta=%llu exit_pc=%#x\n",
+                (unsigned)g_openttd_soft_vdd_polls,
+                (unsigned)g_openttd_soft_vdd_in_vdd_polls,
+                (unsigned)g_openttd_soft_vdd_in_palette_polls,
+                g_openttd_soft_vdd_mid_logged,
+                (unsigned long long)(g_aeabi_calls_total - g_openttd_soft_vdd_sf_before),
+                (unsigned)nested.r[MANGO_REG_PC]);
         fflush(stderr);
       }
     }
@@ -4321,6 +4365,13 @@ static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
   fflush(stderr);
 
   mango_openttd_log_mode_snapshot(lib, "postgen bring-up after dirty-draw post-VDD");
+  /* research/92: after soft bring-up returns, arm MainLoop paint watches so Lab
+   * can see whether natural path re-enters VDD/UW/DDB/UVP or stays PaletteAnimate. */
+  g_openttd_post_bringup_armed = 1;
+  fprintf(stderr,
+          "mango: OpenTTD post-bringup paint watches armed "
+          "(soft VDD vs landscape-hit A/B/C)\n");
+  fflush(stderr);
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
@@ -4458,6 +4509,47 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
             (unsigned long long)g_aeabi_calls_total);
     fflush(stderr);
   }
+  /* research/92: soft-VDD mid-body sample (A vs C). Counts every poll while
+   * soft_vdd_active; mid_hit only when PC/LR in VDD range. */
+  if (g_openttd_soft_vdd_active) {
+    g_openttd_soft_vdd_polls++;
+    if (in_viewport_draw) {
+      g_openttd_soft_vdd_in_vdd_polls++;
+      if (!g_openttd_soft_vdd_mid_logged) {
+        g_openttd_soft_vdd_mid_logged = 1;
+        fprintf(stderr,
+                "mango: OpenTTD soft-VDD mid-body landscape sample "
+                "pc_off=%#x lr_off=%#x softfloat=%llu\n",
+                (unsigned)pc_off, (unsigned)lr_off,
+                (unsigned long long)g_aeabi_calls_total);
+        fflush(stderr);
+      }
+    }
+    if (in_palette) {
+      g_openttd_soft_vdd_in_palette_polls++;
+    }
+  }
+  /* research/92: post-bringup MainLoop paint band (B vs leave-PaletteAnimate). */
+  if (g_openttd_post_bringup_armed && !g_openttd_soft_vdd_active) {
+    if (in_palette && !g_openttd_post_bu_palette_logged) {
+      g_openttd_post_bu_palette_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD post-bringup still PaletteAnimate "
+              "pc_off=%#x lr_off=%#x softfloat=%llu\n",
+              (unsigned)pc_off, (unsigned)lr_off,
+              (unsigned long long)g_aeabi_calls_total);
+      fflush(stderr);
+    }
+    if (in_viewport_draw && !g_openttd_post_bu_vdd_logged) {
+      g_openttd_post_bu_vdd_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD post-bringup ViewportDoDraw sample "
+              "pc_off=%#x lr_off=%#x softfloat=%llu\n",
+              (unsigned)pc_off, (unsigned)lr_off,
+              (unsigned long long)g_aeabi_calls_total);
+      fflush(stderr);
+    }
+  }
   in_vital_windows =
       (pc_off >= MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS &&
        pc_off < MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS_END) ||
@@ -4506,6 +4598,47 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
       g_openttd_update_windows_logged = 1;
       fprintf(stderr,
               "mango: OpenTTD UpdateWindows watch pc_off=%#x lr_off=%#x\n",
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+    }
+    if (g_openttd_post_bringup_armed && !g_openttd_soft_vdd_active &&
+        in_update_windows && !g_openttd_post_bu_uw_logged) {
+      g_openttd_post_bu_uw_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD post-bringup UpdateWindows sample "
+              "pc_off=%#x lr_off=%#x\n",
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+    }
+  }
+  {
+    int in_draw_dirty_bu =
+        (pc_off >= MANGO_OPENTTD_VA_DRAW_DIRTY_BLOCKS &&
+         pc_off < MANGO_OPENTTD_VA_DRAW_DIRTY_BLOCKS_END) ||
+        (lr_off >= MANGO_OPENTTD_VA_DRAW_DIRTY_BLOCKS &&
+         lr_off < MANGO_OPENTTD_VA_DRAW_DIRTY_BLOCKS_END);
+    if (g_openttd_post_bringup_armed && !g_openttd_soft_vdd_active &&
+        in_draw_dirty_bu && !g_openttd_post_bu_ddb_logged) {
+      g_openttd_post_bu_ddb_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD post-bringup DrawDirtyBlocks sample "
+              "pc_off=%#x lr_off=%#x\n",
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+    }
+  }
+  {
+    int in_uvp =
+        (pc_off >= MANGO_OPENTTD_VA_UPDATE_VIEWPORT_POS &&
+         pc_off < MANGO_OPENTTD_VA_UPDATE_VIEWPORT_POS_END) ||
+        (lr_off >= MANGO_OPENTTD_VA_UPDATE_VIEWPORT_POS &&
+         lr_off < MANGO_OPENTTD_VA_UPDATE_VIEWPORT_POS_END);
+    if (g_openttd_post_bringup_armed && !g_openttd_soft_vdd_active && in_uvp &&
+        !g_openttd_post_bu_uvp_logged) {
+      g_openttd_post_bu_uvp_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD post-bringup UpdateViewportPosition sample "
+              "pc_off=%#x lr_off=%#x\n",
               (unsigned)pc_off, (unsigned)lr_off);
       fflush(stderr);
     }
@@ -6484,6 +6617,18 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_set_modal_progress_logged = 0;
           g_openttd_palette_animate_logged = 0;
           g_openttd_viewport_draw_logged = 0;
+          g_openttd_soft_vdd_active = 0;
+          g_openttd_soft_vdd_mid_logged = 0;
+          g_openttd_soft_vdd_polls = 0;
+          g_openttd_soft_vdd_in_vdd_polls = 0;
+          g_openttd_soft_vdd_in_palette_polls = 0;
+          g_openttd_soft_vdd_sf_before = 0;
+          g_openttd_post_bringup_armed = 0;
+          g_openttd_post_bu_palette_logged = 0;
+          g_openttd_post_bu_vdd_logged = 0;
+          g_openttd_post_bu_uw_logged = 0;
+          g_openttd_post_bu_ddb_logged = 0;
+          g_openttd_post_bu_uvp_logged = 0;
           g_openttd_softfloat_window_started_logged = 0;
           g_openttd_softfloat_window_ceiling_logged = 0;
           g_openttd_softfloat_window_next_log = 12922253ull;
