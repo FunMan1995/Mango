@@ -3471,6 +3471,10 @@ static uint32_t g_openttd_last_switch_mode = 0xffffffffu;
 #define MANGO_OPENTTD_BSS_GENERATING_WORLD 0x585c1cu
 #define MANGO_OPENTTD_BSS_SWITCH_MODE      0x587e38u
 #define MANGO_OPENTTD_BSS_IN_MODAL         0x970721u
+/* OpenTTD 1.6.0 SwitchMode (src/openttd.h): SM_NONE=0, SM_NEWGAME=1, ...
+ * Guest SO StartNewGameWithoutGUI / helper 0x22eee8 store #1 when
+ * _game_mode != GM_EDITOR (research/77 path reentry). */
+#define MANGO_OPENTTD_SM_NEWGAME           1u
 
 /* OpenTTD code file VAs (libapplication.so) — research/75. */
 #define MANGO_OPENTTD_VA_SWMODE_HELPER     0x22eee8u
@@ -3514,6 +3518,30 @@ static void mango_openttd_clear_in_modal_progress(MangoLoadedLibrary* lib, const
   }
   lib->guest_mem[modal_addr] = 0;
   fprintf(stderr, "mango: OpenTTD clear _in_modal_progress (%s)\n", why ? why : "?");
+  fflush(stderr);
+}
+
+/* research/77: OnClick w8 / helper never store _switch_mode (path watches N
+ * across ≥4.75 min live window). Force SM_NEWGAME so GameLoop→SwitchToMode
+ * can consume. One-shot log. */
+static void mango_openttd_force_switch_mode_newgame(MangoLoadedLibrary* lib) {
+  uint32_t bias = 0;
+  uint32_t addr;
+  static int s_forced;
+  if (s_forced) {
+    return;
+  }
+  if (mango_openttd_app(&bias) == NULL || bias == 0 || lib == NULL ||
+      lib->guest_mem == NULL) {
+    return;
+  }
+  addr = bias + MANGO_OPENTTD_BSS_SWITCH_MODE;
+  if (!mango_guest_range_ok(lib, addr, 4u)) {
+    return;
+  }
+  mango_store_u32_guest(lib->guest_mem, addr, MANGO_OPENTTD_SM_NEWGAME);
+  s_forced = 1;
+  fprintf(stderr, "mango: OpenTTD force _switch_mode=SM_NEWGAME (path reentry)\n");
   fflush(stderr);
 }
 
@@ -5304,6 +5332,10 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
               g_openttd_last_switch_mode = 0xffffffffu;
             }
           }
+          /* research/77: rank-1 force store — widget/OnClick path never set
+           * _switch_mode (watches N). Seed last *before* force so poll sees
+           * 0→SM_NEWGAME change. */
+          mango_openttd_force_switch_mode_newgame(lib);
           mango_openttd_postgen_poll(lib, cpu);
         }
         s_gen_click++;
