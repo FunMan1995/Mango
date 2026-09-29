@@ -3587,7 +3587,7 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 #define MANGO_OPENTTD_VA_DRAW_DIRTY_BLOCKS_END 0x232b4cu
 /* research/88: UpdateWindows — no-arg MainLoop draw-path peer (nm
  * _Z13UpdateWindowsv @ 0x39215d Thumb; processes invalidations then
- * DrawDirtyBlocks then UpdateViewportPosition). Outside Mark*/DrawDirty*. */
+ * DrawDirtyBlocks then UpdateViewportPosition). Outside Mark-star/DrawDirty softs. */
 #define MANGO_OPENTTD_VA_UPDATE_WINDOWS     0x39215cu
 #define MANGO_OPENTTD_VA_UPDATE_WINDOWS_END 0x392288u
 /* research/83: SetModalProgress always stores _first_in_modal_loop=1. */
