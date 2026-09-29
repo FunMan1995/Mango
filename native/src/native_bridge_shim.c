@@ -3631,6 +3631,17 @@ static int g_openttd_outer_mainloop_uw_done;
 #define MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW   0x3804ecu
 /* research/93: PaletteAnimate epilogue (add sp,#20; ldmia ... pc). */
 #define MANGO_OPENTTD_VA_PALETTE_ANIMATE_EPILOGUE 0x1da390u
+/* research/94: CheckPalette-ish VideoDriver_SDL helper that blx's PaletteAnimate
+ * (push {r3,r4,r5,lr} @ 0x380004; blx @ 0x38003c; Lab saved_pa_lr=0x38003f). */
+#define MANGO_OPENTTD_VA_CHECK_PALETTE         0x380004u
+#define MANGO_OPENTTD_VA_CHECK_PALETTE_END     0x380070u
+/* research/94: MainLoop PIC object base — lit @ 0x38063c + add-PC file value
+ * at 0x38044c (host PC = bias+0x380450) yields ≈0xa0cb78; field +0x73c.
+ * Stack seeds match prologue stores at [sp,#4..#0x14] / [sp,#0xc]=base+0x324. */
+#define MANGO_OPENTTD_MAINLOOP_PIC_LIT         0x623728u
+#define MANGO_OPENTTD_MAINLOOP_PIC_ADDPC      0x380450u
+#define MANGO_OPENTTD_MAINLOOP_OBJ_FIELD      0x73cu
+#define MANGO_OPENTTD_MAINLOOP_SP_OBJ_BIAS    0x324u
 /* research/89: SetupColoursAndInitialWindow — no-arg MainWindow+viewport peer (nm
  * _Z28SetupColoursAndInitialWindowv @ 0x25b281 Thumb; Window ctor + InitNested +
  * NWidgetViewport::InitializeViewport; GM_NORMAL falls through to ShowVitalWindows).
@@ -4456,7 +4467,9 @@ static void mango_openttd_note_softfloat_window(MangoLoadedLibrary* lib,
  * UpdateWindows mid-body (not nested STOP). Nested post-VDD MWSD+UW already
  * consumed dirty on a nested guest; re-arm via SetDirtyBlocks then unwind the
  * PaletteAnimate frame and redirect outer PC so postgen_poll samples the same
- * CPU MainLoop uses. */
+ * CPU MainLoop uses.
+ * research/94: also unwind CheckPalette (PA caller) + re-seed MainLoop PIC
+ * object-base stack slots so ldr.w [r3,#0x73c] hits ≈0xa0cb78. */
 static void mango_openttd_outer_mainloop_updatewindows(MangoLoadedLibrary* lib,
                                                        MangoCpu* cpu,
                                                        uint32_t bias,
@@ -4519,9 +4532,49 @@ static void mango_openttd_outer_mainloop_updatewindows(MangoLoadedLibrary* lib,
   cpu->r[10] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 24u);
   cpu->r[11] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 28u);
   cpu->r[MANGO_REG_SP] = sp + 56u;
+  /* research/94: PA was entered via CheckPalette (0x380004) blx, not direct
+   * from MainLoop. Pop that frame (+16) so SP matches MainLoop, re-seed PIC
+   * object-base locals, clear ITSTATE — else after-UW blx leaves poison r3
+   * and MainLoop ldr.w @[r3,#0x73c] mem-fails (Lab r3=0x293e007c). */
+  {
+    uint32_t pa_lr_off = (saved_lr & ~1u) - bias;
+    uint32_t ml_sp;
+    uint32_t obj_base;
+    if (pa_lr_off >= MANGO_OPENTTD_VA_CHECK_PALETTE &&
+        pa_lr_off < MANGO_OPENTTD_VA_CHECK_PALETTE_END) {
+      ml_sp = cpu->r[MANGO_REG_SP];
+      obj_base = MANGO_OPENTTD_MAINLOOP_PIC_LIT + bias +
+                 MANGO_OPENTTD_MAINLOOP_PIC_ADDPC;
+      if (ml_sp >= 16u && mango_guest_range_ok(lib, ml_sp, 16u)) {
+        cpu->r[3] = mango_load_u32_guest(lib->guest_mem, ml_sp + 0u);
+        cpu->r[4] = mango_load_u32_guest(lib->guest_mem, ml_sp + 4u);
+        cpu->r[5] = mango_load_u32_guest(lib->guest_mem, ml_sp + 8u);
+        cpu->r[MANGO_REG_SP] = ml_sp + 16u;
+        ml_sp = cpu->r[MANGO_REG_SP];
+        if (mango_guest_range_ok(lib, ml_sp, 0x18u) &&
+            mango_guest_range_ok(lib, obj_base,
+                                 MANGO_OPENTTD_MAINLOOP_OBJ_FIELD + 4u)) {
+          mango_store_u32_guest(lib->guest_mem, ml_sp + 4u, obj_base);
+          mango_store_u32_guest(lib->guest_mem, ml_sp + 8u, obj_base);
+          mango_store_u32_guest(lib->guest_mem, ml_sp + 0x10u, obj_base);
+          mango_store_u32_guest(lib->guest_mem, ml_sp + 0x14u, obj_base);
+          mango_store_u32_guest(lib->guest_mem, ml_sp + 0xcu,
+                                obj_base + MANGO_OPENTTD_MAINLOOP_SP_OBJ_BIAS);
+          cpu->r[3] = obj_base;
+        }
+      }
+      /* Clear ITSTATE (CPSR[15:10,26:25]) so PIC ldr+add are not IT no-ops. */
+      cpu->cpsr &= ~((0x3Fu << 10) | (3u << 25));
+      fprintf(stderr,
+              "mango: OpenTTD outer MainLoop UpdateWindows frame-restore "
+              "sp=%#x obj_base=%#x saved_pa_lr=%#x\n",
+              (unsigned)cpu->r[MANGO_REG_SP], (unsigned)obj_base,
+              (unsigned)saved_lr);
+      fflush(stderr);
+    }
+  }
   /* Return into MainLoop after bl UpdateWindows so paint lands mid-body on
-   * outer; saved_lr is MainLoop after blx PaletteAnimate (0x380466). */
-  (void)saved_lr;
+   * outer; saved_lr is CheckPalette after blx PaletteAnimate (0x38003e). */
   cpu->r[MANGO_REG_LR] = (bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW) | 1u;
   cpu->cpsr |= MANGO_CPSR_T;
   cpu->r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_UPDATE_WINDOWS;
