@@ -3484,6 +3484,8 @@ static int g_openttd_vital_windows_logged;
 static int g_openttd_mark_screen_dirty_logged;
 /* research/87: dirty→draw MainLoop consumption after vital/dirty softs. */
 static int g_openttd_draw_dirty_blocks_logged;
+/* research/88: MainLoop UpdateWindows after exhausted SVW+MWSD+DDB softs. */
+static int g_openttd_update_windows_logged;
 static int g_openttd_wait_till_gen_logged;
 static int g_openttd_switchtomode_exit_logged;
 static int g_openttd_genworld_return_logged;
@@ -3583,6 +3585,11 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
  * _Z15DrawDirtyBlocksv @ 0x232969 Thumb; UpdateWindows bl's it). */
 #define MANGO_OPENTTD_VA_DRAW_DIRTY_BLOCKS     0x232968u
 #define MANGO_OPENTTD_VA_DRAW_DIRTY_BLOCKS_END 0x232b4cu
+/* research/88: UpdateWindows — no-arg MainLoop draw-path peer (nm
+ * _Z13UpdateWindowsv @ 0x39215d Thumb; processes invalidations then
+ * DrawDirtyBlocks then UpdateViewportPosition). Outside Mark*/DrawDirty*. */
+#define MANGO_OPENTTD_VA_UPDATE_WINDOWS     0x39215cu
+#define MANGO_OPENTTD_VA_UPDATE_WINDOWS_END 0x392288u
 /* research/83: SetModalProgress always stores _first_in_modal_loop=1. */
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS     0x2d4ff0u
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS_END 0x2d500cu
@@ -4027,7 +4034,11 @@ static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
  * research/87: vital+dirty alone left ViewportDoDraw N — soft DrawDirtyBlocks
  * (0x232968) once after dirty so MainLoop's dirty→draw path can reach landscape
  * draw; keep prior vital/dirty softs FIRED; do not re-enter SM_NEWGAME.
- * Keep this as nested guest execution, not host-side BSS pokes or invented code. */
+ * research/88: SVW+MWSD+DDB exhausted without ViewportDoDraw — soft UpdateWindows
+ * (0x39215c) once after DDB (invalidations + DDB + UpdateViewportPosition).
+ * Not ViewportDoDraw (needs ViewPort*+iiii), not StartScenario (absent; editor
+ * only), not SwitchToMode(SM_NONE) (disasm hits error()); do not re-enter
+ * SM_NEWGAME. Keep as nested guest execution; no opcode invent; map seed untouched. */
 static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
                                                 MangoCpu* cpu,
                                                 const char* where) {
@@ -4093,7 +4104,25 @@ static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
           "pc=%#x r0=%#x\n",
           rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
   fflush(stderr);
-  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after DrawDirtyBlocks");
+
+  /* research/88: MainLoop UpdateWindows after exhausted dirty→draw softs
+   * (processes scheduled invalidations, DrawDirtyBlocks, UpdateViewportPosition). */
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up UpdateWindows entry "
+          "pc=%#x lr=%#x\n",
+          (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR]);
+  fflush(stderr);
+  nested = *cpu;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_UPDATE_WINDOWS;
+  rc = mango_run_guest(lib, &nested, NULL);
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up UpdateWindows exit rc=%d "
+          "pc=%#x r0=%#x\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after UpdateWindows");
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
@@ -4265,6 +4294,20 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
       g_openttd_draw_dirty_blocks_logged = 1;
       fprintf(stderr,
               "mango: OpenTTD DrawDirtyBlocks watch pc_off=%#x lr_off=%#x\n",
+              (unsigned)pc_off, (unsigned)lr_off);
+      fflush(stderr);
+    }
+  }
+  {
+    int in_update_windows =
+        (pc_off >= MANGO_OPENTTD_VA_UPDATE_WINDOWS &&
+         pc_off < MANGO_OPENTTD_VA_UPDATE_WINDOWS_END) ||
+        (lr_off >= MANGO_OPENTTD_VA_UPDATE_WINDOWS &&
+         lr_off < MANGO_OPENTTD_VA_UPDATE_WINDOWS_END);
+    if (in_update_windows && !g_openttd_update_windows_logged) {
+      g_openttd_update_windows_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD UpdateWindows watch pc_off=%#x lr_off=%#x\n",
               (unsigned)pc_off, (unsigned)lr_off);
       fflush(stderr);
     }
@@ -6215,6 +6258,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_vital_windows_logged = 0;
           g_openttd_mark_screen_dirty_logged = 0;
           g_openttd_draw_dirty_blocks_logged = 0;
+          g_openttd_update_windows_logged = 0;
           g_openttd_wait_till_gen_logged = 0;
           g_openttd_switchtomode_exit_logged = 0;
           g_openttd_genworld_return_logged = 0;
