@@ -3578,6 +3578,15 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 #define MANGO_OPENTTD_VA_PALETTE_ANIMATE_END   0x1da3b4u
 #define MANGO_OPENTTD_VA_VIEWPORT_DRAW         0x38246cu
 #define MANGO_OPENTTD_VA_VIEWPORT_DRAW_END     0x3831d4u
+/* research/90: FindWindowById(WindowClass, int) — recover MainWindow after SCAIW
+ * (ResetViewportAfterLoadGame uses WC_MAIN_WINDOW=0, number=0). */
+#define MANGO_OPENTTD_VA_FIND_WINDOW_BY_ID     0x390a44u
+/* Window.viewport at +0x40 (InitializeWindowViewport str); ViewPort left/top/width/height. */
+#define MANGO_OPENTTD_WIN_VIEWPORT_OFF         0x40u
+#define MANGO_OPENTTD_VP_LEFT_OFF              0x0u
+#define MANGO_OPENTTD_VP_TOP_OFF               0x4u
+#define MANGO_OPENTTD_VP_WIDTH_OFF             0x8u
+#define MANGO_OPENTTD_VP_HEIGHT_OFF            0xcu
 /* research/86: known no-argument redraw/vital-window peers from libapplication.so. */
 #define MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS   0x25b260u
 #define MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS_END 0x25b280u
@@ -3595,9 +3604,9 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 /* research/89: SetupColoursAndInitialWindow — no-arg MainWindow+viewport peer (nm
  * _Z28SetupColoursAndInitialWindowv @ 0x25b281 Thumb; Window ctor + InitNested +
  * NWidgetViewport::InitializeViewport; GM_NORMAL falls through to ShowVitalWindows).
- * Outside Mark-star/DrawDirty/UpdateWindows softs. Not ViewportDoDraw (needs
- * ViewPort-star + iiii), not StartScenario (absent; editor only), not
- * SwitchToMode(SM_NONE) (disasm hits error()). */
+ * Outside Mark-star/DrawDirty/UpdateWindows softs. research/90: after this soft,
+ * soft ViewportDoDraw with ViewPort-star + iiii from MainWindow (not blind;
+ * StartScenario absent editor-only; SwitchToMode SM_NONE hits error()). */
 #define MANGO_OPENTTD_VA_SETUP_COLOURS     0x25b280u
 #define MANGO_OPENTTD_VA_SETUP_COLOURS_END 0x25b3f4u
 /* research/83: SetModalProgress always stores _first_in_modal_loop=1. */
@@ -4048,11 +4057,15 @@ static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
  * (0x39215c) once after DDB (invalidations + DDB + UpdateViewportPosition).
  * research/89: SVW+MWSD+DDB+UW exhausted without ViewportDoDraw — soft
  * SetupColoursAndInitialWindow (0x25b280) once after UpdateWindows (MainWindow +
- * InitializeViewport; GM_NORMAL → ShowVitalWindows). Not ViewportDoDraw (needs
- * ViewPort-star + iiii), not StartScenario (absent; editor only), not
- * SwitchToMode(SM_NONE) (disasm hits error()); do not re-enter SM_NEWGAME.
- * Outside Mark-star/DrawDirty/UpdateWindows softs. Keep as nested guest
- * execution; no opcode invent; map seed untouched. */
+ * InitializeViewport; GM_NORMAL → ShowVitalWindows).
+ * research/90: SCAIW soft+watch FIRED but ViewportDoDraw still N — soft
+ * ViewportDoDraw (0x38246c) once after SetupColours with ViewPort-star + iiii
+ * from FindWindowById(WC_MAIN_WINDOW=0,0)->viewport (+0x40) full-rect args.
+ * Rejected: StartScenario (absent; StartScenarioEditor→SM_EDITOR only);
+ * SwitchToMode(SM_NONE) (disasm hits error()); blind ViewportDoDraw (needs args);
+ * another colours/window/dirty soft (SVW+MWSD+DDB+UW+SCAIW exhausted; prior
+ * DDB/UW predated viewport). Do not re-enter SM_NEWGAME. Keep SCAIW+UW+DDB+
+ * SVW+MWSD. Nested guest execution; no opcode invent; map seed untouched. */
 static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
                                                 MangoCpu* cpu,
                                                 const char* where) {
@@ -4154,7 +4167,114 @@ static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
           "rc=%d pc=%#x r0=%#x\n",
           rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
   fflush(stderr);
-  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after SetupColoursAndInitialWindow");
+
+  /* research/90: true draw-start — ViewportDoDraw with MainWindow viewport args.
+   * FindWindowById(0,0) → Window.viewport → full-rect (left,top,right,bottom).
+   * 5th ABI arg (bottom) on guest stack; SP kept 8-byte aligned. */
+  {
+    uint32_t win = 0;
+    uint32_t vp = 0;
+    uint32_t left = 0;
+    uint32_t top = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t right = 0;
+    uint32_t bottom = 0;
+    uint32_t sp = 0;
+    int skip_vdd = 0;
+
+    fprintf(stderr,
+            "mango: OpenTTD postgen bring-up FindWindowById(MainWindow) entry "
+            "pc=%#x lr=%#x\n",
+            (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR]);
+    fflush(stderr);
+    nested = *cpu;
+    nested.r[0] = 0; /* WC_MAIN_WINDOW */
+    nested.r[1] = 0; /* window number */
+    nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+    nested.cpsr |= MANGO_CPSR_T;
+    nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_FIND_WINDOW_BY_ID;
+    rc = mango_run_guest(lib, &nested, NULL);
+    win = nested.r[0];
+    fprintf(stderr,
+            "mango: OpenTTD postgen bring-up FindWindowById(MainWindow) exit "
+            "rc=%d pc=%#x r0=%#x\n",
+            rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)win);
+    fflush(stderr);
+
+    if (win == 0 || !mango_guest_range_ok(lib, win + MANGO_OPENTTD_WIN_VIEWPORT_OFF, 4u)) {
+      fprintf(stderr,
+              "mango: OpenTTD postgen bring-up ViewportDoDraw skip "
+              "(no MainWindow win=%#x)\n",
+              (unsigned)win);
+      fflush(stderr);
+      skip_vdd = 1;
+    } else {
+      vp = mango_load_u32_guest(lib->guest_mem, win + MANGO_OPENTTD_WIN_VIEWPORT_OFF);
+      if (vp == 0 || !mango_guest_range_ok(lib, vp + MANGO_OPENTTD_VP_HEIGHT_OFF, 4u)) {
+        fprintf(stderr,
+                "mango: OpenTTD postgen bring-up ViewportDoDraw skip "
+                "(null viewport vp=%#x)\n",
+                (unsigned)vp);
+        fflush(stderr);
+        skip_vdd = 1;
+      } else {
+        left = mango_load_u32_guest(lib->guest_mem, vp + MANGO_OPENTTD_VP_LEFT_OFF);
+        top = mango_load_u32_guest(lib->guest_mem, vp + MANGO_OPENTTD_VP_TOP_OFF);
+        width = mango_load_u32_guest(lib->guest_mem, vp + MANGO_OPENTTD_VP_WIDTH_OFF);
+        height = mango_load_u32_guest(lib->guest_mem, vp + MANGO_OPENTTD_VP_HEIGHT_OFF);
+        if (width == 0 || height == 0) {
+          fprintf(stderr,
+                  "mango: OpenTTD postgen bring-up ViewportDoDraw skip "
+                  "(zero rect vp=%#x left=%u top=%u w=%u h=%u)\n",
+                  (unsigned)vp, (unsigned)left, (unsigned)top,
+                  (unsigned)width, (unsigned)height);
+          fflush(stderr);
+          skip_vdd = 1;
+        }
+      }
+    }
+
+    if (!skip_vdd) {
+      right = left + width;
+      bottom = top + height;
+      fprintf(stderr,
+              "mango: OpenTTD postgen bring-up ViewportDoDraw entry "
+              "vp=%#x left=%u top=%u right=%u bottom=%u pc=%#x lr=%#x\n",
+              (unsigned)vp, (unsigned)left, (unsigned)top,
+              (unsigned)right, (unsigned)bottom,
+              (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR]);
+      fflush(stderr);
+      nested = *cpu;
+      sp = nested.r[MANGO_REG_SP];
+      if (sp < 8u || !mango_guest_range_ok(lib, sp - 8u, 8u)) {
+        fprintf(stderr,
+                "mango: OpenTTD postgen bring-up ViewportDoDraw skip "
+                "(bad SP %#x)\n",
+                (unsigned)sp);
+        fflush(stderr);
+      } else {
+        sp -= 8u; /* AAPCS 8-byte align; [sp]=bottom, [sp+4]=pad */
+        mango_store_u32_guest(lib->guest_mem, sp, bottom);
+        mango_store_u32_guest(lib->guest_mem, sp + 4u, 0u);
+        nested.r[0] = vp;
+        nested.r[1] = left;
+        nested.r[2] = top;
+        nested.r[3] = right;
+        nested.r[MANGO_REG_SP] = sp;
+        nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+        nested.cpsr |= MANGO_CPSR_T;
+        nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_VIEWPORT_DRAW;
+        rc = mango_run_guest(lib, &nested, NULL);
+        fprintf(stderr,
+                "mango: OpenTTD postgen bring-up ViewportDoDraw exit "
+                "rc=%d pc=%#x r0=%#x\n",
+                rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+        fflush(stderr);
+      }
+    }
+  }
+  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after ViewportDoDraw");
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
