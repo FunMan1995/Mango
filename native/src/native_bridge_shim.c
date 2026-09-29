@@ -3478,6 +3478,10 @@ static int g_openttd_genworld_complete_logged;
 static int g_openttd_post_complete_leave_logged;
 static int g_openttd_cleanup_gen_logged;
 static int g_openttd_cleanup_gen_soft_attempted;
+/* research/86: explicit post-cleanup vital-window + dirty-screen bring-up. */
+static int g_openttd_postgen_bringup_attempted;
+static int g_openttd_vital_windows_logged;
+static int g_openttd_mark_screen_dirty_logged;
 static int g_openttd_wait_till_gen_logged;
 static int g_openttd_switchtomode_exit_logged;
 static int g_openttd_genworld_return_logged;
@@ -3568,6 +3572,11 @@ static uint32_t g_openttd_last_date_watch = 0xffffffffu;
 #define MANGO_OPENTTD_VA_PALETTE_ANIMATE_END   0x1da3b4u
 #define MANGO_OPENTTD_VA_VIEWPORT_DRAW         0x38246cu
 #define MANGO_OPENTTD_VA_VIEWPORT_DRAW_END     0x3831d4u
+/* research/86: known no-argument redraw/vital-window peers from libapplication.so. */
+#define MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS   0x25b260u
+#define MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS_END 0x25b280u
+#define MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY    0x232c08u
+#define MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY_END 0x232c20u
 /* research/83: SetModalProgress always stores _first_in_modal_loop=1. */
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS     0x2d4ff0u
 #define MANGO_OPENTTD_VA_SET_MODAL_PROGRESS_END 0x2d500cu
@@ -3595,6 +3604,9 @@ static void mango_openttd_post_complete_calendar_modal(MangoLoadedLibrary* lib,
 static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
                                                   MangoCpu* cpu,
                                                   const char* where);
+static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
+                                                MangoCpu* cpu,
+                                                const char* where);
 
 /* Peer DoScan: clear leftover _in_modal_progress so HasModalProgress() does
  * not early-out a later GenerateWorld (research/74). */
@@ -3989,12 +4001,72 @@ static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, "CleanupGeneration soft-call after");
   if (!g_openttd_cleanup_gen_logged) {
+    /* A BL-only guest body can return to STOP before postgen_poll samples it.
+     * entered=0 is therefore a watch miss, not evidence of a bad VA/transfer. */
     fprintf(stderr,
-            "mango: OpenTTD CleanupGeneration soft-call blocked/non-entry "
-            "rc=%d pc=%#x\n",
+            "mango: OpenTTD CleanupGeneration soft-call entry-watch miss "
+            "(sample-after-return; not proof of non-entry) rc=%d pc=%#x\n",
             rc, (unsigned)nested.r[MANGO_REG_PC]);
     fflush(stderr);
   }
+  /* research/86: CleanupGeneration alone left the main loop in PaletteAnimate.
+   * Re-run its evidence-backed no-argument vital-window/dirty-screen peers so
+   * the normal window path can reach ViewportDoDraw; do not re-enter SM_NEWGAME. */
+  mango_openttd_soft_postgen_bringup(lib, cpu, where);
+}
+
+/* research/86: explicit post-generation bring-up after CleanupGeneration.
+ * These are the exact no-argument peers used by CleanupGeneration itself:
+ * ShowVitalWindows (0x25b260) followed by MarkWholeScreenDirty (0x232c08).
+ * Keep this as nested guest execution, not host-side BSS pokes or invented code. */
+static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
+                                                MangoCpu* cpu,
+                                                const char* where) {
+  uint32_t bias = 0;
+  MangoCpu nested;
+  int rc;
+  if (g_openttd_postgen_bringup_attempted || cpu == NULL || lib == NULL ||
+      lib->guest_mem == NULL) {
+    return;
+  }
+  if (mango_openttd_app(&bias) == NULL || bias == 0) {
+    return;
+  }
+  g_openttd_postgen_bringup_attempted = 1;
+
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up ShowVitalWindows entry (%s) "
+          "pc=%#x lr=%#x\n",
+          where ? where : "?", (unsigned)cpu->r[MANGO_REG_PC],
+          (unsigned)cpu->r[MANGO_REG_LR]);
+  fflush(stderr);
+  nested = *cpu;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS;
+  rc = mango_run_guest(lib, &nested, NULL);
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up ShowVitalWindows exit rc=%d "
+          "pc=%#x r0=%#x\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+  fflush(stderr);
+
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up MarkWholeScreenDirty entry "
+          "pc=%#x lr=%#x\n",
+          (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR]);
+  fflush(stderr);
+  nested = *cpu;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY;
+  rc = mango_run_guest(lib, &nested, NULL);
+  fprintf(stderr,
+          "mango: OpenTTD postgen bring-up MarkWholeScreenDirty exit rc=%d "
+          "pc=%#x r0=%#x\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0]);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "postgen bring-up after dirty");
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
@@ -4073,6 +4145,8 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
   int in_w8;
   int in_palette;
   int in_viewport_draw;
+  int in_vital_windows;
+  int in_mark_screen_dirty;
   if (!g_openttd_postgen_armed || lib == NULL || lib->guest_mem == NULL || cpu == NULL) {
     return;
   }
@@ -4128,6 +4202,30 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
             "softfloat=%llu\n",
             (unsigned)pc_off, (unsigned)lr_off,
             (unsigned long long)g_aeabi_calls_total);
+    fflush(stderr);
+  }
+  in_vital_windows =
+      (pc_off >= MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS &&
+       pc_off < MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS_END) ||
+      (lr_off >= MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS &&
+       lr_off < MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS_END);
+  if (in_vital_windows && !g_openttd_vital_windows_logged) {
+    g_openttd_vital_windows_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD ShowVitalWindows watch pc_off=%#x lr_off=%#x\n",
+            (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
+  }
+  in_mark_screen_dirty =
+      (pc_off >= MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY &&
+       pc_off < MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY_END) ||
+      (lr_off >= MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY &&
+       lr_off < MANGO_OPENTTD_VA_MARK_SCREEN_DIRTY_END);
+  if (in_mark_screen_dirty && !g_openttd_mark_screen_dirty_logged) {
+    g_openttd_mark_screen_dirty_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD MarkWholeScreenDirty watch pc_off=%#x lr_off=%#x\n",
+            (unsigned)pc_off, (unsigned)lr_off);
     fflush(stderr);
   }
   in_helper = (pc_off >= MANGO_OPENTTD_VA_SWMODE_HELPER && pc_off < MANGO_OPENTTD_VA_SWMODE_HELPER_END) ||
@@ -6072,6 +6170,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_post_complete_leave_logged = 0;
           g_openttd_cleanup_gen_logged = 0;
           g_openttd_cleanup_gen_soft_attempted = 0;
+          g_openttd_postgen_bringup_attempted = 0;
+          g_openttd_vital_windows_logged = 0;
+          g_openttd_mark_screen_dirty_logged = 0;
           g_openttd_wait_till_gen_logged = 0;
           g_openttd_switchtomode_exit_logged = 0;
           g_openttd_genworld_return_logged = 0;
