@@ -3451,10 +3451,78 @@ static int mango_new_fail_to_spritecache(MangoCpu* cpu) {
 }
 
 /* research/73: after genworld ThreadObject create is forced to fail, watch
- * for AllocateMap / Invalid map size via existing libc hooks (one-shot). */
+ * for AllocateMap / Invalid map size via existing libc hooks (one-shot).
+ * research/74: reset on Generate click so a 2nd AllocateMap is visible. */
 static int g_openttd_allocmap_watch;
 static int g_openttd_allocmap_logged;
 static int g_openttd_invalid_map_logged;
+
+/* OpenTTD BSS file offsets (libapplication.so). */
+#define MANGO_OPENTTD_BSS_GENERATING_WORLD 0x585c1cu
+#define MANGO_OPENTTD_BSS_SWITCH_MODE      0x587e38u
+#define MANGO_OPENTTD_BSS_IN_MODAL         0x970721u
+
+/* Resolve libapplication.so load bias into *out_bias; return that library or NULL. */
+static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
+  for (int i = 0; i < g_nlibs; i++) {
+    if (g_libs[i] != NULL && strstr(g_libs[i]->path, "libapplication.so") != NULL) {
+      if (out_bias) {
+        *out_bias = g_libs[i]->load_bias;
+      }
+      return g_libs[i];
+    }
+  }
+  if (out_bias) {
+    *out_bias = 0;
+  }
+  return NULL;
+}
+
+/* Peer DoScan: clear leftover _in_modal_progress so HasModalProgress() does
+ * not early-out a later GenerateWorld (research/74). */
+static void mango_openttd_clear_in_modal_progress(MangoLoadedLibrary* lib, const char* why) {
+  uint32_t bias = 0;
+  MangoLoadedLibrary* app = mango_openttd_app(&bias);
+  uint32_t modal_addr;
+  (void)app;
+  if (bias == 0 || lib == NULL || lib->guest_mem == NULL) {
+    return;
+  }
+  modal_addr = bias + MANGO_OPENTTD_BSS_IN_MODAL;
+  if (!mango_guest_range_ok(lib, modal_addr, 1u)) {
+    return;
+  }
+  lib->guest_mem[modal_addr] = 0;
+  fprintf(stderr, "mango: OpenTTD clear _in_modal_progress (%s)\n", why ? why : "?");
+  fflush(stderr);
+}
+
+/* research/74: post-Generate instrument — snapshot mode / modal / gen flags. */
+static void mango_openttd_log_mode_snapshot(MangoLoadedLibrary* lib, const char* where) {
+  uint32_t bias = 0;
+  uint32_t modal = 0xffu;
+  uint32_t genw = 0xffu;
+  uint32_t sw = 0xffffffffu;
+  if (mango_openttd_app(&bias) == NULL || lib == NULL || lib->guest_mem == NULL) {
+    fprintf(stderr, "mango: OpenTTD mode snapshot (%s) (no app)\n", where ? where : "?");
+    fflush(stderr);
+    return;
+  }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_IN_MODAL, 1u)) {
+    modal = lib->guest_mem[bias + MANGO_OPENTTD_BSS_IN_MODAL];
+  }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GENERATING_WORLD, 1u)) {
+    genw = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GENERATING_WORLD];
+  }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_SWITCH_MODE, 4u)) {
+    sw = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_SWITCH_MODE);
+  }
+  fprintf(stderr,
+          "mango: OpenTTD mode snapshot (%s) _switch_mode=%u _in_modal_progress=%u "
+          "_generating_world=%u\n",
+          where ? where : "?", (unsigned)sw, (unsigned)modal, (unsigned)genw);
+  fflush(stderr);
+}
 
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
@@ -4211,6 +4279,9 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
                   (unsigned)pay_off, (unsigned)pay_rel);
           fflush(stderr);
           g_openttd_allocmap_watch = 1;
+          /* research/74: peer DoScan — title leftover modal must not block a
+           * later GenerateWorld via HasModalProgress() early-out. */
+          mango_openttd_clear_in_modal_progress(lib, "genworld force");
           /* Do not store a fake pthread_t; ThreadObject::New checks rc. */
           cpu->r[0] = (uint32_t)EAGAIN;
           break;
@@ -4221,6 +4292,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         fprintf(stderr, "mango: OpenTTD genworld force single-thread (no payload)\n");
         fflush(stderr);
         g_openttd_allocmap_watch = 1;
+        mango_openttd_clear_in_modal_progress(lib, "genworld force");
         cpu->r[0] = (uint32_t)EAGAIN;
         break;
       }
@@ -5080,6 +5152,13 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         if (s_gen_click == 0) {
           fprintf(stderr, "mango: generate click at 480,280\n");
           fflush(stderr);
+          /* research/74: reset one-shots so a 2nd AllocateMap / Invalid is
+           * visible; snapshot mode flags; clear residual modal (belt). */
+          g_openttd_allocmap_watch = 1;
+          g_openttd_allocmap_logged = 0;
+          g_openttd_invalid_map_logged = 0;
+          mango_openttd_log_mode_snapshot(lib, "generate click");
+          mango_openttd_clear_in_modal_progress(lib, "generate click");
         }
         s_gen_click++;
         cpu->r[0] = 1;
