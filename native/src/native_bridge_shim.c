@@ -3480,8 +3480,14 @@ static int g_openttd_cleanup_gen_logged;
 static int g_openttd_wait_till_gen_logged;
 static int g_openttd_switchtomode_exit_logged;
 static int g_openttd_genworld_return_logged;
+/* research/82: SM handoff after leave-wait + softfloat stall instrument. */
+static int g_openttd_post_complete_sm_handoff_logged;
+static int g_openttd_softfloat_stall_logged;
+static uint64_t g_openttd_softfloat_at_complete;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
+#define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
+#define MANGO_OPENTTD_BSS_DATE             0x57d120u
 #define MANGO_OPENTTD_BSS_GENERATING_WORLD 0x585c1cu
 #define MANGO_OPENTTD_BSS_GW               0x585c20u
 #define MANGO_OPENTTD_BSS_PAUSE_MODE       0x587e34u
@@ -3489,10 +3495,13 @@ static int g_openttd_genworld_return_logged;
 #define MANGO_OPENTTD_BSS_GAME_MODE        0x587e3cu
 #define MANGO_OPENTTD_BSS_FIRST_MODAL      0x970720u
 #define MANGO_OPENTTD_BSS_IN_MODAL         0x970721u
-/* OpenTTD 1.6.0 SwitchMode (src/openttd.h): SM_NONE=0, SM_NEWGAME=1, ...
+/* OpenTTD 1.6.0 SwitchMode (src/openttd.h): SM_NONE=0, SM_NEWGAME=1,
+ * SM_RESTARTGAME=2, SM_EDITOR=3, SM_LOAD_GAME=4, SM_MENU=5, ...
  * Guest SO StartNewGameWithoutGUI / helper 0x22eee8 store #1 when
  * _game_mode != GM_EDITOR (research/77 path reentry).
- * GameMode: GM_MENU=0, GM_NORMAL=1, GM_EDITOR=2, GM_BOOTSTRAP=3. */
+ * GameMode: GM_MENU=0, GM_NORMAL=1, GM_EDITOR=2, GM_BOOTSTRAP=3.
+ * research/82: post-newgame handoff clears to SM_NONE (no SM_NORMAL enum). */
+#define MANGO_OPENTTD_SM_NONE              0u
 #define MANGO_OPENTTD_SM_NEWGAME           1u
 #define MANGO_OPENTTD_GM_NORMAL            1u
 /* GenWorldInfo._gw.threaded at +2 (bool). */
@@ -3652,6 +3661,8 @@ static void mango_openttd_log_mode_snapshot(MangoLoadedLibrary* lib, const char*
   uint32_t pause = 0xffu;
   uint32_t first_modal = 0xffu;
   uint32_t gw_thr = 0xffu;
+  uint32_t tick = 0xffffffffu;
+  uint32_t date = 0xffffffffu;
   if (mango_openttd_app(&bias) == NULL || lib == NULL || lib->guest_mem == NULL) {
     fprintf(stderr, "mango: OpenTTD mode snapshot (%s) (no app)\n", where ? where : "?");
     fflush(stderr);
@@ -3678,12 +3689,23 @@ static void mango_openttd_log_mode_snapshot(MangoLoadedLibrary* lib, const char*
   if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GW + MANGO_OPENTTD_GW_THREADED_OFF, 1u)) {
     gw_thr = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GW + MANGO_OPENTTD_GW_THREADED_OFF];
   }
+  /* research/82: MainLoop progress peers (StateGameLoop advances _tick_counter). */
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_TICK_COUNTER, 2u)) {
+    tick = (uint32_t)(lib->guest_mem[bias + MANGO_OPENTTD_BSS_TICK_COUNTER] |
+                      (lib->guest_mem[bias + MANGO_OPENTTD_BSS_TICK_COUNTER + 1u] << 8));
+  }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_DATE, 4u)) {
+    date = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_DATE);
+  }
   fprintf(stderr,
           "mango: OpenTTD mode snapshot (%s) _switch_mode=%u _game_mode=%u "
           "_in_modal_progress=%u _first_in_modal_loop=%u _pause_mode=%u "
-          "_generating_world=%u _gw.threaded=%u\n",
+          "_generating_world=%u _gw.threaded=%u _tick_counter=%u _date=%u "
+          "softfloat=%llu\n",
           where ? where : "?", (unsigned)sw, (unsigned)gm, (unsigned)modal,
-          (unsigned)first_modal, (unsigned)pause, (unsigned)genw, (unsigned)gw_thr);
+          (unsigned)first_modal, (unsigned)pause, (unsigned)genw, (unsigned)gw_thr,
+          (unsigned)tick, (unsigned)date,
+          (unsigned long long)g_aeabi_calls_total);
   fflush(stderr);
 }
 
@@ -3735,6 +3757,59 @@ static void mango_openttd_post_complete_leave_wait(MangoLoadedLibrary* lib) {
                          : 0xffu));
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, "post-complete leave-wait");
+}
+
+/* research/82: after genworld complete / leave-wait, _switch_mode may still be
+ * SM_NEWGAME(=1). GameLoop only clears it after SwitchToMode returns; Lab saw
+ * 1→0 later without SwitchToMode watches while PaletteAnimate idled. Force
+ * SM_NONE early so StateGameLoop can enter playable (mirror post-SwitchToMode
+ * GameLoop clear). Do not invent opcodes; leave-wait + map seed untouched. */
+static void mango_openttd_post_complete_sm_handoff(MangoLoadedLibrary* lib) {
+  uint32_t bias = 0;
+  uint32_t addr;
+  uint32_t sw_before = 0xffffffffu;
+  if (g_openttd_post_complete_sm_handoff_logged) {
+    return;
+  }
+  if (mango_openttd_app(&bias) == NULL || bias == 0 || lib == NULL ||
+      lib->guest_mem == NULL) {
+    return;
+  }
+  addr = bias + MANGO_OPENTTD_BSS_SWITCH_MODE;
+  if (!mango_guest_range_ok(lib, addr, 4u)) {
+    return;
+  }
+  g_openttd_post_complete_sm_handoff_logged = 1;
+  sw_before = mango_load_u32_guest(lib->guest_mem, addr);
+  if (sw_before != MANGO_OPENTTD_SM_NONE) {
+    mango_store_u32_guest(lib->guest_mem, addr, MANGO_OPENTTD_SM_NONE);
+  }
+  fprintf(stderr,
+          "mango: OpenTTD post-complete SM handoff (_switch_mode %u->%u)\n",
+          (unsigned)sw_before, (unsigned)MANGO_OPENTTD_SM_NONE);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "post-complete SM handoff");
+}
+
+/* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
+ * One-shot at known Lab ceiling (13631488) or on PaletteAnimate step-limit
+ * once leave-wait + SM handoff have run (guest idle blit, softfloat not advancing). */
+static void mango_openttd_note_softfloat_stall(MangoLoadedLibrary* lib, const char* where) {
+  int from_blit;
+  if (g_openttd_softfloat_stall_logged || !g_openttd_genworld_complete_logged ||
+      !g_openttd_post_complete_leave_logged) {
+    return;
+  }
+  from_blit = (where != NULL && strstr(where, "PaletteAnimate") != NULL);
+  if (g_aeabi_calls_total < 13631488ull && !from_blit) {
+    return;
+  }
+  g_openttd_softfloat_stall_logged = 1;
+  fprintf(stderr,
+          "mango: OpenTTD softfloat stall @ %llu (%s)\n",
+          (unsigned long long)g_aeabi_calls_total, where ? where : "?");
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, where ? where : "softfloat stall");
 }
 
 /* research/75: poll BSS _switch_mode + PC/LR against helper / SwitchToMode /
@@ -3839,6 +3914,8 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
             "mango: OpenTTD GenerateWorld return (post-complete) pc_off=%#x lr_off=%#x\n",
             (unsigned)pc_off, (unsigned)lr_off);
     fflush(stderr);
+    /* research/82: force SM_NONE after GenerateWorld return (leading soft bite). */
+    mango_openttd_post_complete_sm_handoff(lib);
   }
   in_w8 = (pc_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && pc_off < MANGO_OPENTTD_VA_ONCLICK_W8_END) ||
           (lr_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && lr_off < MANGO_OPENTTD_VA_ONCLICK_W8_END);
@@ -3898,8 +3975,11 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
           fprintf(stderr, "mango: OpenTTD genworld complete (_generating_world 0->1->0)\n");
           fflush(stderr);
           mango_openttd_log_mode_snapshot(lib, "genworld complete");
+          g_openttd_softfloat_at_complete = g_aeabi_calls_total;
           /* Soft residual: clear modal wait so GameLoop leaves PaletteAnimate. */
           mango_openttd_post_complete_leave_wait(lib);
+          /* research/82: force SM_NONE while still SM_NEWGAME (leave-wait NOP on SM). */
+          mango_openttd_post_complete_sm_handoff(lib);
         }
         if (!g_openttd_genworld_worker_exit_logged) {
           g_openttd_genworld_worker_exit_logged = 1;
@@ -3945,6 +4025,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
         mango_openttd_log_mode_snapshot(lib, "genworld complete");
       }
       mango_openttd_post_complete_leave_wait(lib);
+      mango_openttd_post_complete_sm_handoff(lib);
     }
     in_wait = (pc_off >= MANGO_OPENTTD_VA_WAIT_TILL_GEN &&
                pc_off < MANGO_OPENTTD_VA_WAIT_TILL_GEN_END) ||
@@ -3957,6 +4038,10 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
               (unsigned)pc_off, (unsigned)lr_off);
       fflush(stderr);
     }
+  }
+  /* research/82: after leave-wait, detect softfloat freeze during PaletteAnimate. */
+  if (g_openttd_post_complete_sm_handoff_logged) {
+    mango_openttd_note_softfloat_stall(lib, "softfloat stall post-leave-wait");
   }
 }
 
@@ -7150,6 +7235,10 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         if (!s_openttd_postgen_steplimit_logged) {
           s_openttd_postgen_steplimit_logged = 1;
           fprintf(stderr, "mango: OpenTTD postgen step-limit continue\n");
+        }
+        /* research/82: PaletteAnimate step-limit after leave-wait → softfloat stall pin. */
+        if (g_openttd_genworld_complete_logged) {
+          mango_openttd_note_softfloat_stall(lib, "PaletteAnimate step-limit");
         }
         continue;
       }
