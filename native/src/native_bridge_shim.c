@@ -3452,15 +3452,35 @@ static int mango_new_fail_to_spritecache(MangoCpu* cpu) {
 
 /* research/73: after genworld ThreadObject create is forced to fail, watch
  * for AllocateMap / Invalid map size via existing libc hooks (one-shot).
- * research/74: reset on Generate click so a 2nd AllocateMap is visible. */
+ * research/74: reset on Generate click so a 2nd AllocateMap is visible.
+ * research/75: reset moves to Generate BUTTONUP (post-OnClick). */
 static int g_openttd_allocmap_watch;
 static int g_openttd_allocmap_logged;
 static int g_openttd_invalid_map_logged;
+
+/* research/75: post-Generate BUTTONUP arms PC/BSS watches for the
+ * click→_switch_mode↔SwitchToMode↔GenerateWorld gap (pre-InitializeGame). */
+static int g_openttd_postgen_armed;
+static int g_openttd_swmode_store_logged;
+static int g_openttd_switchtomode_logged;
+static int g_openttd_genworld_logged;
+static int g_openttd_onclick_w8_logged;
+static uint32_t g_openttd_last_switch_mode = 0xffffffffu;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_GENERATING_WORLD 0x585c1cu
 #define MANGO_OPENTTD_BSS_SWITCH_MODE      0x587e38u
 #define MANGO_OPENTTD_BSS_IN_MODAL         0x970721u
+
+/* OpenTTD code file VAs (libapplication.so) — research/75. */
+#define MANGO_OPENTTD_VA_SWMODE_HELPER     0x22eee8u
+#define MANGO_OPENTTD_VA_SWMODE_HELPER_END 0x22ef68u
+#define MANGO_OPENTTD_VA_GENWORLD          0x22e2fcu
+#define MANGO_OPENTTD_VA_GENWORLD_END      0x22e42cu
+#define MANGO_OPENTTD_VA_SWITCHTOMODE      0x2aced0u
+#define MANGO_OPENTTD_VA_SWITCHTOMODE_END  0x2ad2e4u
+#define MANGO_OPENTTD_VA_ONCLICK_W8        0x2301deu
+#define MANGO_OPENTTD_VA_ONCLICK_W8_END    0x2302e4u
 
 /* Resolve libapplication.so load bias into *out_bias; return that library or NULL. */
 static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
@@ -3497,7 +3517,8 @@ static void mango_openttd_clear_in_modal_progress(MangoLoadedLibrary* lib, const
   fflush(stderr);
 }
 
-/* research/74: post-Generate instrument — snapshot mode / modal / gen flags. */
+/* research/74: post-Generate instrument — snapshot mode / modal / gen flags.
+ * research/75: prefer Generate BUTTONUP (after OnClick) over motion. */
 static void mango_openttd_log_mode_snapshot(MangoLoadedLibrary* lib, const char* where) {
   uint32_t bias = 0;
   uint32_t modal = 0xffu;
@@ -3524,10 +3545,113 @@ static void mango_openttd_log_mode_snapshot(MangoLoadedLibrary* lib, const char*
   fflush(stderr);
 }
 
+/* research/75: poll BSS _switch_mode + PC/LR against helper / SwitchToMode /
+ * GenerateWorld / OnClick widget-8 path. Armed after Generate BUTTONUP. */
+static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
+  uint32_t bias = 0;
+  uint32_t pc;
+  uint32_t lr;
+  uint32_t pc_off = 0xffffffffu;
+  uint32_t lr_off = 0xffffffffu;
+  uint32_t sw = 0xffffffffu;
+  uint32_t modal = 0xffu;
+  int in_helper;
+  int in_stm;
+  int in_gw;
+  int in_w8;
+  if (!g_openttd_postgen_armed || lib == NULL || lib->guest_mem == NULL || cpu == NULL) {
+    return;
+  }
+  if (mango_openttd_app(&bias) == NULL || bias == 0) {
+    return;
+  }
+  if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_SWITCH_MODE, 4u)) {
+    sw = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_SWITCH_MODE);
+    if (sw != g_openttd_last_switch_mode) {
+      fprintf(stderr,
+              "mango: OpenTTD _switch_mode change %u -> %u (post-generate)\n",
+              (unsigned)g_openttd_last_switch_mode, (unsigned)sw);
+      fflush(stderr);
+      if (sw != 0u && !g_openttd_swmode_store_logged) {
+        g_openttd_swmode_store_logged = 1;
+        fprintf(stderr, "mango: OpenTTD _switch_mode store value=%u\n", (unsigned)sw);
+        fflush(stderr);
+      }
+      g_openttd_last_switch_mode = sw;
+    }
+  }
+  pc = cpu->r[MANGO_REG_PC] & ~1u;
+  lr = cpu->r[MANGO_REG_LR] & ~1u;
+  if (pc >= bias) {
+    pc_off = pc - bias;
+  }
+  if (lr >= bias) {
+    lr_off = lr - bias;
+  }
+  in_helper = (pc_off >= MANGO_OPENTTD_VA_SWMODE_HELPER && pc_off < MANGO_OPENTTD_VA_SWMODE_HELPER_END) ||
+              (lr_off >= MANGO_OPENTTD_VA_SWMODE_HELPER && lr_off < MANGO_OPENTTD_VA_SWMODE_HELPER_END);
+  if (in_helper && !g_openttd_swmode_store_logged) {
+    g_openttd_swmode_store_logged = 1;
+    if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_SWITCH_MODE, 4u)) {
+      sw = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_SWITCH_MODE);
+    }
+    /* Helper keeps landscape-type arg in r5 after mov r5,r0; BSS may still be 0. */
+    fprintf(stderr,
+            "mango: OpenTTD _switch_mode helper hit pc_off=%#x lr_off=%#x r0=%u r5=%u "
+            "bss=%u\n",
+            (unsigned)pc_off, (unsigned)lr_off, (unsigned)cpu->r[0], (unsigned)cpu->r[5],
+            (unsigned)sw);
+    fflush(stderr);
+  }
+  in_stm = (pc_off >= MANGO_OPENTTD_VA_SWITCHTOMODE && pc_off < MANGO_OPENTTD_VA_SWITCHTOMODE_END) ||
+           (lr_off >= MANGO_OPENTTD_VA_SWITCHTOMODE && lr_off < MANGO_OPENTTD_VA_SWITCHTOMODE_END);
+  if (in_stm && !g_openttd_switchtomode_logged) {
+    g_openttd_switchtomode_logged = 1;
+    /* Entry: r0=mode; shortly mov r5,r0 so r5 also holds mode mid-body. */
+    fprintf(stderr,
+            "mango: OpenTTD SwitchToMode entry mode_r0=%u mode_r5=%u pc_off=%#x lr_off=%#x\n",
+            (unsigned)cpu->r[0], (unsigned)cpu->r[5], (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
+  }
+  in_gw = (pc_off >= MANGO_OPENTTD_VA_GENWORLD && pc_off < MANGO_OPENTTD_VA_GENWORLD_END) ||
+          (lr_off >= MANGO_OPENTTD_VA_GENWORLD && lr_off < MANGO_OPENTTD_VA_GENWORLD_END);
+  if (in_gw && !g_openttd_genworld_logged) {
+    g_openttd_genworld_logged = 1;
+    if (mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_IN_MODAL, 1u)) {
+      modal = lib->guest_mem[bias + MANGO_OPENTTD_BSS_IN_MODAL];
+    }
+    fprintf(stderr,
+            "mango: OpenTTD GenerateWorld entry pc_off=%#x lr_off=%#x "
+            "_in_modal_progress=%u r0=%u\n",
+            (unsigned)pc_off, (unsigned)lr_off, (unsigned)modal, (unsigned)cpu->r[0]);
+    fflush(stderr);
+    if (modal != 0u) {
+      fprintf(stderr,
+              "mango: OpenTTD GenerateWorld HasModal early-out likely "
+              "(_in_modal_progress=%u)\n",
+              (unsigned)modal);
+      fflush(stderr);
+    }
+  }
+  in_w8 = (pc_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && pc_off < MANGO_OPENTTD_VA_ONCLICK_W8_END) ||
+          (lr_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && lr_off < MANGO_OPENTTD_VA_ONCLICK_W8_END);
+  if (in_w8 && !g_openttd_onclick_w8_logged) {
+    g_openttd_onclick_w8_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD OnClick widget 8 path pc_off=%#x lr_off=%#x\n",
+            (unsigned)pc_off, (unsigned)lr_off);
+    fflush(stderr);
+  }
+}
+
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
   uint32_t r2 = cpu->r[2];
+  /* research/75: post-Generate PC/LR + BSS watches on every libc SVC. */
+  if (g_openttd_postgen_armed) {
+    mango_openttd_postgen_poll(lib, cpu);
+  }
   /* research/73: one-shot AllocateMap sighting via LR when guest SVC's from
    * inside AllocateMap (file VA 0x25b428). Gated by genworld force-fail. */
   if (g_openttd_allocmap_watch && !g_openttd_allocmap_logged) {
@@ -5152,13 +5276,35 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         if (s_gen_click == 0) {
           fprintf(stderr, "mango: generate click at 480,280\n");
           fflush(stderr);
-          /* research/74: reset one-shots so a 2nd AllocateMap / Invalid is
-           * visible; snapshot mode flags; clear residual modal (belt). */
+          /* research/74/75: clear residual modal early (belt). Mode snapshot +
+           * allocmap reset move to BUTTONUP — motion is pre-OnClick. */
+          mango_openttd_clear_in_modal_progress(lib, "generate click motion");
+        } else if (s_gen_click == 2) {
+          /* research/75: BUTTONUP is last of the inject trio; OnClick runs on
+           * this event. Snapshot / reset / arm watches here (not on motion). */
+          fprintf(stderr, "mango: generate button-up at 480,280\n");
+          fflush(stderr);
           g_openttd_allocmap_watch = 1;
           g_openttd_allocmap_logged = 0;
           g_openttd_invalid_map_logged = 0;
-          mango_openttd_log_mode_snapshot(lib, "generate click");
-          mango_openttd_clear_in_modal_progress(lib, "generate click");
+          g_openttd_postgen_armed = 1;
+          g_openttd_swmode_store_logged = 0;
+          g_openttd_switchtomode_logged = 0;
+          g_openttd_genworld_logged = 0;
+          g_openttd_onclick_w8_logged = 0;
+          mango_openttd_clear_in_modal_progress(lib, "generate click button-up");
+          mango_openttd_log_mode_snapshot(lib, "generate button-up");
+          {
+            uint32_t bias = 0;
+            if (mango_openttd_app(&bias) != NULL &&
+                mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_SWITCH_MODE, 4u)) {
+              g_openttd_last_switch_mode =
+                  mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_SWITCH_MODE);
+            } else {
+              g_openttd_last_switch_mode = 0xffffffffu;
+            }
+          }
+          mango_openttd_postgen_poll(lib, cpu);
         }
         s_gen_click++;
         cpu->r[0] = 1;
@@ -6596,8 +6742,14 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
     /* Meritous: shorter quanta so PC/progress sampling sees mapgen; on quantum
      * expiry continue (same as a fresh 100M window after SVC). Fatal step-limit
      * only if a single quantum burns the full Meritous budget with no SVC. */
-    uint32_t budget = g_meritous_progress_armed ? 2000000u : 100000000u;
+    /* research/75: shorter quanta when post-Generate watches armed so PC/LR
+     * samples can catch SwitchToMode / GenerateWorld / helper entry. */
+    uint32_t budget = g_meritous_progress_armed ? 2000000u
+                      : (g_openttd_postgen_armed ? 2000000u : 100000000u);
     int rc = mango_interp_run(cpu, &mem, MANGO_JNI_STOP, budget);
+    if (g_openttd_postgen_armed) {
+      mango_openttd_postgen_poll(lib, cpu);
+    }
     if (g_meritous_progress_armed) {
       uint32_t pc = cpu->r[MANGO_REG_PC];
       mango_pc_hist_sample(pc);
