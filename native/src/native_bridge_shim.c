@@ -3523,8 +3523,12 @@ static int g_openttd_post_bu_vdd_logged;
 static int g_openttd_post_bu_uw_logged;
 static int g_openttd_post_bu_ddb_logged;
 static int g_openttd_post_bu_uvp_logged;
-/* research/93: one-shot outer-CPU MainLoop UpdateWindows after leave-PA. */
+/* research/93: outer-CPU MainLoop UpdateWindows after leave-PA.
+ * research/95: not permanently one-shot — re-arm when outer re-enters PA. */
 static int g_openttd_outer_mainloop_uw_done;
+static int g_openttd_outer_mainloop_uw_seen_outside;
+static int g_openttd_outer_mainloop_uw_rearm_count;
+#define MANGO_OPENTTD_LEAVE_PA_REARM_CAP 32
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
@@ -4705,7 +4709,29 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
       fflush(stderr);
     }
     /* research/93: once post-bu sees outer in PaletteAnimate body, leave PA and
-     * run MainLoop UpdateWindows mid-body on outer CPU (not nested STOP). */
+     * run MainLoop UpdateWindows mid-body on outer CPU (not nested STOP).
+     * research/95: durable leave — after leave fires, require outer PC outside
+     * PA then clear latch on PA re-entry (cap while landscape hit still N).
+     * Keep SDB+frame-restore+redirect; do not permanently consume the flag. */
+    if (g_openttd_outer_mainloop_uw_done) {
+      if (pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE ||
+          pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE_END) {
+        g_openttd_outer_mainloop_uw_seen_outside = 1;
+      } else if (g_openttd_outer_mainloop_uw_seen_outside &&
+                 !g_openttd_viewport_draw_logged &&
+                 g_openttd_outer_mainloop_uw_rearm_count <
+                     MANGO_OPENTTD_LEAVE_PA_REARM_CAP) {
+        g_openttd_outer_mainloop_uw_done = 0;
+        g_openttd_outer_mainloop_uw_seen_outside = 0;
+        g_openttd_outer_mainloop_uw_rearm_count++;
+        fprintf(stderr,
+                "mango: OpenTTD outer MainLoop UpdateWindows leave-PA re-arm "
+                "pc_off=%#x count=%d\n",
+                (unsigned)pc_off,
+                g_openttd_outer_mainloop_uw_rearm_count);
+        fflush(stderr);
+      }
+    }
     if (!g_openttd_outer_mainloop_uw_done &&
         pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE &&
         pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE_END) {
@@ -6792,6 +6818,8 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_post_bu_ddb_logged = 0;
           g_openttd_post_bu_uvp_logged = 0;
           g_openttd_outer_mainloop_uw_done = 0;
+          g_openttd_outer_mainloop_uw_seen_outside = 0;
+          g_openttd_outer_mainloop_uw_rearm_count = 0;
           g_openttd_softfloat_window_started_logged = 0;
           g_openttd_softfloat_window_ceiling_logged = 0;
           g_openttd_softfloat_window_next_log = 12922253ull;
