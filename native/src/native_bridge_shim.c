@@ -6504,6 +6504,27 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         cpu->r[MANGO_REG_PC] = pc + 4u;
         continue;
       }
+      /* OpenTTD TutorialWindow::OnTick stage/widget guards merge to a
+       * compiler Thumb UDF #255 (0xdeff, A8.8.247). Soft-skip to the
+       * early-return pop; keep mango_decode_t16(0xdeff) uncover. */
+      if ((cpu->cpsr & MANGO_CPSR_T) != 0 && strstr(lib->path, "libapplication.so") != NULL) {
+        uint32_t va = pc - lib->load_bias;
+        uint16_t hw = (uint16_t)(w & 0xFFFFu);
+        int tutorial_udf = (va == 0x3732deu);
+        if (!tutorial_udf && hw == 0xdeffu && pc >= 4u && pc + 2u <= mem.size) {
+          uint32_t prior = mango_load_u32_guest(mem.bytes, pc - 4u);
+          /* movs r3,#0; ldr r3,[r3,#72] at VA 0x3732da / 0x3732dc */
+          if ((prior & 0xFFFFu) == 0x2300u && (prior >> 16) == 0x6c9bu) {
+            tutorial_udf = 1;
+          }
+        }
+        if (tutorial_udf) {
+          fprintf(stderr, "mango: OpenTTD skip tutorial UDF trap va=0x%x\n", va);
+          /* OnTick+0xf4: pop {r3,r4,r5,r6,r7,pc} — clean early return. */
+          cpu->r[MANGO_REG_PC] = lib->load_bias + 0x3732d8u;
+          continue;
+        }
+      }
       MangoInsn ins;
       int dec;
       if (cpu->cpsr & MANGO_CPSR_T) {
@@ -7787,6 +7808,31 @@ static void mango_patch_openttd_new(MangoLoadedLibrary* lib) {
   mango_write_jni_thunk(lib->guest_mem, fn, MANGO_LIBC_SVC_BASE + MANGO_LIBC_MALLOC);
 }
 
+/* Force-nop ShowTutorialWindow* so New Game never builds TutorialWindow.
+ * Soft-skip in the interp loop still covers a live OnTick UDF trap. */
+static void mango_patch_openttd_tutorial(MangoLoadedLibrary* lib) {
+  uint32_t addr;
+  if (lib == NULL || lib->path[0] == '\0' || strstr(lib->path, "libapplication.so") == NULL) {
+    return;
+  }
+  /* ShowTutorialWindow @ file VA 0x3732e8 (push {r4,lr} → bx lr). */
+  addr = lib->load_bias + 0x3732e8u;
+  if (mango_guest_range_ok(lib, addr, 2u) && lib->guest_mem[addr] == 0x10u &&
+      lib->guest_mem[addr + 1u] == 0xb5u) {
+    lib->guest_mem[addr] = 0x70u;
+    lib->guest_mem[addr + 1u] = 0x47u;
+    fprintf(stderr, "mango: OpenTTD nop ShowTutorialWindow\n");
+  }
+  /* ShowTutorialWindowOnceAfterInstall @ file VA 0x37333c (ldr r0,[pc,#84]). */
+  addr = lib->load_bias + 0x37333cu;
+  if (mango_guest_range_ok(lib, addr, 2u) && lib->guest_mem[addr] == 0x15u &&
+      lib->guest_mem[addr + 1u] == 0x48u) {
+    lib->guest_mem[addr] = 0x70u;
+    lib->guest_mem[addr + 1u] = 0x47u;
+    fprintf(stderr, "mango: OpenTTD nop ShowTutorialWindowOnceAfterInstall\n");
+  }
+}
+
 static void mango_patch_ofdp_unity(MangoLoadedLibrary* lib) {
   uint32_t alloc_fn, alloc2_fn, realloc_fn, hdr, sen;
   if (!mango_is_ofdp_unity(lib)) {
@@ -8064,6 +8110,7 @@ static void* mango_load_library(const char* libpath, int flag) {
   }
   mango_patch_ofdp_unity(lib);
   mango_patch_openttd_new(lib);
+  mango_patch_openttd_tutorial(lib);
   mango_patch_meritous_img_load(lib);
   mango_patch_meritous_skip_plasma(lib);
   mango_seed_ofdp_mono_gc(lib);

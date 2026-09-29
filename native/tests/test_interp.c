@@ -5048,7 +5048,21 @@ static int test_t16_rev16(void) {
   return 0;
 }
 
+static int test_t16_udf_stays_uncover(void) {
+  /* research/72: Thumb UDF #255 (0xdeff, A8.8.247) must stay uncover.
+   * Soft-skip is host-side; do not invent UDF as an executable opcode. */
+  MangoInsn di;
+  memset(&di, 0, sizeof(di));
+  if (mango_decode_t16(0xdeffu, &di) == 0) {
+    fprintf(stderr, "FAIL(t16_udf_stays_uncover): 0xdeff decoded as op=%d\n", di.op);
+    return 1;
+  }
+  printf("ok: T16 UDF #255 stays uncover (research/72)\n");
+  return 0;
+}
+
 static int test_t32_bfi(void) {
+
   /* Q-OTTD-0ar: bfi r0,r12,#16,#16 = f36c 401f. Insert r12[15:0] into r0[31:16].
    * bfc r0,#16,#16 (Rn=15) clears those bits. NZCV unchanged. msb<lsb rejected. */
   static const uint16_t kProg[] = {0xF36Cu, 0x401Fu, 0x4770u};
@@ -12904,6 +12918,7 @@ int main(void) {
   failures += test_t32_eor_w_imm1();
   failures += test_t32_tst_w_imm1();
   failures += test_t16_rev16();
+  failures += test_t16_udf_stays_uncover();
   failures += test_t32_bfi();
   failures += test_t32_rsb_w_imm1();
   failures += test_t32_rsbs_w_imm0();
