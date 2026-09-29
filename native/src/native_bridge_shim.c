@@ -3477,6 +3477,7 @@ static int g_openttd_genworld_seen_rise;
 static int g_openttd_genworld_complete_logged;
 static int g_openttd_post_complete_leave_logged;
 static int g_openttd_cleanup_gen_logged;
+static int g_openttd_cleanup_gen_soft_attempted;
 static int g_openttd_wait_till_gen_logged;
 static int g_openttd_switchtomode_exit_logged;
 static int g_openttd_genworld_return_logged;
@@ -3589,7 +3590,11 @@ static MangoLoadedLibrary* mango_openttd_app(uint32_t* out_bias) {
 
 /* research/83: forward — soft calendar + modal clear after SM handoff. */
 static void mango_openttd_post_complete_calendar_modal(MangoLoadedLibrary* lib,
+                                                      MangoCpu* cpu,
                                                       const char* where);
+static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
+                                                  MangoCpu* cpu,
+                                                  const char* where);
 
 /* Peer DoScan: clear leftover _in_modal_progress so HasModalProgress() does
  * not early-out a later GenerateWorld (research/74). */
@@ -3803,7 +3808,7 @@ static void mango_openttd_post_complete_leave_wait(MangoLoadedLibrary* lib) {
  * 1→0 later without SwitchToMode watches while PaletteAnimate idled. Force
  * SM_NONE early so StateGameLoop can enter playable (mirror post-SwitchToMode
  * GameLoop clear). Do not invent opcodes; leave-wait + map seed untouched. */
-static void mango_openttd_post_complete_sm_handoff(MangoLoadedLibrary* lib) {
+static void mango_openttd_post_complete_sm_handoff(MangoLoadedLibrary* lib, MangoCpu* cpu) {
   uint32_t bias = 0;
   uint32_t addr;
   uint32_t sw_before = 0xffffffffu;
@@ -3829,7 +3834,7 @@ static void mango_openttd_post_complete_sm_handoff(MangoLoadedLibrary* lib) {
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, "post-complete SM handoff");
   /* research/83: seed calendar + keep modal loop clear past SM handoff. */
-  mango_openttd_post_complete_calendar_modal(lib, "post-complete SM handoff");
+  mango_openttd_post_complete_calendar_modal(lib, cpu, "post-complete SM handoff");
 }
 
 /* research/83: OpenTTD AccumulDaysOfLeapYears + Jan 1 (mirror ConvertYMDToDate
@@ -3849,6 +3854,7 @@ static uint32_t mango_openttd_date_jan1(uint32_t year) {
  * always reasserts _first_in_modal_loop=1) and seed _date/_cur_year from
  * settings.starting_year (or 1950) when calendar stuck at 0. Map seed untouched. */
 static void mango_openttd_post_complete_calendar_modal(MangoLoadedLibrary* lib,
+                                                      MangoCpu* cpu,
                                                       const char* where) {
   uint32_t bias = 0;
   uint32_t first_addr;
@@ -3936,12 +3942,65 @@ static void mango_openttd_post_complete_calendar_modal(MangoLoadedLibrary* lib,
             where ? where : "?", (unsigned)first_before, (unsigned)modal_before);
     fflush(stderr);
   }
+  /* The calendar/modal soft is the last prerequisite before the real
+   * post-generation cleanup. Run the guest CleanupGeneration peer once,
+   * rather than only mirroring its BSS side effects above. */
+  mango_openttd_soft_cleanup_generation(lib, cpu, where);
+}
+
+/* research/85: the existing leave-wait/SM/calendar softs prove the state
+ * handoff but do not execute CleanupGeneration itself. Invoke the guest
+ * no-argument Thumb function with the same nested MangoCpu/stop-sentinel
+ * pattern used by pthread_once and DoScanNewGRFFiles. */
+static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
+                                                  MangoCpu* cpu,
+                                                  const char* where) {
+  uint32_t bias = 0;
+  MangoCpu nested;
+  int rc;
+  if (g_openttd_cleanup_gen_soft_attempted ||
+      g_openttd_cleanup_gen_logged || cpu == NULL || lib == NULL ||
+      lib->guest_mem == NULL) {
+    return;
+  }
+  if (mango_openttd_app(&bias) == NULL || bias == 0) {
+    return;
+  }
+  g_openttd_cleanup_gen_soft_attempted = 1;
+  fprintf(stderr,
+          "mango: OpenTTD CleanupGeneration soft-call attempt (%s) "
+          "pc=%#x lr=%#x\n",
+          where ? where : "?", (unsigned)cpu->r[MANGO_REG_PC],
+          (unsigned)cpu->r[MANGO_REG_LR]);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "CleanupGeneration soft-call before");
+
+  nested = *cpu;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_CLEANUP_GEN;
+  rc = mango_run_guest(lib, &nested, NULL);
+
+  fprintf(stderr,
+          "mango: OpenTTD CleanupGeneration soft-call result rc=%d "
+          "pc=%#x r0=%#x entered=%u\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0],
+          (unsigned)g_openttd_cleanup_gen_logged);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "CleanupGeneration soft-call after");
+  if (!g_openttd_cleanup_gen_logged) {
+    fprintf(stderr,
+            "mango: OpenTTD CleanupGeneration soft-call blocked/non-entry "
+            "rc=%d pc=%#x\n",
+            rc, (unsigned)nested.r[MANGO_REG_PC]);
+    fflush(stderr);
+  }
 }
 
 /* research/82: pin softfloat freeze during PaletteAnimate after leave-wait.
  * One-shot at known Lab ceiling (13631488) or on PaletteAnimate step-limit
  * once leave-wait + SM handoff have run (guest idle blit, softfloat not advancing). */
-static void mango_openttd_note_softfloat_stall(MangoLoadedLibrary* lib, const char* where) {
+static void mango_openttd_note_softfloat_stall(MangoLoadedLibrary* lib, MangoCpu* cpu, const char* where) {
   int from_blit;
   if (g_openttd_softfloat_stall_logged || !g_openttd_genworld_complete_logged ||
       !g_openttd_post_complete_leave_logged) {
@@ -3958,7 +4017,7 @@ static void mango_openttd_note_softfloat_stall(MangoLoadedLibrary* lib, const ch
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, where ? where : "softfloat stall");
   /* research/83: at stall, _first may be reasserted and _date still 0 — soft again. */
-  mango_openttd_post_complete_calendar_modal(lib, where ? where : "softfloat stall");
+  mango_openttd_post_complete_calendar_modal(lib, cpu, where ? where : "softfloat stall");
 }
 
 /* research/84: log progress through the known softfloat freeze window rather
@@ -4131,7 +4190,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
             (unsigned)pc_off, (unsigned)lr_off);
     fflush(stderr);
     /* research/82: force SM_NONE after GenerateWorld return (leading soft bite). */
-    mango_openttd_post_complete_sm_handoff(lib);
+    mango_openttd_post_complete_sm_handoff(lib, cpu);
   }
   in_w8 = (pc_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && pc_off < MANGO_OPENTTD_VA_ONCLICK_W8_END) ||
           (lr_off >= MANGO_OPENTTD_VA_ONCLICK_W8 && lr_off < MANGO_OPENTTD_VA_ONCLICK_W8_END);
@@ -4195,7 +4254,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
           /* Soft residual: clear modal wait so GameLoop leaves PaletteAnimate. */
           mango_openttd_post_complete_leave_wait(lib);
           /* research/82: force SM_NONE while still SM_NEWGAME (leave-wait NOP on SM). */
-          mango_openttd_post_complete_sm_handoff(lib);
+          mango_openttd_post_complete_sm_handoff(lib, cpu);
         }
         if (!g_openttd_genworld_worker_exit_logged) {
           g_openttd_genworld_worker_exit_logged = 1;
@@ -4241,7 +4300,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
         mango_openttd_log_mode_snapshot(lib, "genworld complete");
       }
       mango_openttd_post_complete_leave_wait(lib);
-      mango_openttd_post_complete_sm_handoff(lib);
+      mango_openttd_post_complete_sm_handoff(lib, cpu);
     }
     in_wait = (pc_off >= MANGO_OPENTTD_VA_WAIT_TILL_GEN &&
                pc_off < MANGO_OPENTTD_VA_WAIT_TILL_GEN_END) ||
@@ -4283,7 +4342,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
                 "pc_off=%#x lr_off=%#x\n",
                 (unsigned)pc_off, (unsigned)lr_off);
         fflush(stderr);
-        mango_openttd_post_complete_calendar_modal(lib, "first-modal reassert");
+        mango_openttd_post_complete_calendar_modal(lib, cpu, "first-modal reassert");
       }
       g_openttd_last_first_modal = first_now;
     }
@@ -4308,7 +4367,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
               (unsigned)pc_off, (unsigned)lr_off, (unsigned)cpu->r[0]);
       fflush(stderr);
     }
-    mango_openttd_note_softfloat_stall(lib, "softfloat stall post-leave-wait");
+    mango_openttd_note_softfloat_stall(lib, cpu, "softfloat stall post-leave-wait");
   } else if (g_openttd_post_complete_leave_logged) {
     /* Arm last-first tracker once leave-wait has cleared it to 0. */
     if (g_openttd_last_first_modal == 0xffffffffu &&
@@ -6012,6 +6071,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_genworld_complete_logged = 0;
           g_openttd_post_complete_leave_logged = 0;
           g_openttd_cleanup_gen_logged = 0;
+          g_openttd_cleanup_gen_soft_attempted = 0;
           g_openttd_wait_till_gen_logged = 0;
           g_openttd_switchtomode_exit_logged = 0;
           g_openttd_genworld_return_logged = 0;
@@ -7525,7 +7585,7 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         }
         /* research/82: PaletteAnimate step-limit after leave-wait → softfloat stall pin. */
         if (g_openttd_genworld_complete_logged) {
-          mango_openttd_note_softfloat_stall(lib, "PaletteAnimate step-limit");
+          mango_openttd_note_softfloat_stall(lib, cpu, "PaletteAnimate step-limit");
         }
         continue;
       }
