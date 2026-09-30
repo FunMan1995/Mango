@@ -3538,6 +3538,10 @@ static int g_openttd_outer_leave_pa_paint_done;
  * the nested copy after SDB hits STOP (PC rewritten to VDD then discarded), so
  * Lab logs paint success while OUTER never enters ViewportDoDraw mid-body. */
 static int g_openttd_outer_leave_pa_nested;
+/* research/99: after OUTER landscape VDD safe-return, allow leave-PA re-arm
+ * even though landscape hit latched viewport_draw_logged (research/95 gate
+ * otherwise permanently blocks re-arm; Lab leave_pa_rearm=0 + PA spam). */
+static int g_openttd_outer_vdd_safe_returned;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
@@ -4590,8 +4594,8 @@ static void mango_openttd_outer_landscape_paint_after_leave(MangoLoadedLibrary* 
  * Snap OUTER to MainLoop-after-UW Thumb, pop the ABI arg, keep T + clear
  * ITSTATE. Hit marker already latched by caller re-sample. KEEP leave-PA
  * SDB+frame-restore+redirect+re-arm + research/96 paint + research/97
- * nest-guard. NOT invent UDF/0xffffffff; NOT raise re-arm cap; NOT re-soft
- * VDD alone. */
+ * nest-guard. research/99 sets safe_returned so leave-PA can re-arm past hit.
+ * NOT invent UDF/0xffffffff; NOT raise re-arm cap; NOT re-soft VDD alone. */
 static void mango_openttd_outer_landscape_vdd_safe_return(MangoLoadedLibrary* lib,
                                                           MangoCpu* cpu,
                                                           uint32_t bias) {
@@ -4600,6 +4604,9 @@ static void mango_openttd_outer_landscape_vdd_safe_return(MangoLoadedLibrary* li
   if (lib == NULL || cpu == NULL || bias == 0) {
     return;
   }
+  /* research/99: latch so postgen re-arm can fire past hit latch when outer
+   * re-enters PaletteAnimate after this snap (durable leave past safe-return). */
+  g_openttd_outer_vdd_safe_returned = 1;
   sp = cpu->r[MANGO_REG_SP];
   if (sp + 8u >= sp && mango_guest_range_ok(lib, sp, 8u)) {
     cpu->r[MANGO_REG_SP] = sp + 8u;
@@ -4872,13 +4879,17 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
      * run MainLoop UpdateWindows mid-body on outer CPU (not nested STOP).
      * research/95: durable leave — after leave fires, require outer PC outside
      * PA then clear latch on PA re-entry (cap while landscape hit still N).
-     * Keep SDB+frame-restore+redirect; do not permanently consume the flag. */
+     * research/99: after safe-return, allow re-arm even if viewport_draw_logged
+     * (hit latch alone must not permanently kill leave-PA; Lab PA spam).
+     * Keep SDB+frame-restore+redirect; do not permanently consume the flag.
+     * Do not raise LEAVE_PA_REARM_CAP alone; keep hit latch (no paint re-fire). */
     if (g_openttd_outer_mainloop_uw_done) {
       if (pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE ||
           pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE_END) {
         g_openttd_outer_mainloop_uw_seen_outside = 1;
       } else if (g_openttd_outer_mainloop_uw_seen_outside &&
-                 !g_openttd_viewport_draw_logged &&
+                 (!g_openttd_viewport_draw_logged ||
+                  g_openttd_outer_vdd_safe_returned) &&
                  g_openttd_outer_mainloop_uw_rearm_count <
                      MANGO_OPENTTD_LEAVE_PA_REARM_CAP) {
         g_openttd_outer_mainloop_uw_done = 0;
@@ -4887,9 +4898,10 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
         g_openttd_outer_mainloop_uw_rearm_count++;
         fprintf(stderr,
                 "mango: OpenTTD outer MainLoop UpdateWindows leave-PA re-arm "
-                "pc_off=%#x count=%d\n",
+                "pc_off=%#x count=%d post_safe=%d\n",
                 (unsigned)pc_off,
-                g_openttd_outer_mainloop_uw_rearm_count);
+                g_openttd_outer_mainloop_uw_rearm_count,
+                g_openttd_outer_vdd_safe_returned);
         fflush(stderr);
       }
     }
@@ -7048,6 +7060,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_outer_mainloop_uw_rearm_count = 0;
           g_openttd_outer_leave_pa_paint_done = 0;
           g_openttd_outer_leave_pa_nested = 0;
+          g_openttd_outer_vdd_safe_returned = 0;
           g_openttd_softfloat_window_started_logged = 0;
           g_openttd_softfloat_window_ceiling_logged = 0;
           g_openttd_softfloat_window_next_log = 12922253ull;
