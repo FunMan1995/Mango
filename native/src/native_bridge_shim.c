@@ -34,12 +34,14 @@
 #include "mango/native_bridge.h"
 
 #define MANGO_STACK_SIZE 0x10000u
-/* 128 MiB bump heap. OpenTTD probes new[] of cache*3/2, frees it, then
- * keeps `cache`. A 40 MiB heap only fit the 16 MiB cache (the 32 MiB
- * step's probe is 48 MiB). That 16 MiB pool stays full and evicts
- * sprites the menu still draws. 128 MiB lets the 64 MiB cache's 96 MiB
- * probe succeed, and the 128 MiB step still fails closed. */
-#define MANGO_HEAP_SIZE 0x8000000u
+/* 192 MiB bump heap (research/103). OpenTTD probes new[] of cache*3/2,
+ * frees it, then keeps `cache`. 128 MiB fit the 64 MiB cache's 96 MiB
+ * probe, but later CheckForMissingGlyphs 512 B font/glyph allocs failed
+ * at the ceiling (heap ~134217608/134217728) and left a null cursor that
+ * Utf8Decode LDRB'd as ELF-magic. 192 MiB keeps the 64→128 MiB cache
+ * probe path available and leaves headroom for glyph walk; the 256 MiB
+ * cache step's 384 MiB probe still fails closed. */
+#define MANGO_HEAP_SIZE 0xC000000u
 #define MANGO_JNI_TABLE_LEN 256u
 #define MANGO_JVM_TABLE_LEN 8u
 #define MANGO_JNI_THUNK_SIZE 16u
@@ -329,11 +331,10 @@
 #define MANGO_SL_CREATE_AUDIO_PLAYER 2
 #define MANGO_SL_COUNT 3
 
-/* 256 MiB. Libraries use the low 32 MiB and the heap reservation is
- * 128 MiB. icudt52l.dat (~23 MiB) is mapped after that reservation;
- * the OpenTTD drive placed it at 0xa013000, ending near 0xb680000,
- * with room left for another file map. */
-#define MANGO_AS_SIZE 0x10000000u
+/* 320 MiB (research/103). Libraries use the low 32 MiB and the heap
+ * reservation is 192 MiB. icudt52l.dat (~23 MiB) maps after heap+stack
+ * and still fits with room for another file map. */
+#define MANGO_AS_SIZE 0x14000000u
 #define MANGO_LIB_CAP 0x2000000u
 #define MANGO_MAX_LIBS 16
 
@@ -2396,7 +2397,9 @@ static uint32_t g_filemap_next;
 /* malloc/calloc/realloc blocks carry an 8-byte header so free can
  * reuse them. The tail block still rewinds the bump cursor. */
 #define MANGO_ALLOC_HDR 8u
-#define MANGO_HOLE_MAX 1024
+/* research/103: 1024 holes saturated at the Utf8Decode ELF-magic stop
+ * (holes=1024 with 512 B malloc fail). Raise so free reclaim keeps up. */
+#define MANGO_HOLE_MAX 4096
 typedef struct MangoHole {
   uint32_t addr;
   uint32_t size;
@@ -8814,6 +8817,29 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
         fprintf(stderr, "mango: OpenTTD skip null vcall va=0x%x\n", pc - lib->load_bias);
         cpu->r[0] = 0;
         cpu->r[MANGO_REG_PC] = pc + 4u;
+        continue;
+      }
+      /* research/103: CheckForMissingGlyphs walks with null/poison cursor
+       * (r5=4 → ldr r1,[r5,#-4] loads guest[0] = libsdl ELF magic) into
+       * Utf8Decode's ldrb r3,[r1]. Soft-complete as a NUL decode so the
+       * caller sees wchar 0 and exits the string walk. Heap raise above
+       * is PRIMARY; this guards residual malloc-fail null cursors. */
+      if ((cpu->cpsr & MANGO_CPSR_T) != 0 && strstr(lib->path, "libapplication.so") != NULL &&
+          (pc - lib->load_bias) == 0x346486u && (w & 0xFFFFu) == 0x780bu &&
+          (cpu->r[1] == 0u || cpu->r[1] == 0x464c457fu || cpu->r[1] >= mem.size)) {
+        static int s_utf8_null_skip;
+        if (s_utf8_null_skip < 4) {
+          fprintf(stderr,
+                  "mango: OpenTTD skip Utf8Decode null/ELF-magic cursor r1=0x%x r5=0x%x\n",
+                  cpu->r[1], cpu->r[5]);
+          s_utf8_null_skip++;
+        }
+        if (cpu->r[0] != 0 && mango_guest_range_ok(lib, cpu->r[0], 4u)) {
+          mango_store_u32_guest(mem.bytes, cpu->r[0], 0u);
+        }
+        cpu->r[0] = 1u; /* length 1 — matches Utf8Decode NUL fast-path */
+        /* pop {r4,r5}; bx lr — frame already pushed at Utf8Decode entry */
+        cpu->r[MANGO_REG_PC] = lib->load_bias + 0x3464acu;
         continue;
       }
       /* OpenTTD TutorialWindow::OnTick stage/widget guards merge to a
