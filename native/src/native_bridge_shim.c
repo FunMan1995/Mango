@@ -4581,6 +4581,43 @@ static void mango_openttd_outer_landscape_paint_after_leave(MangoLoadedLibrary* 
   fflush(stderr);
 }
 
+
+/* research/98: after OUTER landscape paint parks PC at ViewportDoDraw for the
+ * hit latch, do NOT free-run that invented call into MainLoop-after-UW.
+ * VDD uses AAPCS [sp]=bottom (paint pushed 8) then returns with SP still -8
+ * and caller-saved regs clobbered; MainLoop at 0x3804ec does ldr r0,[sp,#0xc]
+ * / blx and Lab stops at stack-adjacent ARM pc=0xa0110f8 word=0xffffffff.
+ * Snap OUTER to MainLoop-after-UW Thumb, pop the ABI arg, keep T + clear
+ * ITSTATE. Hit marker already latched by caller re-sample. KEEP leave-PA
+ * SDB+frame-restore+redirect+re-arm + research/96 paint + research/97
+ * nest-guard. NOT invent UDF/0xffffffff; NOT raise re-arm cap; NOT re-soft
+ * VDD alone. */
+static void mango_openttd_outer_landscape_vdd_safe_return(MangoLoadedLibrary* lib,
+                                                          MangoCpu* cpu,
+                                                          uint32_t bias) {
+  uint32_t sp;
+  uint32_t pc_off = 0xffffffffu;
+  if (lib == NULL || cpu == NULL || bias == 0) {
+    return;
+  }
+  sp = cpu->r[MANGO_REG_SP];
+  if (sp + 8u >= sp && mango_guest_range_ok(lib, sp, 8u)) {
+    cpu->r[MANGO_REG_SP] = sp + 8u;
+  }
+  cpu->r[MANGO_REG_LR] = (bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW) | 1u;
+  cpu->cpsr |= MANGO_CPSR_T;
+  cpu->cpsr &= ~((0x3Fu << 10) | (3u << 25)); /* clear ITSTATE */
+  cpu->r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW;
+  pc_off = MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW;
+  fprintf(stderr,
+          "mango: OpenTTD outer landscape VDD safe-return "
+          "pc_off=%#x lr=%#x sp=%#x cpsr_t=1\n",
+          (unsigned)pc_off,
+          (unsigned)cpu->r[MANGO_REG_LR],
+          (unsigned)cpu->r[MANGO_REG_SP]);
+  fflush(stderr);
+}
+
 /* research/93: leave PaletteAnimate on the OUTER cpu and run MainLoop's
  * UpdateWindows mid-body (not nested STOP). Nested post-VDD MWSD+UW already
  * consumed dirty on a nested guest; re-arm via SetDirtyBlocks then unwind the
@@ -4907,6 +4944,23 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
                 (unsigned)pc_off, (unsigned)lr_off,
                 (unsigned long long)g_aeabi_calls_total);
         fflush(stderr);
+      }
+      /* research/98: hit latched on invented OUTER VDD entry — safe-return
+       * before free-run falls into stack garbage / ARM 0xffffffff. */
+      if (g_openttd_outer_leave_pa_paint_done &&
+          pc_off >= MANGO_OPENTTD_VA_VIEWPORT_DRAW &&
+          pc_off < MANGO_OPENTTD_VA_VIEWPORT_DRAW_END) {
+        mango_openttd_outer_landscape_vdd_safe_return(lib, cpu, bias);
+        pc = cpu->r[MANGO_REG_PC] & ~1u;
+        lr = cpu->r[MANGO_REG_LR] & ~1u;
+        pc_off = 0xffffffffu;
+        lr_off = 0xffffffffu;
+        if (pc >= bias) {
+          pc_off = pc - bias;
+        }
+        if (lr >= bias) {
+          lr_off = lr - bias;
+        }
       }
     }
   }
