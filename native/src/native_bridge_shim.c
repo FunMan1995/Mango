@@ -3542,6 +3542,10 @@ static int g_openttd_outer_leave_pa_nested;
  * even though landscape hit latched viewport_draw_logged (research/95 gate
  * otherwise permanently blocks re-arm; Lab leave_pa_rearm=0 + PA spam). */
 static int g_openttd_outer_vdd_safe_returned;
+/* research/100: after durable leave through CAP + safe-return + landscape hit,
+ * suppress CheckPalette->PA re-entry (pin MainLoop-after-UW). Cap stays 32. */
+static int g_openttd_outer_post_cap_pa_suppress_logged;
+static int g_openttd_outer_post_cap_pa_suppress_count;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
@@ -4625,6 +4629,132 @@ static void mango_openttd_outer_landscape_vdd_safe_return(MangoLoadedLibrary* li
   fflush(stderr);
 }
 
+/* research/100: after durable leave-PA re-arm through CAP + safe-return +
+ * landscape hit, CheckPalette still re-blx'es PaletteAnimate (Lab spam at
+ * guest pc=0x243276 / pc_off=0x1da276). Suppress that re-entry: unwind the
+ * PA(+CheckPalette) frame like leave-PA frame-restore, then pin OUTER at
+ * MainLoop-after-UW (research/98 Thumb style). Also catch CheckPalette itself
+ * before the blx. Do NOT raise LEAVE_PA_REARM_CAP; do NOT invent opcodes;
+ * KEEP leave-PA+paint+nest-guard+safe-return+post_safe re-arm+soft stack. */
+static void mango_openttd_outer_post_cap_pa_suppress(MangoLoadedLibrary* lib,
+                                                     MangoCpu* cpu,
+                                                     uint32_t bias,
+                                                     uint32_t pc_off) {
+  uint32_t sp;
+  uint32_t saved_lr = 0;
+  int in_pa;
+  int in_check_palette;
+  if (lib == NULL || cpu == NULL || lib->guest_mem == NULL || bias == 0) {
+    return;
+  }
+  in_pa = (pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE &&
+           pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE_END);
+  in_check_palette = (pc_off >= MANGO_OPENTTD_VA_CHECK_PALETTE &&
+                      pc_off < MANGO_OPENTTD_VA_CHECK_PALETTE_END);
+  if (!in_pa && !in_check_palette) {
+    return;
+  }
+  if (in_pa) {
+    sp = cpu->r[MANGO_REG_SP];
+    if (sp < 56u || !mango_guest_range_ok(lib, sp, 56u)) {
+      /* Bad PA frame - still snap to MainLoop-after-UW to break spam. */
+      cpu->r[MANGO_REG_LR] = (bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW) | 1u;
+      cpu->cpsr |= MANGO_CPSR_T;
+      cpu->cpsr &= ~((0x3Fu << 10) | (3u << 25));
+      cpu->r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW;
+    } else {
+      /* Unwind PA: add sp,#20 then pop {r4-r9,sl,fp,lr}. Saved LR at [sp+20+32]. */
+      saved_lr = mango_load_u32_guest(lib->guest_mem, sp + 20u + 32u);
+      cpu->r[4] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 0u);
+      cpu->r[5] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 4u);
+      cpu->r[6] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 8u);
+      cpu->r[7] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 12u);
+      cpu->r[8] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 16u);
+      cpu->r[9] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 20u);
+      cpu->r[10] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 24u);
+      cpu->r[11] = mango_load_u32_guest(lib->guest_mem, sp + 20u + 28u);
+      cpu->r[MANGO_REG_SP] = sp + 56u;
+      {
+        uint32_t pa_lr_off = (saved_lr & ~1u) - bias;
+        uint32_t ml_sp;
+        uint32_t obj_base;
+        if (pa_lr_off >= MANGO_OPENTTD_VA_CHECK_PALETTE &&
+            pa_lr_off < MANGO_OPENTTD_VA_CHECK_PALETTE_END) {
+          ml_sp = cpu->r[MANGO_REG_SP];
+          obj_base = MANGO_OPENTTD_MAINLOOP_PIC_LIT + bias +
+                     MANGO_OPENTTD_MAINLOOP_PIC_ADDPC;
+          if (ml_sp >= 16u && mango_guest_range_ok(lib, ml_sp, 16u)) {
+            cpu->r[3] = mango_load_u32_guest(lib->guest_mem, ml_sp + 0u);
+            cpu->r[4] = mango_load_u32_guest(lib->guest_mem, ml_sp + 4u);
+            cpu->r[5] = mango_load_u32_guest(lib->guest_mem, ml_sp + 8u);
+            cpu->r[MANGO_REG_SP] = ml_sp + 16u;
+            ml_sp = cpu->r[MANGO_REG_SP];
+            if (mango_guest_range_ok(lib, ml_sp, 0x18u) &&
+                mango_guest_range_ok(lib, obj_base,
+                                     MANGO_OPENTTD_MAINLOOP_OBJ_FIELD + 4u)) {
+              mango_store_u32_guest(lib->guest_mem, ml_sp + 4u, obj_base);
+              mango_store_u32_guest(lib->guest_mem, ml_sp + 8u, obj_base);
+              mango_store_u32_guest(lib->guest_mem, ml_sp + 0x10u, obj_base);
+              mango_store_u32_guest(lib->guest_mem, ml_sp + 0x14u, obj_base);
+              mango_store_u32_guest(lib->guest_mem, ml_sp + 0xcu,
+                                    obj_base + MANGO_OPENTTD_MAINLOOP_SP_OBJ_BIAS);
+              cpu->r[3] = obj_base;
+            }
+          }
+          cpu->cpsr &= ~((0x3Fu << 10) | (3u << 25));
+        }
+      }
+      cpu->r[MANGO_REG_LR] = (bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW) | 1u;
+      cpu->cpsr |= MANGO_CPSR_T;
+      cpu->r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW;
+    }
+  } else {
+    /* In CheckPalette (push {r3,r4,r5,lr} @ 0x380004) - pop frame and skip
+     * the blx-to-PA so MainLoop continues after UW. */
+    sp = cpu->r[MANGO_REG_SP];
+    if (sp >= 16u && mango_guest_range_ok(lib, sp, 16u)) {
+      uint32_t obj_base = MANGO_OPENTTD_MAINLOOP_PIC_LIT + bias +
+                          MANGO_OPENTTD_MAINLOOP_PIC_ADDPC;
+      cpu->r[3] = mango_load_u32_guest(lib->guest_mem, sp + 0u);
+      cpu->r[4] = mango_load_u32_guest(lib->guest_mem, sp + 4u);
+      cpu->r[5] = mango_load_u32_guest(lib->guest_mem, sp + 8u);
+      cpu->r[MANGO_REG_SP] = sp + 16u;
+      sp = cpu->r[MANGO_REG_SP];
+      if (mango_guest_range_ok(lib, sp, 0x18u) &&
+          mango_guest_range_ok(lib, obj_base,
+                               MANGO_OPENTTD_MAINLOOP_OBJ_FIELD + 4u)) {
+        mango_store_u32_guest(lib->guest_mem, sp + 4u, obj_base);
+        mango_store_u32_guest(lib->guest_mem, sp + 8u, obj_base);
+        mango_store_u32_guest(lib->guest_mem, sp + 0x10u, obj_base);
+        mango_store_u32_guest(lib->guest_mem, sp + 0x14u, obj_base);
+        mango_store_u32_guest(lib->guest_mem, sp + 0xcu,
+                              obj_base + MANGO_OPENTTD_MAINLOOP_SP_OBJ_BIAS);
+        cpu->r[3] = obj_base;
+      }
+    }
+    cpu->cpsr &= ~((0x3Fu << 10) | (3u << 25));
+    cpu->r[MANGO_REG_LR] = (bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW) | 1u;
+    cpu->cpsr |= MANGO_CPSR_T;
+    cpu->r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW;
+  }
+  g_openttd_outer_post_cap_pa_suppress_count++;
+  if (!g_openttd_outer_post_cap_pa_suppress_logged) {
+    g_openttd_outer_post_cap_pa_suppress_logged = 1;
+    fprintf(stderr,
+            "mango: OpenTTD post-CAP CheckPalette->PA suppress "
+            "pc_off=%#x rearm_count=%d post_safe=%d hit=%d sp=%#x "
+            "lr=%#x count=%d\n",
+            (unsigned)pc_off,
+            g_openttd_outer_mainloop_uw_rearm_count,
+            g_openttd_outer_vdd_safe_returned,
+            g_openttd_viewport_draw_logged,
+            (unsigned)cpu->r[MANGO_REG_SP],
+            (unsigned)cpu->r[MANGO_REG_LR],
+            g_openttd_outer_post_cap_pa_suppress_count);
+    fflush(stderr);
+  }
+}
+
 /* research/93: leave PaletteAnimate on the OUTER cpu and run MainLoop's
  * UpdateWindows mid-body (not nested STOP). Nested post-VDD MWSD+UW already
  * consumed dirty on a nested guest; re-arm via SetDirtyBlocks then unwind the
@@ -4973,6 +5103,29 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
         if (lr >= bias) {
           lr_off = lr - bias;
         }
+      }
+    }
+    /* research/100: after hit+safe-return+CAP, suppress CheckPalette->PA
+     * re-entry / pin MainLoop-after-UW continue so outer does not fall back
+     * into PaletteAnimate spam. Cap stays 32; do not re-arm; KEEP priors. */
+    if (g_openttd_outer_vdd_safe_returned &&
+        g_openttd_viewport_draw_logged &&
+        g_openttd_outer_mainloop_uw_rearm_count >=
+            MANGO_OPENTTD_LEAVE_PA_REARM_CAP &&
+        ((pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE &&
+          pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE_END) ||
+         (pc_off >= MANGO_OPENTTD_VA_CHECK_PALETTE &&
+          pc_off < MANGO_OPENTTD_VA_CHECK_PALETTE_END))) {
+      mango_openttd_outer_post_cap_pa_suppress(lib, cpu, bias, pc_off);
+      pc = cpu->r[MANGO_REG_PC] & ~1u;
+      lr = cpu->r[MANGO_REG_LR] & ~1u;
+      pc_off = 0xffffffffu;
+      lr_off = 0xffffffffu;
+      if (pc >= bias) {
+        pc_off = pc - bias;
+      }
+      if (lr >= bias) {
+        lr_off = lr - bias;
       }
     }
   }
@@ -7061,6 +7214,8 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_outer_leave_pa_paint_done = 0;
           g_openttd_outer_leave_pa_nested = 0;
           g_openttd_outer_vdd_safe_returned = 0;
+          g_openttd_outer_post_cap_pa_suppress_logged = 0;
+          g_openttd_outer_post_cap_pa_suppress_count = 0;
           g_openttd_softfloat_window_started_logged = 0;
           g_openttd_softfloat_window_ceiling_logged = 0;
           g_openttd_softfloat_window_next_log = 12922253ull;
