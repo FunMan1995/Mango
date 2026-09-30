@@ -3556,7 +3556,10 @@ static int g_openttd_outer_post_cap_pa_suppress_durable;
 static int g_openttd_outer_post_cap_pa_bl_skipped;
 /* research/104: after durable landscape path, soft-enter SwitchToMode once
  * so Lab stm_e>=1 (prior SM handoff only forced BSS SM_NONE). soft_stm_active
- * gates nest soft-complete before GenerateWorld re-entry. */
+ * gates nest soft-complete before GenerateWorld re-entry.
+ * research/105: soft-enter samples entry+soft-complete while PC still in
+ * VA_SWITCHTOMODE (quanta/SVC poll alone missed); soft_stm_active also
+ * suppresses genworld-force New mid soft-call. */
 static int g_openttd_soft_stm_playable_attempted;
 static int g_openttd_soft_stm_active;
 
@@ -4832,7 +4835,10 @@ static void mango_openttd_outer_post_cap_pa_suppress(MangoLoadedLibrary* lib,
  * SM_NEWGAME (the historically missing GameLoop consume mode) then soft-
  * complete inside SwitchToMode before GenerateWorld re-entry — KEEP map seed,
  * KEEP soft stack + durable suppress + bl_skip + NOP.W + heap/Utf8, CAP 32.
- * NOT one-shot MainLoop-after-UW pin alone; NOT raise-cap; NOT undo-103. */
+ * research/105: soft-complete watch only samples after quanta/SVC; free-run
+ * past STM into GenerateWorld left stm_logged=0. Sample entry+soft-complete
+ * STOP at soft-enter while PC still in VA_SWITCHTOMODE (KEEP /104 pin).
+ * NOT one-shot MainLoop-after-UW pin alone; NOT raise-cap; NOT undo-103/104. */
 static void mango_openttd_soft_switchtomode_playable(MangoLoadedLibrary* lib,
                                                      MangoCpu* cpu) {
   uint32_t bias = 0;
@@ -4869,6 +4875,33 @@ static void mango_openttd_soft_switchtomode_playable(MangoLoadedLibrary* lib,
   nested.cpsr |= MANGO_CPSR_T;
   nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_SWITCHTOMODE;
   g_openttd_soft_stm_active = 1;
+  /* research/105: soft-complete watch only samples after quanta/SVC; nested
+   * otherwise free-runs past VA_SWITCHTOMODE into GenerateWorld (Lab @
+   * a88d26d: _date 712222->0 @ pc_off=0x1f984b8 + genworld force #3) before
+   * first poll, so stm_logged/stm_e stayed 0. Sample entry + soft-complete
+   * STOP now while PC is still in VA_SWITCHTOMODE — before GenerateWorld.
+   * KEEP /104 soft-call pin; do not remove attempt. */
+  {
+    uint32_t stm_pc_off = MANGO_OPENTTD_VA_SWITCHTOMODE;
+    if (!g_openttd_switchtomode_logged) {
+      g_openttd_switchtomode_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD SwitchToMode entry mode_r0=%u mode_r5=%u "
+              "pc_off=%#x lr_off=%#x\n",
+              (unsigned)nested.r[0], (unsigned)nested.r[5],
+              (unsigned)stm_pc_off, 0xffffffffu);
+      fflush(stderr);
+    }
+    if (!g_openttd_switchtomode_exit_logged) {
+      g_openttd_switchtomode_exit_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD SwitchToMode soft-complete playable "
+              "pc_off=%#x (before GenerateWorld)\n",
+              (unsigned)stm_pc_off);
+      fflush(stderr);
+    }
+    nested.r[MANGO_REG_PC] = MANGO_JNI_STOP;
+  }
   rc = mango_run_guest(lib, &nested, NULL);
   g_openttd_soft_stm_active = 0;
 
@@ -6455,6 +6488,18 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
            * to completion (CleanupGeneration clears the wait). Title force
            * (pre-button) stays EAGAIN — that path already reaches the menu. */
           lr_off = (cpu->r[MANGO_REG_LR] & ~1u);
+          /* research/105: suppress New→_GenerateWorld during soft-STM playable
+           * (soft_stm_active). Soft-enter must soft-complete before GenerateWorld;
+           * Lab tip a88d26d forced #3 mid soft-call and wiped _date. */
+          if (g_openttd_soft_stm_active) {
+            fprintf(stderr,
+                    "mango: OpenTTD genworld force suppress (soft_stm_active) "
+                    "payload off=%#x\n",
+                    (unsigned)pay_rel);
+            fflush(stderr);
+            cpu->r[0] = (uint32_t)EAGAIN;
+            break;
+          }
           if (g_openttd_postgen_armed && pay_rel == MANGO_OPENTTD_VA_GENWORLD_WORKER &&
               app_bias != 0 && lr_off == app_bias + MANGO_OPENTTD_VA_THREAD_NEW_RET) {
             fprintf(stderr,
