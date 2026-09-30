@@ -3543,9 +3543,14 @@ static int g_openttd_outer_leave_pa_nested;
  * otherwise permanently blocks re-arm; Lab leave_pa_rearm=0 + PA spam). */
 static int g_openttd_outer_vdd_safe_returned;
 /* research/100: after durable leave through CAP + safe-return + landscape hit,
- * suppress CheckPalette->PA re-entry (pin MainLoop-after-UW). Cap stays 32. */
+ * suppress CheckPalette->PA re-entry (pin MainLoop-after-UW). Cap stays 32.
+ * research/101: logged is first-fire only. durable stays armed so later
+ * PA/CheckPalette polls keep unwinding; MainLoop's CheckPalette bl is skipped
+ * for the rest of the run (not a one-shot pin). */
 static int g_openttd_outer_post_cap_pa_suppress_logged;
 static int g_openttd_outer_post_cap_pa_suppress_count;
+static int g_openttd_outer_post_cap_pa_suppress_durable;
+static int g_openttd_outer_post_cap_pa_bl_skipped;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
@@ -3650,6 +3655,12 @@ static int g_openttd_outer_post_cap_pa_suppress_count;
 #define MANGO_OPENTTD_VA_SET_DIRTY_BLOCKS     0x232b4cu
 /* research/93: VideoDriver_SDL::MainLoop after bl UpdateWindows (0x3804e8). */
 #define MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW   0x3804ecu
+/* research/101: MainLoop anim branch `bl CheckPalette` at 0x380512
+ * (f7ff fd77). nop.w falls through to 0x380516, beyond CheckPalette.
+ * Not an interpreter opcode; cap stays 32. */
+#define MANGO_OPENTTD_VA_MAINLOOP_CHECK_PALETTE_BL 0x380512u
+#define MANGO_OPENTTD_MAINLOOP_CHECK_PALETTE_BL_WORD 0xFD77F7FFu
+#define MANGO_OPENTTD_THUMB_NOP_W            0x8000F3AFu
 /* research/93: PaletteAnimate epilogue (add sp,#20; ldmia ... pc). */
 #define MANGO_OPENTTD_VA_PALETTE_ANIMATE_EPILOGUE 0x1da390u
 /* research/94: CheckPalette-ish VideoDriver_SDL helper that blx's PaletteAnimate
@@ -4629,13 +4640,46 @@ static void mango_openttd_outer_landscape_vdd_safe_return(MangoLoadedLibrary* li
   fflush(stderr);
 }
 
+/* research/101: once post-CAP suppress has fired, MainLoop's anim-branch
+ * bl to CheckPalette (0x380512) is replaced with nop.w so later iterations
+ * fall through to 0x380516 instead of re-entering PaletteAnimate. Idempotent.
+ * Generate reset restores the original bl. Not an opcode invent. */
+static void mango_openttd_post_cap_pa_bl_set(MangoLoadedLibrary* lib,
+                                             uint32_t bias,
+                                             int skip) {
+  uint32_t addr;
+  if (lib == NULL || lib->guest_mem == NULL || bias == 0) {
+    return;
+  }
+  addr = bias + MANGO_OPENTTD_VA_MAINLOOP_CHECK_PALETTE_BL;
+  if (!mango_guest_range_ok(lib, addr, 4u)) {
+    return;
+  }
+  if (skip) {
+    if (g_openttd_outer_post_cap_pa_bl_skipped) {
+      return;
+    }
+    mango_store_u32_guest(lib->guest_mem, addr, MANGO_OPENTTD_THUMB_NOP_W);
+    g_openttd_outer_post_cap_pa_bl_skipped = 1;
+    g_openttd_outer_post_cap_pa_suppress_durable = 1;
+  } else if (g_openttd_outer_post_cap_pa_bl_skipped) {
+    mango_store_u32_guest(lib->guest_mem, addr,
+                          MANGO_OPENTTD_MAINLOOP_CHECK_PALETTE_BL_WORD);
+    g_openttd_outer_post_cap_pa_bl_skipped = 0;
+    g_openttd_outer_post_cap_pa_suppress_durable = 0;
+  }
+}
+
 /* research/100: after durable leave-PA re-arm through CAP + safe-return +
  * landscape hit, CheckPalette still re-blx'es PaletteAnimate (Lab spam at
  * guest pc=0x243276 / pc_off=0x1da276). Suppress that re-entry: unwind the
  * PA(+CheckPalette) frame like leave-PA frame-restore, then pin OUTER at
  * MainLoop-after-UW (research/98 Thumb style). Also catch CheckPalette itself
  * before the blx. Do NOT raise LEAVE_PA_REARM_CAP; do NOT invent opcodes;
- * KEEP leave-PA+paint+nest-guard+safe-return+post_safe re-arm+soft stack. */
+ * KEEP leave-PA+paint+nest-guard+safe-return+post_safe re-arm+soft stack.
+ * research/101: g_openttd_outer_post_cap_pa_suppress_logged gates the first
+ * log only. Every later PA/CheckPalette poll still unwinds and pins, bumps
+ * count, and arms a durable CheckPalette-bl skip so the pin is not one-shot. */
 static void mango_openttd_outer_post_cap_pa_suppress(MangoLoadedLibrary* lib,
                                                      MangoCpu* cpu,
                                                      uint32_t bias,
@@ -4738,6 +4782,9 @@ static void mango_openttd_outer_post_cap_pa_suppress(MangoLoadedLibrary* lib,
     cpu->r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_MAINLOOP_AFTER_UW;
   }
   g_openttd_outer_post_cap_pa_suppress_count++;
+  /* research/101: durable arm. Logged latch must not block later unwinds. */
+  g_openttd_outer_post_cap_pa_suppress_durable = 1;
+  mango_openttd_post_cap_pa_bl_set(lib, bias, 1);
   if (!g_openttd_outer_post_cap_pa_suppress_logged) {
     g_openttd_outer_post_cap_pa_suppress_logged = 1;
     fprintf(stderr,
@@ -4753,6 +4800,19 @@ static void mango_openttd_outer_post_cap_pa_suppress(MangoLoadedLibrary* lib,
             g_openttd_outer_post_cap_pa_suppress_count);
     fflush(stderr);
   }
+  fprintf(stderr,
+          "mango: OpenTTD durable post-CAP CheckPalette->PA suppress "
+          "pc_off=%#x rearm_count=%d post_safe=%d hit=%d sp=%#x lr=%#x "
+          "count=%d bl_skip=%d\n",
+          (unsigned)pc_off,
+          g_openttd_outer_mainloop_uw_rearm_count,
+          g_openttd_outer_vdd_safe_returned,
+          g_openttd_viewport_draw_logged,
+          (unsigned)cpu->r[MANGO_REG_SP],
+          (unsigned)cpu->r[MANGO_REG_LR],
+          g_openttd_outer_post_cap_pa_suppress_count,
+          g_openttd_outer_post_cap_pa_bl_skipped);
+  fflush(stderr);
 }
 
 /* research/93: leave PaletteAnimate on the OUTER cpu and run MainLoop's
@@ -5107,11 +5167,15 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
     }
     /* research/100: after hit+safe-return+CAP, suppress CheckPalette->PA
      * re-entry / pin MainLoop-after-UW continue so outer does not fall back
-     * into PaletteAnimate spam. Cap stays 32; do not re-arm; KEEP priors. */
-    if (g_openttd_outer_vdd_safe_returned &&
-        g_openttd_viewport_draw_logged &&
-        g_openttd_outer_mainloop_uw_rearm_count >=
-            MANGO_OPENTTD_LEAVE_PA_REARM_CAP &&
+     * into PaletteAnimate spam. Cap stays 32; do not re-arm; KEEP priors.
+     * research/101: not one-shot. logged does not gate this. Every poll while
+     * PC is still in PA or CheckPalette unwinds again and the durable bl skip
+     * keeps later MainLoop iterations beyond CheckPalette. */
+    if ((g_openttd_outer_post_cap_pa_suppress_durable ||
+         (g_openttd_outer_vdd_safe_returned &&
+          g_openttd_viewport_draw_logged &&
+          g_openttd_outer_mainloop_uw_rearm_count >=
+              MANGO_OPENTTD_LEAVE_PA_REARM_CAP)) &&
         ((pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE &&
           pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE_END) ||
          (pc_off >= MANGO_OPENTTD_VA_CHECK_PALETTE &&
@@ -7216,6 +7280,15 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_outer_vdd_safe_returned = 0;
           g_openttd_outer_post_cap_pa_suppress_logged = 0;
           g_openttd_outer_post_cap_pa_suppress_count = 0;
+          g_openttd_outer_post_cap_pa_suppress_durable = 0;
+          {
+            uint32_t bias_pa = 0;
+            if (mango_openttd_app(&bias_pa) != NULL) {
+              mango_openttd_post_cap_pa_bl_set(lib, bias_pa, 0);
+            } else {
+              g_openttd_outer_post_cap_pa_bl_skipped = 0;
+            }
+          }
           g_openttd_softfloat_window_started_logged = 0;
           g_openttd_softfloat_window_ceiling_logged = 0;
           g_openttd_softfloat_window_next_log = 12922253ull;
