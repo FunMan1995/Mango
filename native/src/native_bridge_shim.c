@@ -3554,6 +3554,11 @@ static int g_openttd_outer_post_cap_pa_suppress_logged;
 static int g_openttd_outer_post_cap_pa_suppress_count;
 static int g_openttd_outer_post_cap_pa_suppress_durable;
 static int g_openttd_outer_post_cap_pa_bl_skipped;
+/* research/104: after durable landscape path, soft-enter SwitchToMode once
+ * so Lab stm_e>=1 (prior SM handoff only forced BSS SM_NONE). soft_stm_active
+ * gates nest soft-complete before GenerateWorld re-entry. */
+static int g_openttd_soft_stm_playable_attempted;
+static int g_openttd_soft_stm_active;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
@@ -3715,6 +3720,8 @@ static void mango_openttd_soft_cleanup_generation(MangoLoadedLibrary* lib,
 static void mango_openttd_soft_postgen_bringup(MangoLoadedLibrary* lib,
                                                 MangoCpu* cpu,
                                                 const char* where);
+static void mango_openttd_soft_switchtomode_playable(MangoLoadedLibrary* lib,
+                                                     MangoCpu* cpu);
 
 /* Peer DoScan: clear leftover _in_modal_progress so HasModalProgress() does
  * not early-out a later GenerateWorld (research/74). */
@@ -3736,7 +3743,7 @@ static void mango_openttd_clear_in_modal_progress(MangoLoadedLibrary* lib, const
 }
 
 /* research/77: OnClick w8 / helper never store _switch_mode (path watches N
- * across ≥4.75 min live window). Force SM_NEWGAME so GameLoop→SwitchToMode
+ * across >=4.75 min live window). Force SM_NEWGAME so GameLoop→SwitchToMode
  * can consume. One-shot log.
  * research/79: mirror helper 0x22eee8 prologue — MakeNewgameSettingsLive
  * (memcpy 488 B newgame→game) + ensure map_x/y in [6,12] (default 8/8)
@@ -4818,6 +4825,74 @@ static void mango_openttd_outer_post_cap_pa_suppress(MangoLoadedLibrary* lib,
   fflush(stderr);
 }
 
+/* research/104: after durable landscape path (hit+safe+CAP+suppress+bl_skip),
+ * soft-enter SwitchToMode so Lab stm_e>=1 / true playable handshake. Prior
+ * research/82 SM handoff only forced BSS _switch_mode SM_NONE without ever
+ * entering VA_SWITCHTOMODE (stm_e stayed 0 through MAX_WALL). Soft-call with
+ * SM_NEWGAME (the historically missing GameLoop consume mode) then soft-
+ * complete inside SwitchToMode before GenerateWorld re-entry — KEEP map seed,
+ * KEEP soft stack + durable suppress + bl_skip + NOP.W + heap/Utf8, CAP 32.
+ * NOT one-shot MainLoop-after-UW pin alone; NOT raise-cap; NOT undo-103. */
+static void mango_openttd_soft_switchtomode_playable(MangoLoadedLibrary* lib,
+                                                     MangoCpu* cpu) {
+  uint32_t bias = 0;
+  MangoCpu nested;
+  int rc;
+  uint32_t sw_addr;
+  uint32_t gm_addr;
+  if (g_openttd_soft_stm_playable_attempted || cpu == NULL || lib == NULL ||
+      lib->guest_mem == NULL) {
+    return;
+  }
+  if (mango_openttd_app(&bias) == NULL || bias == 0) {
+    return;
+  }
+  if (!g_openttd_outer_post_cap_pa_suppress_durable ||
+      !g_openttd_outer_post_cap_pa_bl_skipped ||
+      !g_openttd_outer_vdd_safe_returned ||
+      !g_openttd_viewport_draw_logged) {
+    return;
+  }
+  g_openttd_soft_stm_playable_attempted = 1;
+  fprintf(stderr,
+          "mango: OpenTTD SwitchToMode soft-call playable attempt "
+          "pc=%#x lr=%#x rearm_count=%d bl_skip=%d\n",
+          (unsigned)cpu->r[MANGO_REG_PC], (unsigned)cpu->r[MANGO_REG_LR],
+          g_openttd_outer_mainloop_uw_rearm_count,
+          g_openttd_outer_post_cap_pa_bl_skipped);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "SwitchToMode soft-call before");
+
+  nested = *cpu;
+  nested.r[0] = MANGO_OPENTTD_SM_NEWGAME;
+  nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
+  nested.cpsr |= MANGO_CPSR_T;
+  nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_SWITCHTOMODE;
+  g_openttd_soft_stm_active = 1;
+  rc = mango_run_guest(lib, &nested, NULL);
+  g_openttd_soft_stm_active = 0;
+
+  /* Mirror post-SwitchToMode GameLoop clear: SM_NONE + GM_NORMAL stay playable. */
+  sw_addr = bias + MANGO_OPENTTD_BSS_SWITCH_MODE;
+  gm_addr = bias + MANGO_OPENTTD_BSS_GAME_MODE;
+  if (mango_guest_range_ok(lib, sw_addr, 4u)) {
+    mango_store_u32_guest(lib->guest_mem, sw_addr, MANGO_OPENTTD_SM_NONE);
+  }
+  if (mango_guest_range_ok(lib, gm_addr, 1u) &&
+      lib->guest_mem[gm_addr] != (uint8_t)MANGO_OPENTTD_GM_NORMAL) {
+    lib->guest_mem[gm_addr] = (uint8_t)MANGO_OPENTTD_GM_NORMAL;
+  }
+  mango_openttd_clear_in_modal_progress(lib, "SwitchToMode soft-call playable");
+
+  fprintf(stderr,
+          "mango: OpenTTD SwitchToMode soft-call playable result rc=%d "
+          "pc=%#x r0=%#x stm_logged=%u\n",
+          rc, (unsigned)nested.r[MANGO_REG_PC], (unsigned)nested.r[0],
+          (unsigned)g_openttd_switchtomode_logged);
+  fflush(stderr);
+  mango_openttd_log_mode_snapshot(lib, "SwitchToMode soft-call after");
+}
+
 /* research/93: leave PaletteAnimate on the OUTER cpu and run MainLoop's
  * UpdateWindows mid-body (not nested STOP). Nested post-VDD MWSD+UW already
  * consumed dirty on a nested guest; re-arm via SetDirtyBlocks then unwind the
@@ -5049,7 +5124,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
    * research/97: skip OUTER leave/paint/re-arm side-effects while leave invent
    * nested SDB is running (poll cpu is the nested copy). */
   if (g_openttd_post_bringup_armed && !g_openttd_soft_vdd_active &&
-      !g_openttd_outer_leave_pa_nested) {
+      !g_openttd_outer_leave_pa_nested && !g_openttd_soft_stm_active) {
     if (in_palette && !g_openttd_post_bu_palette_logged) {
       g_openttd_post_bu_palette_logged = 1;
       fprintf(stderr,
@@ -5195,6 +5270,23 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
         lr_off = lr - bias;
       }
     }
+    /* research/104: once durable suppress+bl_skip armed after landscape path,
+     * soft-enter SwitchToMode (playable continue) so stm_e>=1. */
+    if (g_openttd_outer_post_cap_pa_suppress_durable &&
+        g_openttd_outer_post_cap_pa_bl_skipped &&
+        !g_openttd_soft_stm_playable_attempted) {
+      mango_openttd_soft_switchtomode_playable(lib, cpu);
+      pc = cpu->r[MANGO_REG_PC] & ~1u;
+      lr = cpu->r[MANGO_REG_LR] & ~1u;
+      pc_off = 0xffffffffu;
+      lr_off = 0xffffffffu;
+      if (pc >= bias) {
+        pc_off = pc - bias;
+      }
+      if (lr >= bias) {
+        lr_off = lr - bias;
+      }
+    }
   }
   in_vital_windows =
       (pc_off >= MANGO_OPENTTD_VA_SHOW_VITAL_WINDOWS &&
@@ -5328,6 +5420,31 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
             "mango: OpenTTD SwitchToMode entry mode_r0=%u mode_r5=%u pc_off=%#x lr_off=%#x\n",
             (unsigned)cpu->r[0], (unsigned)cpu->r[5], (unsigned)pc_off, (unsigned)lr_off);
     fflush(stderr);
+  }
+  /* research/104: soft-STM playable — after entry watch fires, STOP nested
+   * SwitchToMode before GenerateWorld re-entry. Nested CPU discarded; outer
+   * MainLoop SP/BSS restored by soft-call epilogue (SM_NONE + GM_NORMAL). */
+  if (g_openttd_soft_stm_active &&
+      pc_off >= MANGO_OPENTTD_VA_SWITCHTOMODE &&
+      pc_off < MANGO_OPENTTD_VA_SWITCHTOMODE_END) {
+    if (!g_openttd_switchtomode_logged) {
+      g_openttd_switchtomode_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD SwitchToMode entry mode_r0=%u mode_r5=%u "
+              "pc_off=%#x lr_off=%#x\n",
+              (unsigned)cpu->r[0], (unsigned)cpu->r[5], (unsigned)pc_off,
+              (unsigned)lr_off);
+      fflush(stderr);
+    }
+    if (!g_openttd_switchtomode_exit_logged) {
+      g_openttd_switchtomode_exit_logged = 1;
+      fprintf(stderr,
+              "mango: OpenTTD SwitchToMode soft-complete playable "
+              "pc_off=%#x (before GenerateWorld)\n",
+              (unsigned)pc_off);
+      fflush(stderr);
+    }
+    cpu->r[MANGO_REG_PC] = MANGO_JNI_STOP;
   } else if (g_openttd_switchtomode_logged && !in_stm && !g_openttd_switchtomode_exit_logged &&
              g_openttd_genworld_complete_logged) {
     /* research/81: exit after genworld complete (entry may SVC-poll miss). */
@@ -7284,6 +7401,8 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_outer_post_cap_pa_suppress_logged = 0;
           g_openttd_outer_post_cap_pa_suppress_count = 0;
           g_openttd_outer_post_cap_pa_suppress_durable = 0;
+          g_openttd_soft_stm_playable_attempted = 0;
+          g_openttd_soft_stm_active = 0;
           {
             uint32_t bias_pa = 0;
             if (mango_openttd_app(&bias_pa) != NULL) {
