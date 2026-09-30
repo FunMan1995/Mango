@@ -3774,6 +3774,16 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
     return 0;
   }
 
+  /* research/102: T32 HINT/NOP.W Encoding T2 → MANGO_OP_NOP (single-thread).
+   * Guest f3af 8000 = nop.w / hint #0 (OpenTTD MainLoop anim bl_skip patch
+   * MANGO_OPENTTD_THUMB_NOP_W). Wider (hw2 & 0xFFF0)==0x8000 opens HINT #imm
+   * family (YIELD/WFE/WFI/SEV/SEVL = no-ops here). A32 HINT peer is
+   * (word & 0x0FFFFFF0)==0x0320F000. Execute is existing NOP (pc+=4 T32). */
+  if (hw1 == 0xF3AFu && (hw2 & 0xFFF0u) == 0x8000u) {
+    out->op = MANGO_OP_NOP;
+    return 0;
+  }
+
   /* Q-OTTD-0p: T32 DMB option → MANGO_OP_NOP (single-thread; no GPR/CPSR effect).
    * Guest f3bf 8f5f = dmb sy; wider (hw2 & 0xFFF0)==0x8F50 opens option sibs
    * (ish/osh/…). DSB/ISB/CLREX T32 (8F4x/8F6x/8F2F) stay uncover this bite —

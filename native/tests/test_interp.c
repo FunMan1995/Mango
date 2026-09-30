@@ -9288,6 +9288,131 @@ static int test_t32_dmb_reject_dsb_isb(void) {
   return 0;
 }
 
+
+static int test_t32_nop_w_hint0(void) {
+  /* research/102: nop.w / hint #0 = f3af 8000 → NOP. Lab stop word
+   * 0x8000f3af. GPRs/NZCV hold; pc+=4. */
+  static const uint16_t kProg[] = {0xF3AFu, 0x8000u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF3AFu, 0x8000u, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_nop_w): decode op=%d (want NOP)\n", di.op);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0xa5a5a5a5u;
+  cpu.r[1] = 0x11111111u;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+  if (rc != 0 || cpu.r[0] != 0xa5a5a5a5u || cpu.r[1] != 0x11111111u ||
+      cpu.cpsr != cpsr_before || cpu.r[MANGO_REG_PC] != 4u) {
+    fprintf(stderr,
+            "FAIL(t32_nop_w): rc=%d r0=0x%x r1=0x%x cpsr=0x%x pc=0x%x "
+            "(want hold + pc=4)\n",
+            rc, cpu.r[0], cpu.r[1], cpu.cpsr, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: T32 NOP.W/HINT #0 f3af8000 → NOP (research/102)\n");
+  return 0;
+}
+
+static int test_t32_hint_imm_sib(void) {
+  /* HINT #imm family under wider mask: hint #1 (YIELD) = f3af 8001 → NOP. */
+  static const uint16_t kProg[] = {0xF3AFu, 0x8001u};
+  uint8_t mem_buf[64];
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 2);
+
+  MangoInsn di;
+  if (mango_decode_t32(0xF3AFu, 0x8001u, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_hint_imm): decode op=%d (want NOP)\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xF3AFu, 0x8004u, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_hint_imm): SEV f3af8004 want NOP, got op=%d\n", di.op);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_Z | MANGO_CPSR_C;
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0xdeadbeefu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+  if (rc != 0 || cpu.r[0] != 0xdeadbeefu || cpu.cpsr != cpsr_before ||
+      cpu.r[MANGO_REG_PC] != 4u) {
+    fprintf(stderr, "FAIL(t32_hint_imm): rc=%d r0=0x%x cpsr=0x%x pc=0x%x\n", rc,
+            cpu.r[0], cpu.cpsr, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: T32 HINT #imm f3af8001/#4 siblings → NOP (research/102)\n");
+  return 0;
+}
+
+static int test_a32_hint_nop_still(void) {
+  /* A32 HINT NOP E320F000 must remain NOP (do not regress tip HINT path). */
+  static const uint32_t kWord = 0xE320F000u;
+  uint8_t mem_buf[64];
+  memset(mem_buf, 0, sizeof(mem_buf));
+  mem_buf[0] = (uint8_t)(kWord & 0xFFu);
+  mem_buf[1] = (uint8_t)((kWord >> 8) & 0xFFu);
+  mem_buf[2] = (uint8_t)((kWord >> 16) & 0xFFu);
+  mem_buf[3] = (uint8_t)((kWord >> 24) & 0xFFu);
+
+  MangoInsn di;
+  if (mango_decode(0xE320F000u, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(a32_hint_nop): decode op=%d (want NOP)\n", di.op);
+    return 1;
+  }
+  if (mango_decode(0xE320F004u, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(a32_hint_nop): SEV E320F004 want NOP, got op=%d\n", di.op);
+    return 1;
+  }
+
+  MangoCpu cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_Z | MANGO_CPSR_C; /* ARM mode */
+  uint32_t cpsr_before = cpu.cpsr;
+  cpu.r[0] = 0xa5a5a5a5u;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 4u, 100);
+  if (rc != 0 || cpu.r[0] != 0xa5a5a5a5u || cpu.cpsr != cpsr_before ||
+      cpu.r[MANGO_REG_PC] != 4u) {
+    fprintf(stderr, "FAIL(a32_hint_nop): rc=%d r0=0x%x cpsr=0x%x pc=0x%x\n", rc,
+            cpu.r[0], cpu.cpsr, cpu.r[MANGO_REG_PC]);
+    return 1;
+  }
+  printf("ok: A32 HINT NOP/SEV E320F000/4 still NOP (research/102)\n");
+  return 0;
+}
+
+static int test_t32_nop_w_dmb_still(void) {
+  /* research/102: DMB → NOP must not regress under HINT invent. */
+  MangoInsn di;
+  if (mango_decode_t32(0xF3BFu, 0x8F5Fu, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_nop_w_dmb): DMB f3bf8f5f want NOP, got op=%d\n", di.op);
+    return 1;
+  }
+  if (mango_decode_t32(0xF3AFu, 0x8000u, &di) != 0 || di.op != MANGO_OP_NOP) {
+    fprintf(stderr, "FAIL(t32_nop_w_dmb): NOP.W f3af8000 want NOP, got op=%d\n", di.op);
+    return 1;
+  }
+  /* Near-miss: F3AF with non-8xxx high nibble stays uncover (not HINT). */
+  if (mango_decode_t32(0xF3AFu, 0x8F50u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_nop_w_dmb): f3af8f50 should stay uncover, got op=%d\n",
+            di.op);
+    return 1;
+  }
+  printf("ok: T32 NOP.W + DMB both NOP; non-HINT F3AF stay uncover (research/102)\n");
+  return 0;
+}
+
 static int test_t32_bic_w_modimm_3(void) {
   /* Q-OTTD-0q: bic.w r6,r6,#3 = f026 0603.
    * ThumbExpandImm(0x003)=3. R6 = R6 & ~3; S=0 leaves NZCV; pc+=4. */
@@ -12996,6 +13121,10 @@ int main(void) {
   failures += test_t32_dmb_ish_sib();
   failures += test_a32_dmb_sy_still_nop();
   failures += test_t32_dmb_reject_dsb_isb();
+  failures += test_t32_nop_w_hint0();
+  failures += test_t32_hint_imm_sib();
+  failures += test_a32_hint_nop_still();
+  failures += test_t32_nop_w_dmb_still();
   failures += test_t32_bic_w_modimm_3();
   failures += test_t32_bic_w_modimm_15();
   failures += test_t32_bic_w_modimm_reject();
