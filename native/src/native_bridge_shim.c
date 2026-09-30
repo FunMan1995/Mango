@@ -3533,6 +3533,11 @@ static int g_openttd_outer_mainloop_uw_rearm_count;
  * once per leave cycle (cleared on re-arm). Nested soft VDD does not trip
  * landscape hit; outer UW redirect x33 still left landscape N. */
 static int g_openttd_outer_leave_pa_paint_done;
+/* research/97: leave invent nested SetDirtyBlocks runs mango_run_guest which
+ * postgen_polls the NESTED cpu. Without this gate, seen_outside+paint fire on
+ * the nested copy after SDB hits STOP (PC rewritten to VDD then discarded), so
+ * Lab logs paint success while OUTER never enters ViewportDoDraw mid-body. */
+static int g_openttd_outer_leave_pa_nested;
 
 /* OpenTTD BSS file offsets (libapplication.so). */
 #define MANGO_OPENTTD_BSS_TICK_COUNTER     0x57d11cu
@@ -4477,7 +4482,9 @@ static void mango_openttd_note_softfloat_window(MangoLoadedLibrary* lib,
  * ABSENT. Resolve MainWindow viewport (FindWindowById nested for args only),
  * then redirect OUTER PC into ViewportDoDraw with MainLoop-after-UW LR so
  * postgen_poll landscape watch can stick. KEEP SDB+frame-restore+UW
- * redirect+re-arm. NOT raise LEAVE_PA_REARM_CAP; NOT re-soft nested VDD. */
+ * redirect+re-arm. NOT raise LEAVE_PA_REARM_CAP; NOT re-soft nested VDD.
+ * research/97: caller must pass OUTER cpu only — nest-guard blocks paint during
+ * leave invent nested SDB (success-without-hit was nested PC write discarded). */
 static void mango_openttd_outer_landscape_paint_after_leave(MangoLoadedLibrary* lib,
                                                             MangoCpu* cpu,
                                                             uint32_t bias) {
@@ -4614,7 +4621,10 @@ static void mango_openttd_outer_mainloop_updatewindows(MangoLoadedLibrary* lib,
   nested.r[MANGO_REG_LR] = MANGO_JNI_STOP;
   nested.cpsr |= MANGO_CPSR_T;
   nested.r[MANGO_REG_PC] = bias + MANGO_OPENTTD_VA_SET_DIRTY_BLOCKS;
+  /* research/97: nest-guard — postgen_poll must not treat nested SDB as OUTER. */
+  g_openttd_outer_leave_pa_nested = 1;
   rc = mango_run_guest(lib, &nested, NULL);
+  g_openttd_outer_leave_pa_nested = 0;
   fprintf(stderr,
           "mango: OpenTTD outer MainLoop UpdateWindows dirty-rearm "
           "SetDirtyBlocks exit rc=%d pc=%#x r0=%#x\n",
@@ -4698,6 +4708,9 @@ static void mango_openttd_outer_mainloop_updatewindows(MangoLoadedLibrary* lib,
           (unsigned)cpu->r[MANGO_REG_SP],
           (unsigned)saved_lr);
   fflush(stderr);
+  /* research/97: OUTER is now outside PA (UW). Mark seen_outside here so the
+   * same postgen_poll paint arm redirects OUTER (not a later nested poll). */
+  g_openttd_outer_mainloop_uw_seen_outside = 1;
 }
 
 /* research/75: poll BSS _switch_mode + PC/LR against helper / SwitchToMode /
@@ -4795,8 +4808,11 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
       g_openttd_soft_vdd_in_palette_polls++;
     }
   }
-  /* research/92: post-bringup MainLoop paint band (B vs leave-PaletteAnimate). */
-  if (g_openttd_post_bringup_armed && !g_openttd_soft_vdd_active) {
+  /* research/92: post-bringup MainLoop paint band (B vs leave-PaletteAnimate).
+   * research/97: skip OUTER leave/paint/re-arm side-effects while leave invent
+   * nested SDB is running (poll cpu is the nested copy). */
+  if (g_openttd_post_bringup_armed && !g_openttd_soft_vdd_active &&
+      !g_openttd_outer_leave_pa_nested) {
     if (in_palette && !g_openttd_post_bu_palette_logged) {
       g_openttd_post_bu_palette_logged = 1;
       fprintf(stderr,
@@ -4844,10 +4860,20 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
         pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE &&
         pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE_END) {
       mango_openttd_outer_mainloop_updatewindows(lib, cpu, bias, pc_off);
+      /* research/97: leave invent may have parked OUTER at UW — refresh pc_off
+       * so the paint arm below sees outside-PA (stale PA pc_off would skip). */
+      pc = cpu->r[MANGO_REG_PC] & ~1u;
+      if (pc >= bias) {
+        pc_off = pc - bias;
+      } else {
+        pc_off = 0xffffffffu;
+      }
     }
     /* research/96: once leave-PA has proven outer outside PA and landscape
      * hit still N, force outer ViewportDoDraw (MainWindow viewport args).
-     * KEEP SDB+frame-restore+UW redirect+re-arm; do not raise re-arm cap. */
+     * KEEP SDB+frame-restore+UW redirect+re-arm; do not raise re-arm cap.
+     * research/97: leave invent sets seen_outside after OUTER UW redirect so
+     * this arm runs on OUTER in the same poll (nest-guard blocks nested SDB). */
     if (g_openttd_outer_mainloop_uw_done &&
         g_openttd_outer_mainloop_uw_seen_outside &&
         !g_openttd_outer_leave_pa_paint_done &&
@@ -4855,6 +4881,33 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
         (pc_off < MANGO_OPENTTD_VA_PALETTE_ANIMATE ||
          pc_off >= MANGO_OPENTTD_VA_PALETTE_ANIMATE_END)) {
       mango_openttd_outer_landscape_paint_after_leave(lib, cpu, bias);
+      /* research/97: hit watch samples at poll start — re-sample after OUTER
+       * PC was written into ViewportDoDraw so entry counts before return /
+       * PA overwrite. */
+      pc = cpu->r[MANGO_REG_PC] & ~1u;
+      lr = cpu->r[MANGO_REG_LR] & ~1u;
+      pc_off = 0xffffffffu;
+      lr_off = 0xffffffffu;
+      if (pc >= bias) {
+        pc_off = pc - bias;
+      }
+      if (lr >= bias) {
+        lr_off = lr - bias;
+      }
+      in_viewport_draw = (pc_off >= MANGO_OPENTTD_VA_VIEWPORT_DRAW &&
+                          pc_off < MANGO_OPENTTD_VA_VIEWPORT_DRAW_END) ||
+                         (lr_off >= MANGO_OPENTTD_VA_VIEWPORT_DRAW &&
+                          lr_off < MANGO_OPENTTD_VA_VIEWPORT_DRAW_END);
+      if (in_viewport_draw && g_openttd_genworld_complete_logged &&
+          !g_openttd_viewport_draw_logged) {
+        g_openttd_viewport_draw_logged = 1;
+        fprintf(stderr,
+                "mango: OpenTTD landscape ViewportDoDraw hit pc_off=%#x "
+                "lr_off=%#x softfloat=%llu\n",
+                (unsigned)pc_off, (unsigned)lr_off,
+                (unsigned long long)g_aeabi_calls_total);
+        fflush(stderr);
+      }
     }
   }
   in_vital_windows =
@@ -6940,6 +6993,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_outer_mainloop_uw_seen_outside = 0;
           g_openttd_outer_mainloop_uw_rearm_count = 0;
           g_openttd_outer_leave_pa_paint_done = 0;
+          g_openttd_outer_leave_pa_nested = 0;
           g_openttd_softfloat_window_started_logged = 0;
           g_openttd_softfloat_window_ceiling_logged = 0;
           g_openttd_softfloat_window_next_log = 12922253ull;
