@@ -33,6 +33,20 @@ class CompatibilityCheckerTest {
     }
 
     @Test
+    fun `armeabi-only app needs the bridge`() {
+        val apk = ApkAbiInfo(abisPresent = setOf(Abi.ARMEABI), hasAnyNativeLibs = true)
+        val device = DeviceProfile(supportedAbis = setOf(Abi.ARM64_V8A), nativeBridgeActive = true)
+        assertEquals(Verdict.NEEDS_BRIDGE, CompatibilityChecker.check(apk, device).verdict)
+    }
+
+    @Test
+    fun `x86-only app is not an ARM guest and is blocked`() {
+        val apk = ApkAbiInfo(abisPresent = setOf(Abi.X86), hasAnyNativeLibs = true)
+        val device = DeviceProfile(supportedAbis = setOf(Abi.ARM64_V8A), nativeBridgeActive = true)
+        assertEquals(Verdict.BLOCKED, CompatibilityChecker.check(apk, device).verdict)
+    }
+
+    @Test
     fun `unsupported non-32-bit abi is blocked, not offered the bridge`() {
         val apk = ApkAbiInfo(abisPresent = setOf(Abi.X86_64), hasAnyNativeLibs = true)
         val device = DeviceProfile(supportedAbis = setOf(Abi.ARM64_V8A), nativeBridgeActive = true)
