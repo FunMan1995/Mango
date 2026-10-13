@@ -3550,6 +3550,57 @@ static int test_t32_orr_w_reg_lsl6(void) {
 }
 
 /* research/109: VFP multiply-accumulate (vmls.f64 from TGP, vmla.f32). */
+/* research/110: VCVT.F32.F64 with a D16+ source (M bit), VDIV by zero
+ * (IEEE +/-inf; NaN cases deferred). */
+static int test_research110_vcvt_vdiv(void) {
+  uint8_t mem_buf[64];
+  MangoCpu cpu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc, fails = 0;
+  uint64_t u;
+  {
+    /* A32 vcvt.f32.f64 s0, d17 = eeb70be1 ; T32 vcvt.f32.f64 s3, d20 = eef7 1be4 */
+    double v = -2.5, v2 = 6.25; float f, f2;
+    uint32_t w[] = {0xEEB70BE1u, 0xE12FFF1Eu};
+    memset(mem_buf, 0, sizeof mem_buf); memcpy(mem_buf, w, sizeof w);
+    memset(&cpu, 0, sizeof(cpu)); cpu.r[MANGO_REG_LR] = 0xABCDu;
+    memcpy(&u, &v, 8); cpu.s[34] = (uint32_t)u; cpu.s[35] = (uint32_t)(u >> 32);
+    cpu.s[2] = 0x3F800000u; cpu.s[3] = 0x40000000u; /* d1 decoy */
+    rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    memcpy(&f, &cpu.s[0], 4);
+    if (rc != 0 || f != -2.5f) { fprintf(stderr, "FAIL(r110_vcvt_f32_d17): rc=%d s0=%f\n", rc, f); fails++; }
+    {
+      static const uint16_t k[] = {0xEEF7u, 0x1BE4u, 0x4770u};
+      memset(mem_buf, 0, sizeof mem_buf);
+      load_halfwords(mem_buf, sizeof(mem_buf), k, 3);
+      memset(&cpu, 0, sizeof(cpu)); cpu.cpsr = MANGO_CPSR_T; cpu.r[MANGO_REG_LR] = 0xABCDu;
+      memcpy(&u, &v2, 8); cpu.s[40] = (uint32_t)u; cpu.s[41] = (uint32_t)(u >> 32);
+      rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+      memcpy(&f2, &cpu.s[3], 4);
+      if (rc != 0 || f2 != 6.25f) { fprintf(stderr, "FAIL(r110_vcvt_f32_d20_t32): rc=%d s3=%f\n", rc, f2); fails++; }
+    }
+  }
+  {
+    /* vdiv.f64 d0,d1,d2 = ee810b02 ; vdiv.f32 s6,s7,s8 = ee833a84 */
+    double one = 1.0, mone = -3.0, zero = 0.0, r; float rf;
+    uint32_t w[] = {0xEE810B02u, 0xEE833A84u, 0xE12FFF1Eu};
+    memset(mem_buf, 0, sizeof mem_buf); memcpy(mem_buf, w, sizeof w);
+    memset(&cpu, 0, sizeof(cpu)); cpu.r[MANGO_REG_LR] = 0xABCDu;
+    memcpy(&u, &one, 8); cpu.s[2] = (uint32_t)u; cpu.s[3] = (uint32_t)(u >> 32);
+    memcpy(&u, &zero, 8); cpu.s[4] = (uint32_t)u; cpu.s[5] = (uint32_t)(u >> 32);
+    { float a = -3.0f; (void)mone; memcpy(&cpu.s[7], &a, 4); cpu.s[8] = 0u; }
+    rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    u = (uint64_t)cpu.s[0] | ((uint64_t)cpu.s[1] << 32); memcpy(&r, &u, 8);
+    memcpy(&rf, &cpu.s[6], 4);
+    if (rc != 0 || u != 0x7FF0000000000000ull || cpu.s[6] != 0xFF800000u) {
+      fprintf(stderr, "FAIL(r110_vdiv_zero): rc=%d d0=%#llx s6=%#x (%f %f)\n", rc, (unsigned long long)u, cpu.s[6], r, rf);
+      fails++;
+    }
+  }
+  if (!fails) printf("ok: research/110 VCVT.F32.F64 D16+ source (A32/T32), VDIV by zero -> +/-inf\n");
+  return fails;
+}
+
 /* research/109: VMOV Dm<->Rt,Rt2 (no D16 alias), Thumb literal VLDR Align(PC,4),
  * saturating VCVT to s32, VCVT.F32.F64 with D bit. Oracle: unicorn 2.1.4. */
 static int test_research109_tgp_isa(void) {
@@ -13194,6 +13245,7 @@ int main(void) {
   failures += test_research108_isa();
   failures += test_research109_vmla();
   failures += test_research109_tgp_isa();
+  failures += test_research110_vcvt_vdiv();
   failures += test_t32_and_w_reg();
   failures += test_t32_ands_w_reg();
   failures += test_t32_tst_w_reg();

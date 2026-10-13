@@ -3649,6 +3649,8 @@ static void mango_openttd_settings_probe(MangoLoadedLibrary* lib, uint32_t bias)
 static unsigned long long g_openttd_input_mark;
 static int g_openttd_input_stage;
 static void mango_openttd_input_dump(const char* tag);
+static void mango_openttd_snap_take(void);
+static void mango_openttd_locate_toolbar_click(uint32_t* ox, uint32_t* oy);
 static int mango_env_flag(const char* name) {
   const char* v = getenv(name);
   return v != NULL && v[0] != '\0' && v[0] != '0';
@@ -7756,6 +7758,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           s_gap = 0;
         } else if (st == 0 && n >= 64ull) {
           mango_openttd_input_dump("input-0-before");
+          mango_openttd_snap_take();
           g_openttd_input_stage = 1;
         } else if (st >= 1 && st <= 7) {
           /* Viewport scroll by right-drag (OpenTTD default scroll mode):
@@ -7782,8 +7785,13 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           type = st == 9 ? 4u : (st == 10 ? 5u : 6u);
           button = st == 9 ? 0u : 1u;
           state = st == 10 ? 1u : 0u;
-          x = 60u; y = 8u; emit = 1;
-          if (st == 9) fprintf(stderr, "mango: OpenTTD research/107 inject toolbar click at 60,8 presents=%llu\n", n);
+          {
+            static uint32_t s_cx = 60u, s_cy = 8u;
+            if (st == 9) mango_openttd_locate_toolbar_click(&s_cx, &s_cy);
+            x = s_cx; y = s_cy;
+          }
+          emit = 1;
+          if (st == 9) fprintf(stderr, "mango: OpenTTD research/107 inject toolbar click at %u,%u presents=%llu\n", x, y, n);
           if (++g_openttd_input_stage == 12) g_openttd_input_mark = n;
         } else if (st == 12 && n >= g_openttd_input_mark + 48ull) {
           mango_openttd_input_dump("input-2-click");
@@ -10569,6 +10577,104 @@ static int mango_openttd_dump_ppm(MangoLoadedLibrary* lib, uint32_t surf, const 
   fprintf(stderr, "mango: OpenTTD frame dump %s %ux%u nonzero=%u/%u\n", path,
           (unsigned)w, (unsigned)h, (unsigned)nonzero, (unsigned)(w * h));
   return (int)nonzero;
+}
+
+
+/* research/110: toolbar click locator by frame analysis. Snapshot the
+ * framebuffer at input-0-before; after the right-drag scroll the changed
+ * bbox is the main viewport, and the unchanged margin holds the toolbar
+ * (top strip with NO_SCAN_TID defaults, left/right columns with the real
+ * config's vertical toolbar). Target = Save/Load button (dropdown), found
+ * by its floppy-blue icon in that margin. Revert: MANGO_OPENTTD_110_FIXED_CLICK=1. */
+static uint8_t* g_openttd_snap;
+static uint32_t g_openttd_snap_w, g_openttd_snap_h;
+static int mango_openttd_fb_geom(MangoLoadedLibrary* lib, uint32_t surf, uint32_t* w, uint32_t* h,
+                                 uint32_t* pitch, uint32_t* pix) {
+  uint32_t fmt;
+  if (!lib || !surf || !mango_guest_range_ok(lib, surf, 60u)) return -1;
+  fmt = mango_load_u32_guest(lib->guest_mem, surf + 4u);
+  *w = mango_load_u32_guest(lib->guest_mem, surf + 8u);
+  *h = mango_load_u32_guest(lib->guest_mem, surf + 12u);
+  *pitch = (uint32_t)lib->guest_mem[surf + 16u] | ((uint32_t)lib->guest_mem[surf + 17u] << 8);
+  *pix = mango_load_u32_guest(lib->guest_mem, surf + 20u);
+  if (!fmt || !*pix || *w == 0 || *h == 0 || *w > 4096 || *h > 4096 ||
+      !mango_guest_range_ok(lib, fmt, 8u) || lib->guest_mem[fmt + 5u] != 4 ||
+      !mango_guest_range_ok(lib, *pix, *pitch * *h)) return -1;
+  return 0;
+}
+static void mango_openttd_snap_take(void) {
+  MangoLoadedLibrary* dl = mango_openttd_app(NULL);
+  uint32_t w, h, pitch, pix;
+  if (mango_openttd_fb_geom(dl, g_fb_surf_last, &w, &h, &pitch, &pix) != 0) return;
+  free(g_openttd_snap);
+  g_openttd_snap = (uint8_t*)malloc((size_t)w * h * 4u);
+  if (!g_openttd_snap) return;
+  for (uint32_t y = 0; y < h; y++) memcpy(g_openttd_snap + (size_t)y * w * 4u, dl->guest_mem + pix + y * pitch, w * 4u);
+  g_openttd_snap_w = w; g_openttd_snap_h = h;
+}
+static void mango_openttd_locate_toolbar_click(uint32_t* ox, uint32_t* oy) {
+  MangoLoadedLibrary* dl = mango_openttd_app(NULL);
+  uint32_t w, h, pitch, pix, x0 = ~0u, y0 = ~0u, x1 = 0, y1 = 0, n = 0;
+  *ox = 60u; *oy = 8u;
+  if (mango_env_flag("MANGO_OPENTTD_110_FIXED_CLICK") || !g_openttd_snap ||
+      mango_openttd_fb_geom(dl, g_fb_surf_last, &w, &h, &pitch, &pix) != 0 ||
+      w != g_openttd_snap_w || h != g_openttd_snap_h) {
+    fprintf(stderr, "mango: OpenTTD research/110 toolbar locate: fixed 60,8\n");
+    return;
+  }
+  for (uint32_t y = 0; y < h; y++) {
+    const uint8_t* a = dl->guest_mem + pix + y * pitch;
+    const uint8_t* b = g_openttd_snap + (size_t)y * w * 4u;
+    for (uint32_t x = 0; x < w; x++) {
+      if (memcmp(a + x * 4u, b + x * 4u, 3) != 0) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; n++;
+      }
+    }
+  }
+  if (n < 1000u) {
+    fprintf(stderr, "mango: OpenTTD research/110 toolbar locate: no scroll diff (%u), fixed 60,8\n", n);
+    return;
+  }
+  {
+    /* Toolbar strip = unchanged margin: top strip (horizontal layout) or
+     * left column (vertical). Target the Save/Load button (dropdown): the
+     * first cluster of floppy-blue pixels (B>150,R<80,G<100) along the
+     * strip axis; click the cluster centroid. */
+    int horiz = (y0 >= 16u && y0 >= x0);
+    uint32_t depth = horiz ? y0 : x0, len = horiz ? w : h;
+    uint32_t start = ~0u, last = 0, cnt = 0;
+    uint64_t sa = 0, sc = 0;
+    if (depth >= 16u) {
+      for (uint32_t t = 0; t < len; t++) {
+        uint32_t c = 0;
+        for (uint32_t q = 0; q < depth; q++) {
+          uint32_t x = horiz ? t : q, y = horiz ? q : t;
+          const uint8_t* px = dl->guest_mem + pix + y * pitch + x * 4u; /* B,G,R */
+          if (px[0] > 150 && px[2] < 80 && px[1] < 100) { c++; sa += t; sc += q; }
+        }
+        if (c >= 1u) {
+          if (start == ~0u) start = t;
+          last = t; cnt += c;
+        } else if (start != ~0u && t > last + 6u) {
+          break;
+        } else if (start == ~0u) {
+          sa = 0; sc = 0;
+        }
+      }
+    }
+    if (start != ~0u && cnt >= 20u) {
+      uint32_t ca = (uint32_t)(sa / cnt), cc = (uint32_t)(sc / cnt);
+      *ox = horiz ? ca : cc; *oy = horiz ? cc : ca;
+      fprintf(stderr, "mango: OpenTTD research/110 toolbar %s strip depth=%u save-button cluster %u..%u px=%u\n",
+              horiz ? "top" : "left", depth, start, last, cnt);
+    } else if (horiz && depth >= 16u) {
+      *ox = 60u; *oy = y0 / 2u;
+    } else if (depth >= 16u) {
+      *ox = x0 / 2u; *oy = 60u;
+    }
+  }
+  fprintf(stderr, "mango: OpenTTD research/110 toolbar locate: viewport bbox=(%u,%u,%u,%u) n=%u -> click %u,%u\n",
+          x0, y0, x1 + 1u, y1 + 1u, n, *ox, *oy);
 }
 
 static void mango_openttd_input_dump(const char* tag) {
