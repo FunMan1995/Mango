@@ -3549,6 +3549,87 @@ static int test_t32_orr_w_reg_lsl6(void) {
   return 0;
 }
 
+/* research/108: TEQ.W / EORS.W register, T32 S=1 inside IT, VNEG/VABS.F32. */
+static int test_research108_isa(void) {
+  MangoInsn di;
+  /* teq.w r12, r0 = ea9c 0f00 */
+  if (mango_decode_t32(0xEA9Cu, 0x0F00u, &di) != 0 || di.op != MANGO_OP_TEQ || di.rn != 12 ||
+      di.rm != 0 || di.sets_flags != 1) {
+    fprintf(stderr, "FAIL(r108_teq): decode op=%d\n", di.op);
+    return 1;
+  }
+  {
+    /* teq.w r12,r0 ; bx lr. r12=0x80000000 r0=1 -> N=1 Z=0, C/V kept. */
+    static const uint16_t kProg[] = {0xEA9Cu, 0x0F00u, 0x4770u};
+    uint8_t mem_buf[32];
+    MangoCpu cpu;
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T | MANGO_CPSR_C | MANGO_CPSR_V | MANGO_CPSR_Z;
+    cpu.r[12] = 0x80000000u; cpu.r[0] = 1u; cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.cpsr != (MANGO_CPSR_T | MANGO_CPSR_N | MANGO_CPSR_C | MANGO_CPSR_V) ||
+        cpu.r[12] != 0x80000000u) {
+      fprintf(stderr, "FAIL(r108_teq run): rc=%d cpsr=%x\n", rc, cpu.cpsr);
+      return 1;
+    }
+  }
+  {
+    /* eors.w r3, r2, r4 = ea92 0304: r3 = r2^r4, Z set when equal. */
+    static const uint16_t kProg[] = {0xEA92u, 0x0304u, 0x4770u};
+    uint8_t mem_buf[32];
+    MangoCpu cpu;
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[2] = 0x55u; cpu.r[4] = 0x55u; cpu.r[3] = 7u; cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.r[3] != 0u || (cpu.cpsr & MANGO_CPSR_Z) == 0u) {
+      fprintf(stderr, "FAIL(r108_eors): rc=%d r3=%x cpsr=%x\n", rc, cpu.r[3], cpu.cpsr);
+      return 1;
+    }
+  }
+  {
+    /* libgcc __divsi3 tail: cmp r3,#0 ; itt ne ; lsrsne.w r2,r2,#4 ; lsrne r1,r1,#4 ; bx lr.
+     * r2=8: lsrs.w -> 0 sets Z (T32 S=1 inside IT writes flags), so lsrne
+     * r1 is skipped (r1 stays 0x100). */
+    static const uint16_t kProg[] = {0x2B00u, 0xBF1Cu, 0xEA5Fu, 0x1212u, 0x0909u, 0x4770u};
+    uint8_t mem_buf[32];
+    MangoCpu cpu;
+    load_halfwords(mem_buf, sizeof(mem_buf), kProg, 6);
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[3] = 5u; cpu.r[2] = 8u; cpu.r[1] = 0x100u; cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 20);
+    if (rc != 0 || cpu.r[2] != 0u || (cpu.cpsr & MANGO_CPSR_Z) == 0u || cpu.r[1] != 0x100u) {
+      fprintf(stderr, "FAIL(r108_it_t32_s): rc=%d r2=%x r1=%x cpsr=%x\n", rc, cpu.r[2], cpu.r[1],
+              cpu.cpsr);
+      return 1;
+    }
+  }
+  {
+    /* A32 vneg.f32 s15,s15 = eef17a67 ; vabs.f32 s14,s15 = eeb07ae7 ; bx lr */
+    uint8_t mem_buf[32];
+    MangoCpu cpu;
+    uint32_t w[] = {0xEEF17A67u, 0xEEB07AE7u, 0xE12FFF1Eu};
+    memcpy(mem_buf, w, sizeof w);
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.s[15] = 0x3f800000u; /* 1.0f */
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+    int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.s[15] != 0xbf800000u || cpu.s[14] != 0x3f800000u) {
+      fprintf(stderr, "FAIL(r108_vneg_f32): rc=%d s15=%x s14=%x\n", rc, cpu.s[15], cpu.s[14]);
+      return 1;
+    }
+  }
+  printf("ok: research/108 TEQ.W, EORS.W, IT+T32 S, VNEG/VABS.F32\n");
+  return 0;
+}
+
 static int test_t32_eor_w_reg(void) {
   /* Q-OTTD-0ay: eor.w r3,r2,r4 = ea82 0304. r3 = r2 ^ r4. Flags hold. */
   static const uint16_t kProg[] = {0xEA82u, 0x0304u, 0x4770u};
@@ -3561,8 +3642,9 @@ static int test_t32_eor_w_reg(void) {
             di.rn, di.rm, di.sets_flags, di.shift_amount);
     return 1;
   }
-  if (mango_decode_t32(0xEA92u, 0x0304u, &di) == 0 || mango_decode_t32(0xEA8Fu, 0x0304u, &di) == 0) {
-    fprintf(stderr, "FAIL(t32_eor_reg): EORS or Rn=PC decoded\n");
+  /* research/108: EORS.W (EA9x) now decodes; Rn=PC stays rejected. */
+  if (mango_decode_t32(0xEA8Fu, 0x0304u, &di) == 0 || mango_decode_t32(0xEA9Fu, 0x0304u, &di) == 0) {
+    fprintf(stderr, "FAIL(t32_eor_reg): Rn=PC decoded\n");
     return 1;
   }
 
@@ -13015,6 +13097,7 @@ int main(void) {
   failures += test_t32_orrs_w_reg();
   failures += test_t32_orr_w_reg_lsl6();
   failures += test_t32_eor_w_reg();
+  failures += test_research108_isa();
   failures += test_t32_and_w_reg();
   failures += test_t32_ands_w_reg();
   failures += test_t32_tst_w_reg();

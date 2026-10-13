@@ -67,4 +67,11 @@ uint32_t mango_elf32_find_symbol(const MangoElf32Image* image, const char* name)
 int mango_elf32_apply_relocs(const MangoElf32Image* image, uint8_t* mem, uint32_t mem_size,
                              uint32_t load_bias, MangoElf32ResolveFn resolve, void* ctx);
 
+/* research/108: late binding. For UND-symbol GLOB_DAT/JUMP_SLOT/ABS32 slots
+ * still holding `old_value` (an unresolved stub), call resolve again and
+ * store any new nonzero address. Returns slots rebound, -1 on error. */
+int mango_elf32_rebind_undefined(const MangoElf32Image* image, uint8_t* mem, uint32_t mem_size,
+                                 uint32_t load_bias, uint32_t old_value,
+                                 MangoElf32ResolveFn resolve, void* ctx);
+
 #endif /* MANGO_ELF32_H_ */

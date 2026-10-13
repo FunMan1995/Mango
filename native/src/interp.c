@@ -3,6 +3,7 @@
 #include "mango/decoder.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -549,12 +550,44 @@ static int mango_cond_holds(uint32_t cond, uint32_t cpsr) {
   }
 }
 
-static uint32_t g_fastpath_addr;
-static MangoFastpathFn g_fastpath_fn;
+/* research/108: up to 32 fastpath/probe slots (was one). Same semantics per
+ * slot; set_fastpath(addr, NULL) clears that addr; (0, NULL) clears all. */
+#define MANGO_FASTPATH_SLOTS 32
+static uint32_t g_fastpath_addrs[MANGO_FASTPATH_SLOTS];
+static MangoFastpathFn g_fastpath_fns[MANGO_FASTPATH_SLOTS];
+static uint32_t g_fastpath_lo = 0xffffffffu, g_fastpath_hi;
+
+static void mango_fastpath_bounds(void) {
+  g_fastpath_lo = 0xffffffffu; g_fastpath_hi = 0u;
+  for (int i = 0; i < MANGO_FASTPATH_SLOTS; i++) {
+    if (g_fastpath_fns[i] == NULL) continue;
+    if (g_fastpath_addrs[i] < g_fastpath_lo) g_fastpath_lo = g_fastpath_addrs[i];
+    if (g_fastpath_addrs[i] > g_fastpath_hi) g_fastpath_hi = g_fastpath_addrs[i];
+  }
+}
 
 void mango_interp_set_fastpath(uint32_t addr, MangoFastpathFn fn) {
-  g_fastpath_addr = fn ? addr : 0u;
-  g_fastpath_fn = addr ? fn : NULL;
+  int i, free_i = -1;
+  if (addr == 0u) {
+    for (i = 0; i < MANGO_FASTPATH_SLOTS; i++) { g_fastpath_fns[i] = NULL; g_fastpath_addrs[i] = 0; }
+    mango_fastpath_bounds();
+    return;
+  }
+  for (i = 0; i < MANGO_FASTPATH_SLOTS; i++) {
+    if (g_fastpath_fns[i] != NULL && g_fastpath_addrs[i] == addr) break;
+    if (g_fastpath_fns[i] == NULL && free_i < 0) free_i = i;
+  }
+  if (i == MANGO_FASTPATH_SLOTS) i = free_i;
+  if (i >= 0) { g_fastpath_fns[i] = fn; g_fastpath_addrs[i] = fn ? addr : 0u; }
+  mango_fastpath_bounds();
+}
+
+static MangoFastpathFn mango_fastpath_find(uint32_t addr) {
+  if (addr < g_fastpath_lo || addr > g_fastpath_hi) return NULL;
+  for (int i = 0; i < MANGO_FASTPATH_SLOTS; i++) {
+    if (g_fastpath_fns[i] != NULL && g_fastpath_addrs[i] == addr) return g_fastpath_fns[i];
+  }
+  return NULL;
 }
 
 int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32_t max_steps) {
@@ -565,10 +598,11 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
       return 0;
     }
 
-    if (g_fastpath_fn != NULL && addr == g_fastpath_addr &&
+    MangoFastpathFn fpf;
+    if (addr >= g_fastpath_lo && addr <= g_fastpath_hi && (fpf = mango_fastpath_find(addr)) != NULL &&
         (cpu->cpsr & MANGO_CPSR_T) != 0 && mango_get_itstate(cpu->cpsr) == 0) {
       uint32_t next_fp = 0;
-      if (g_fastpath_fn(cpu, mem, &next_fp) == 0) {
+      if (fpf(cpu, mem, &next_fp) == 0) {
         addr = next_fp;
         cpu->r[MANGO_REG_PC] = addr;
         continue;
@@ -627,8 +661,17 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
        * `itt eq; moveq r2,#1; beq` otherwise clears Z and misses the NUL.
        * CMP/CMN/TST/TEQ still write flags; they are only legal as the last
        * instruction in the block. */
+      /* research/108: only 16-bit encodings lose S inside IT. A 32-bit
+       * encoding with S=1 (e.g. lsrsne.w in libgcc __divsi3, used by
+       * FreeType FT_MulDiv) sets flags per the ARM ARM; dropping it looped
+       * __divsi3 forever. Revert: MANGO_108_IT_DROP_S_T32=1. */
+      static int s_it_drop_t32 = -1;
+      if (s_it_drop_t32 < 0) {
+        const char* v = getenv("MANGO_108_IT_DROP_S_T32");
+        s_it_drop_t32 = (v != NULL && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+      }
       if (insn.op != MANGO_OP_CMP && insn.op != MANGO_OP_CMN && insn.op != MANGO_OP_TST &&
-          insn.op != MANGO_OP_TEQ) {
+          insn.op != MANGO_OP_TEQ && (next_addr - addr == 2u || s_it_drop_t32)) {
         insn.sets_flags = 0;
       }
     }
@@ -1260,18 +1303,45 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         }
 
         case MANGO_OP_VABS: {
+          if (!insn.b) {
+            float fa, fr;
+            uint32_t u = cpu->s[insn.rm & 31u];
+            memcpy(&fa, &u, 4);
+            fr = fa < 0.0f ? -fa : fa;
+            memcpy(&u, &fr, 4);
+            cpu->s[insn.rd & 31u] = u;
+            break;
+          }
           double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
           mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(a < 0.0 ? -a : a));
           break;
         }
 
         case MANGO_OP_VNEG: {
+          if (!insn.b) {
+            float fa, fr;
+            uint32_t u = cpu->s[insn.rm & 31u];
+            memcpy(&fa, &u, 4);
+            fr = -fa;
+            memcpy(&u, &fr, 4);
+            cpu->s[insn.rd & 31u] = u;
+            break;
+          }
           double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
           mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(-a));
           break;
         }
 
         case MANGO_OP_VSQRT: {
+          if (!insn.b) {
+            float fa, fr;
+            uint32_t u = cpu->s[insn.rm & 31u];
+            memcpy(&fa, &u, 4);
+            fr = fa < 0.0f ? 0.0f : sqrtf(fa);
+            memcpy(&u, &fr, 4);
+            cpu->s[insn.rd & 31u] = u;
+            break;
+          }
           double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
           mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(a < 0.0 ? 0.0 : sqrt(a)));
           break;

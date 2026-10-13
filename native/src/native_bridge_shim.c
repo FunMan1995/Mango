@@ -3887,6 +3887,58 @@ static void mango_openttd_force_switch_mode_newgame(MangoLoadedLibrary* lib) {
   fflush(stderr);
 }
 
+/* research/108: play-mode trigger for the post-STM frame dump and input
+ * script. Latches once the game is really playing: _game_mode==GM_NORMAL,
+ * no modal progress, not generating, _switch_mode==SM_NONE and _date has
+ * ticked since that state was first seen. Works when the soft stack never
+ * fires (MANGO_OPENTTD_107_PA_FASTPATH_EARLY=1). Revert to the /107
+ * STM-only trigger: MANGO_OPENTTD_108_NO_PLAYMODE_TRIGGER=1. */
+static int g_openttd_play_reached;
+static void mango_openttd_play_poll(void) {
+  static int s_seen;
+  static uint32_t s_date0;
+  uint32_t bias = 0, gm, modal, genw, sw, date;
+  MangoLoadedLibrary* lib;
+  if (g_openttd_play_reached) return;
+  if (mango_env_flag("MANGO_OPENTTD_108_NO_PLAYMODE_TRIGGER")) return;
+  lib = mango_openttd_app(&bias);
+  if (lib == NULL || lib->guest_mem == NULL || bias == 0) return;
+  if (!mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_IN_MODAL, 1u) ||
+      !mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_GAME_MODE, 4u) ||
+      !mango_guest_range_ok(lib, bias + MANGO_OPENTTD_BSS_DATE, 4u)) return;
+  gm = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GAME_MODE];
+  modal = lib->guest_mem[bias + MANGO_OPENTTD_BSS_IN_MODAL];
+  genw = lib->guest_mem[bias + MANGO_OPENTTD_BSS_GENERATING_WORLD];
+  sw = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_SWITCH_MODE);
+  date = mango_load_u32_guest(lib->guest_mem, bias + MANGO_OPENTTD_BSS_DATE);
+  if (gm != MANGO_OPENTTD_GM_NORMAL || modal != 0u || genw != 0u ||
+      sw != MANGO_OPENTTD_SM_NONE || date == 0u) {
+    s_seen = 0;
+    return;
+  }
+  if (!s_seen) { s_seen = 1; s_date0 = date; return; }
+  if (date != s_date0) {
+    g_openttd_play_reached = 1;
+    fprintf(stderr, "mango: OpenTTD research/108 play mode reached _date=%u->%u stm_attempted=%d\n",
+            (unsigned)s_date0, (unsigned)date, g_openttd_soft_stm_playable_attempted);
+    {
+      static const struct { uint32_t va, len; const char* nm; } kS[] = {
+        {0x977730u, 0x2c8u, "_settings_client"}, {0x977548u, 0x1e8u, "_settings_game"},
+        {0x977360u, 0x1e8u, "_settings_newgame"}};
+      for (unsigned k = 0; k < 3; k++) {
+        unsigned nz = 0;
+        if (!mango_guest_range_ok(lib, bias + kS[k].va, kS[k].len)) continue;
+        for (uint32_t j = 0; j < kS[k].len; j++) nz += lib->guest_mem[bias + kS[k].va + j] != 0;
+        fprintf(stderr, "mango: OpenTTD research/108 %s nonzero=%u/%u\n", kS[k].nm, nz, (unsigned)kS[k].len);
+      }
+      fprintf(stderr, "mango: OpenTTD research/108 gui.zoom_min=%u zoom_max=%u\n",
+              lib->guest_mem[bias + 0x977730u + 0x26u], lib->guest_mem[bias + 0x977730u + 0x27u]);
+    }
+    fflush(stderr);
+  }
+}
+#define MANGO_OPENTTD_POST_PLAY() (g_openttd_soft_stm_playable_attempted || g_openttd_play_reached)
+
 /* research/74: post-Generate instrument — snapshot mode / modal / gen flags.
  * research/75: prefer Generate BUTTONUP (after OnClick) over motion.
  * research/81: also _game_mode / _pause_mode (StateGameLoop wait peers). */
@@ -5789,6 +5841,16 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
   }
 }
 
+/* research/108: soft pthread_self. 1 on the main thread; the inline
+ * DoScanNewGRFFiles nested run reports its ThreadObject id so
+ * ThreadMutex_pthread::BeginCritical does not see a recursive lock by the
+ * "same" thread (NOT_REACHED thread_pthread.cpp:132 -> exit, which skipped
+ * AfterNewGRFScan::OnNewGRFsScanned and the full LoadFromConfig).
+ * OPT-IN: MANGO_OPENTTD_108_SCAN_TID=1. Off by default because the real
+ * settings then select the TGP generator, whose run currently wild-jumps
+ * (interp stop in GetTextfile data, see 108 brief). */
+static uint32_t g_soft_pthread_self = 1u;
+
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
   uint32_t r0 = cpu->r[0];
   uint32_t r1 = cpu->r[1];
@@ -6458,7 +6520,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       mango_ret_f(cpu, fabsf(mango_arg_f(cpu)));
       break;
     case MANGO_LIBC_PTHREAD_SELF:
-      cpu->r[0] = 1;
+      cpu->r[0] = g_soft_pthread_self;
       break;
     case MANGO_LIBC_PTHREAD_CREATE: {
       /* SDL_OpenAudio treats EAGAIN as fatal ("Couldn't create audio
@@ -6516,7 +6578,43 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           nested.cpsr |= MANGO_CPSR_T;
           nested.r[MANGO_REG_PC] = pay_off;
           {
-            int rc = mango_run_guest(lib, &nested, NULL);
+            uint32_t saved_tid = g_soft_pthread_self;
+            uint32_t mtx[2] = {0, 0}, mown[2] = {0, 0}, mcnt[2] = {0, 0};
+            int rc, use_tid = mango_env_flag("MANGO_OPENTTD_108_SCAN_TID");
+            if (use_tid) {
+              /* The scan "thread" runs while the main thread is parked: hand
+               * it the modal paint/work mutexes free (owner 0, count 0) and
+               * give them back afterwards. ThreadMutex_pthread owner +0x10,
+               * recursive_count +0x14 (BeginCritical @0x351f9c). */
+              uint32_t ab = 0;
+              if (mango_openttd_app(&ab) != NULL) {
+                for (int k = 0; k < 2; k++) {
+                  uint32_t cell = ab + (k == 0 ? 0x970718u : 0x97071cu);
+                  if (!mango_guest_range_ok(lib, cell, 4u)) continue;
+                  mtx[k] = mango_load_u32_guest(lib->guest_mem, cell);
+                  if (mtx[k] == 0 || !mango_guest_range_ok(lib, mtx[k], 0x18u)) { mtx[k] = 0; continue; }
+                  mown[k] = mango_load_u32_guest(lib->guest_mem, mtx[k] + 0x10u);
+                  mcnt[k] = mango_load_u32_guest(lib->guest_mem, mtx[k] + 0x14u);
+                  mango_store_u32_guest(lib->guest_mem, mtx[k] + 0x10u, 0u);
+                  mango_store_u32_guest(lib->guest_mem, mtx[k] + 0x14u, 0u);
+                }
+              }
+              g_soft_pthread_self = id;
+              fprintf(stderr, "mango: OpenTTD research/108 DoScan nested pthread_self=%u paint{own=%u cnt=%u} work{own=%u cnt=%u}\n",
+                      (unsigned)id, mown[0], mcnt[0], mown[1], mcnt[1]);
+            }
+            rc = mango_run_guest(lib, &nested, NULL);
+            g_soft_pthread_self = saved_tid;
+            if (use_tid) {
+              for (int k = 0; k < 2; k++) {
+                if (mtx[k] == 0) continue;
+                fprintf(stderr, "mango: OpenTTD research/108 DoScan mutex%d after own=%u cnt=%u -> restore %u/%u\n", k,
+                        mango_load_u32_guest(lib->guest_mem, mtx[k] + 0x10u),
+                        mango_load_u32_guest(lib->guest_mem, mtx[k] + 0x14u), mown[k], mcnt[k]);
+                mango_store_u32_guest(lib->guest_mem, mtx[k] + 0x10u, mown[k]);
+                mango_store_u32_guest(lib->guest_mem, mtx[k] + 0x14u, mcnt[k]);
+              }
+            }
             uint32_t modal_addr = 0;
             for (int i = 0; i < g_nlibs; i++) {
               if (g_libs[i] != NULL && strstr(g_libs[i]->path, "libapplication.so") != NULL) {
@@ -6578,7 +6676,19 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           /* research/105: suppress New→_GenerateWorld during soft-STM playable
            * (soft_stm_active). Soft-enter must soft-complete before GenerateWorld;
            * Lab tip a88d26d forced #3 mid soft-call and wiped _date. */
-          if (g_openttd_soft_stm_active) {
+          /* research/108: Arm B (MANGO_OPENTTD_106_REAL_STM=1) runs the real
+           * SwitchToMode inside the soft-call, so this suppress made New
+           * return EAGAIN and _GenerateWorld never ran: the progress window
+           * sat at 0% forever. Under Arm B let it fall through to the rc=0
+           * single-thread path. Revert: MANGO_OPENTTD_108_NO_REALSTM_GENWORLD=1. */
+          if (g_openttd_soft_stm_active && mango_env_flag("MANGO_OPENTTD_106_REAL_STM") &&
+              !mango_env_flag("MANGO_OPENTTD_108_NO_REALSTM_GENWORLD")) {
+            fprintf(stderr,
+                    "mango: OpenTTD research/108 REAL_STM genworld: no suppress (postgen_armed=%d lr_ok=%d)\n",
+                    g_openttd_postgen_armed,
+                    (int)(app_bias != 0 && lr_off == app_bias + MANGO_OPENTTD_VA_THREAD_NEW_RET));
+            fflush(stderr);
+          } else if (g_openttd_soft_stm_active) {
             fprintf(stderr,
                     "mango: OpenTTD genworld force suppress (soft_stm_active) "
                     "payload off=%#x\n",
@@ -7569,7 +7679,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         }
         s_gen_click++;
         cpu->r[0] = 1;
-      } else if (openttd && g_openttd_soft_stm_playable_attempted && ev != 0 &&
+      } else if (openttd && MANGO_OPENTTD_POST_PLAY() && ev != 0 &&
                  mango_guest_range_ok(lib, ev, 16u) &&
                  !mango_env_flag("MANGO_OPENTTD_107_NO_INPUT")) {
         /* research/107 post-STM input script (one event per frame: the poll
@@ -7618,7 +7728,35 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           if (++g_openttd_input_stage == 12) g_openttd_input_mark = n;
         } else if (st == 12 && n >= g_openttd_input_mark + 48ull) {
           mango_openttd_input_dump("input-2-click");
-          g_openttd_input_stage = 13;
+          g_openttd_input_stage = mango_env_flag("MANGO_OPENTTD_108_NO_WHEEL") ? 99 : 13;
+        } else if (st >= 13 && st <= 15) {
+          /* research/108: close the dropdown with a left click on the map
+           * (500,350), then wheel at viewport centre. */
+          type = st == 13 ? 4u : (st == 14 ? 5u : 6u);
+          button = st == 13 ? 0u : 1u;
+          state = st == 14 ? 1u : 0u;
+          x = 500u; y = 350u; emit = 1;
+          if (++g_openttd_input_stage == 16) g_openttd_input_mark = n;
+        } else if (st == 16 && n >= g_openttd_input_mark + 24ull) {
+          mango_openttd_input_dump("input-3-closed");
+          g_openttd_input_stage = 17;
+        } else if (st >= 17 && st <= 23) {
+          /* motion to 320,240 then 3x wheel (SDL 1.2 button 5 = WHEELDOWN =
+           * zoom out; MANGO_OPENTTD_108_WHEEL_UP=1 uses button 4). */
+          int wb = mango_env_flag("MANGO_OPENTTD_108_WHEEL_UP") ? 4 : 5;
+          if (st == 17) {
+            type = 4u; button = 0u; state = 0u;
+            fprintf(stderr, "mango: OpenTTD research/108 inject wheel button %d x3 at 320,240 presents=%llu\n", wb, n);
+          } else {
+            type = ((st - 18) & 1) == 0 ? 5u : 6u;
+            button = (uint8_t)wb;
+            state = type == 5u ? 1u : 0u;
+          }
+          x = 320u; y = 240u; emit = 1;
+          if (++g_openttd_input_stage == 24) g_openttd_input_mark = n;
+        } else if (st == 24 && n >= g_openttd_input_mark + 48ull) {
+          mango_openttd_input_dump("input-4-wheel");
+          g_openttd_input_stage = 99;
         }
         if (emit) s_gap = 1;
         if (emit) {
@@ -7663,7 +7801,8 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
         uint32_t sf = r0 ? r0 : g_fb_surf;
         MangoLoadedLibrary* dl = mango_openttd_app(NULL);
         if (dl == NULL) dl = lib;
-        if (g_openttd_soft_stm_playable_attempted) {
+        mango_openttd_play_poll();
+        if (MANGO_OPENTTD_POST_PLAY()) {
           s_post_stm_n++;
           g_openttd_post_stm_presents = s_post_stm_n;
           g_fb_surf_last = sf;
@@ -9201,6 +9340,93 @@ static void mango_openttd_pa_fastpath_arm(void) {
           (unsigned)(bias + MANGO_OPENTTD_VA_PA_SKIP_LOOP));
 }
 
+/* research/108: font/glyph probes (diagnostic only, always decline).
+ * Enable: MANGO_OPENTTD_108_FONT_PROBE=1. Entry probes log args; FT_*
+ * entries also arm a return probe at LR that logs r0. */
+#define MANGO_PROBE_MAX 31
+static struct { uint32_t addr; const char* name; int ret; int strreg; unsigned long long n; } g_probes[MANGO_PROBE_MAX];
+static int g_nprobes;
+static int mango_probe_fn(MangoCpu* cpu, MangoMemory* mem, uint32_t* next_pc);
+static void mango_probe_add(uint32_t addr, const char* name, int ret, int strreg) {
+  for (int i = 0; i < g_nprobes; i++) if (g_probes[i].addr == addr) return;
+  if (g_nprobes >= MANGO_PROBE_MAX) return;
+  g_probes[g_nprobes].addr = addr; g_probes[g_nprobes].name = name;
+  g_probes[g_nprobes].ret = ret; g_probes[g_nprobes].strreg = strreg; g_probes[g_nprobes].n = 0;
+  g_nprobes++;
+  mango_interp_set_fastpath(addr, mango_probe_fn);
+}
+static int mango_probe_fn(MangoCpu* cpu, MangoMemory* mem, uint32_t* next_pc) {
+  uint32_t pc = cpu->r[MANGO_REG_PC];
+  (void)next_pc;
+  for (int i = 0; i < g_nprobes; i++) {
+    if (g_probes[i].addr != pc) continue;
+    unsigned long long n = ++g_probes[i].n;
+    if (n <= 24ull || (n & (n - 1ull)) == 0ull) {
+      char str[65] = {0};
+      int sr = g_probes[i].strreg;
+      uint32_t sp = sr >= 0 ? cpu->r[sr] : 0u;
+      if (sp && sp < mem->size) {
+        for (int k = 0; k < 64 && sp + k < mem->size; k++) {
+          uint8_t c = mem->bytes[sp + k];
+          if (!c) break;
+          str[k] = (c >= 32 && c < 127) ? (char)c : '.';
+        }
+      }
+      fprintf(stderr, "mango: font-probe %s%s n=%llu r0=%#x r1=%#x r2=%#x r3=%#x r4=%#x lr=%#x%s%s%s\n",
+              g_probes[i].ret ? "ret " : "", g_probes[i].name, n, cpu->r[0], cpu->r[1], cpu->r[2],
+              cpu->r[3], cpu->r[4], cpu->r[14], sr >= 0 ? " str=\"" : "", str, sr >= 0 ? "\"" : "");
+    }
+    if (!g_probes[i].ret && strncmp(g_probes[i].name, "FT_", 3) == 0 && (cpu->r[14] & 1u)) {
+      mango_probe_add(cpu->r[14] & ~1u, g_probes[i].name, 1, -1);
+    }
+    break;
+  }
+  return 1; /* decline: guest runs normally */
+}
+static void mango_openttd_font_probe_arm(uint32_t bias) {
+  static int s_done;
+  static const struct { const char* lib; const char* sym; int strreg; uint32_t off; } kp[] = {
+    {"libapplication.so", "_ZN8LayouterC1EPKci10TextColour8FontSize", 1},
+    {"libfontconfig.so", "FT_New_Face", 1},
+    {"libfontconfig.so", "FT_Select_Charmap", -1},
+    {"libfontconfig.so", "FT_Get_Char_Index", -1},
+    {"libfontconfig.so", "FT_Load_Glyph", -1},
+    {"libfontconfig.so", "FT_Render_Glyph", -1},
+    {"libfontconfig.so", "FT_Set_Pixel_Sizes", -1},
+    {"libapplication.so", "_ZN10MainWindow12OnMouseWheelEi", -1},
+    {"libapplication.so", "_Z25ZoomInOrOutToCursorWindowbP6Window", -1},
+    {"libapplication.so", "_Z17DoZoomInOutWindow15ZoomStateChangeP6Window", -1},
+    {"libapplication.so", "_Z14LoadFromConfigb", -1},
+    {"libapplication.so", "_ZN15AfterNewGRFScan16OnNewGRFsScannedEv", -1},
+    {"libapplication.so", "_Z15ScanNewGRFFilesP18NewGRFScanCallback", -1},
+    {"libapplication.so", "_Z17DoScanNewGRFFilesPv", -1},
+    {"libapplication.so", "DoScan.after_mutex(0x27f7a4)", -1, 0x27f7a4u},
+    {"libapplication.so", "DoScan.cbz_callback(r6)", -1, 0x27f7cau},
+    {"libapplication.so", "DoScan.blx_callback(r3)", -1, 0x27f7d2u},
+    /* ZoomInOrOutToCursorWindow zoom-out limit compare: r4=vp->zoom r3=zoom_max */
+    {"libapplication.so", "ZoomOut.cmp(vp->zoom=r4,zoom_max=r3)", -1, 0x25b20eu},
+    /* zoom-in limit compare: r4=vp->zoom r3=zoom_min */
+    {"libapplication.so", "ZoomIn.cmp(vp->zoom=r4,zoom_min=r3)", -1, 0x25b1d2u},
+  };
+  if (s_done || (!mango_env_flag("MANGO_OPENTTD_108_FONT_PROBE") && !mango_env_flag("MANGO_OPENTTD_108_PROBE"))) return;
+  int found = 0;
+  (void)bias;
+  for (unsigned k = 0; k < sizeof kp / sizeof kp[0]; k++) {
+    for (int i = 0; i < g_nlibs; i++) {
+      if (g_libs[i] == NULL || strstr(g_libs[i]->path, kp[k].lib) == NULL) continue;
+      uint32_t st = kp[k].off ? kp[k].off : mango_elf32_find_symbol(&g_libs[i]->image, kp[k].sym);
+      if (st) {
+        uint32_t a = (st + g_libs[i]->load_bias) & ~1u;
+        int had = g_nprobes;
+        mango_probe_add(a, kp[k].sym, 0, kp[k].strreg);
+        if (g_nprobes != had) fprintf(stderr, "mango: font-probe armed %s @%#x\n", kp[k].sym, (unsigned)a);
+        found++;
+      }
+    }
+  }
+  if (found == (int)(sizeof kp / sizeof kp[0])) s_done = 1;
+}
+
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) {
   MangoMemory mem = {lib->guest_mem, lib->guest_mem_size};
   for (;;) {
@@ -9215,6 +9441,10 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
      * soft stack (which keys off PA step-limit polls) still runs unchanged.
      * MANGO_OPENTTD_107_PA_FASTPATH_EARLY=1 arms from load (soft stack then
      * never triggers: see 107 brief). */
+    {
+      uint32_t pb = 0;
+      if (mango_openttd_app(&pb) != NULL && pb != 0) mango_openttd_font_probe_arm(pb);
+    }
     if (g_openttd_post_stm_unsuppressed || mango_env_flag("MANGO_OPENTTD_107_PA_FASTPATH_EARLY")) {
       mango_openttd_pa_fastpath_arm();
     }
@@ -10854,6 +11084,34 @@ static void mango_run_constructors(MangoLoadedLibrary* lib) {
   }
 }
 
+/* research/108: late binding. Libraries load in Java loadLibrary order, not
+ * DT_NEEDED order, so imports of an earlier library that a later one defines
+ * (OpenTTD libapplication -> FT_* in libfontconfig) were bound to the shared
+ * stub (returns 0): FreeType never ran and every glyph was blank. After each
+ * load, rebind earlier libraries' stub-bound UND slots to symbols the new
+ * library exports. Revert: MANGO_108_NO_LATE_REBIND=1. */
+static uint32_t mango_late_rebind_resolve(void* ctx, const char* name, uint32_t st_value,
+                                          uint32_t st_shndx) {
+  MangoLoadedLibrary* nl = ctx;
+  uint32_t st;
+  (void)st_value; (void)st_shndx;
+  st = mango_elf32_find_symbol(&nl->image, name);
+  return st ? st + nl->load_bias : 0u;
+}
+static void mango_late_rebind_into(MangoLoadedLibrary* nl) {
+  if (nl == NULL || mango_env_flag("MANGO_108_NO_LATE_REBIND")) return;
+  for (int i = 0; i < g_nlibs; i++) {
+    MangoLoadedLibrary* ol = g_libs[i];
+    int n;
+    if (ol == NULL || ol == nl) continue;
+    n = mango_elf32_rebind_undefined(&ol->image, ol->guest_mem, ol->guest_mem_size, ol->load_bias,
+                                     ol->stub_addr, mango_late_rebind_resolve, nl);
+    if (n > 0) {
+      fprintf(stderr, "mango: late-rebind %d slot(s) in %s -> %s\n", n, ol->path, nl->path);
+    }
+  }
+}
+
 static void* mango_load_library(const char* libpath, int flag) {
   (void)flag;
   if (!libpath || !mango_is_arm32_elf(libpath)) {
@@ -10953,6 +11211,7 @@ static void* mango_load_library(const char* libpath, int flag) {
     free(lib);
     return NULL;
   }
+  mango_late_rebind_into(lib);
   mango_patch_ofdp_unity(lib);
   mango_patch_openttd_new(lib);
   mango_patch_openttd_tutorial(lib);

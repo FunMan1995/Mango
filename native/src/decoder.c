@@ -556,11 +556,29 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       out->op = MANGO_OP_VABS;
       return 0;
     }
+    /* research/108: single-precision VABS.F32 Sd,Sm (OpenTTD ICU
+     * adjustGlyphPositions eef17a67 = vneg.f32 s15,s15). */
+    if (!dbl && (word & 0x0FBF0FD0u) == 0x0EB00AC0u) {
+      out->op = MANGO_OP_VABS;
+      return 0;
+    }
     if (dbl && (word & 0x0FBF0FD0u) == 0x0EB10B40u) {
       out->op = MANGO_OP_VNEG;
       return 0;
     }
+    /* research/108: single-precision VNEG.F32 Sd,Sm (OpenTTD ICU
+     * adjustGlyphPositions eef17a67 = vneg.f32 s15,s15). */
+    if (!dbl && (word & 0x0FBF0FD0u) == 0x0EB10A40u) {
+      out->op = MANGO_OP_VNEG;
+      return 0;
+    }
     if (dbl && (word & 0x0FBF0FD0u) == 0x0EB10BC0u) {
+      out->op = MANGO_OP_VSQRT;
+      return 0;
+    }
+    /* research/108: single-precision VSQRT.F32 Sd,Sm (OpenTTD ICU
+     * adjustGlyphPositions eef17a67 = vneg.f32 s15,s15). */
+    if (!dbl && (word & 0x0FBF0FD0u) == 0x0EB10AC0u) {
       out->op = MANGO_OP_VSQRT;
       return 0;
     }
@@ -2220,6 +2238,52 @@ int mango_decode_t32(uint16_t hw1, uint16_t hw2, MangoInsn* out) {
       return -1;
     }
     out->op = MANGO_OP_AND;
+    out->rd = rd;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 1;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* research/108: T32 TEQ.W Rn,Rm{,shift} (EORS with Rd=15). FreeType in
+   * OpenTTD libfontconfig ea9c 0f00 = teq.w r12, r0 (llvm-mc [9c,ea,00,0f]).
+   * Flags only: NZ from Rn ^ shifted Rm, C from the shifter, V unchanged.
+   * Reject Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA80u && (hw1 & 0x10u) != 0 && (hw2 & 0x8F00u) == 0x0F00u) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_TEQ;
+    out->rn = rn;
+    out->rm = rm;
+    out->is_imm = 0;
+    out->sets_flags = 1;
+    out->shift_type = (hw2 >> 4) & 3u;
+    out->shift_amount = (imm3 << 2) | imm2;
+    out->shift_by_reg = 0;
+    return 0;
+  }
+
+  /* research/108: T32 EORS.W Rd,Rn,Rm{,shift} (S=1, Rd!=15). NZ from the
+   * result, C from the shifter, V unchanged. Reject Rd/Rn/Rm=PC. */
+  if ((hw1 & 0xFFE0u) == 0xEA80u && (hw1 & 0x10u) != 0 && (hw2 & 0x8000u) == 0) {
+    uint32_t rn = hw1 & 0xFu;
+    uint32_t rd = (hw2 >> 8) & 0xFu;
+    uint32_t rm = hw2 & 0xFu;
+    uint32_t imm3 = (hw2 >> 12) & 7u;
+    uint32_t imm2 = (hw2 >> 6) & 3u;
+    if (rd == MANGO_REG_PC || rn == MANGO_REG_PC || rm == MANGO_REG_PC) {
+      return -1;
+    }
+    out->op = MANGO_OP_EOR;
     out->rd = rd;
     out->rn = rn;
     out->rm = rm;

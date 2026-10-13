@@ -292,3 +292,53 @@ int mango_elf32_apply_relocs(const MangoElf32Image* image, uint8_t* mem, uint32_
   return mango_elf32_apply_rel_table(image, mem, mem_size, image->jmprel_vaddr, image->jmprel_size,
                                      load_bias, resolve, ctx);
 }
+
+/* research/108: late binding. Rewrite UND-symbol GLOB_DAT / JUMP_SLOT /
+ * ABS32 slots whose current value is exactly `old_value` (the loader's
+ * unresolved stub) when `resolve` now yields a different nonzero address.
+ * Returns the number of slots rebound, or -1 on a malformed table. */
+static int mango_elf32_rebind_table(const MangoElf32Image* image, uint8_t* mem, uint32_t mem_size,
+                                    uint32_t table_vaddr, uint32_t table_size, uint32_t load_bias,
+                                    uint32_t old_value, MangoElf32ResolveFn resolve, void* ctx) {
+  int n = 0;
+  if (table_size == 0) return 0;
+  uint32_t table_at = table_vaddr + load_bias;
+  if (table_size % 8u != 0 || (uint64_t)table_at + table_size > mem_size) return -1;
+  for (uint32_t i = 0; i < table_size; i += 8u) {
+    uint32_t r_offset =
+        (uint32_t)mem[table_at + i] | ((uint32_t)mem[table_at + i + 1u] << 8) |
+        ((uint32_t)mem[table_at + i + 2u] << 16) | ((uint32_t)mem[table_at + i + 3u] << 24);
+    uint32_t r_info =
+        (uint32_t)mem[table_at + i + 4u] | ((uint32_t)mem[table_at + i + 5u] << 8) |
+        ((uint32_t)mem[table_at + i + 6u] << 16) | ((uint32_t)mem[table_at + i + 7u] << 24);
+    uint32_t type = r_info & 0xFFu, sym = r_info >> 8, loc = r_offset + load_bias;
+    if (sym == 0 || (type != MANGO_R_ARM_ABS32 && type != MANGO_R_ARM_GLOB_DAT &&
+                     type != MANGO_R_ARM_JUMP_SLOT)) continue;
+    if ((uint64_t)loc + 4u > mem_size) return -1;
+    uint32_t cur = (uint32_t)mem[loc] | ((uint32_t)mem[loc + 1u] << 8) |
+                   ((uint32_t)mem[loc + 2u] << 16) | ((uint32_t)mem[loc + 3u] << 24);
+    if (cur != old_value) continue;
+    uint32_t st_value = 0; uint16_t st_shndx = 0; const char* name = "";
+    if (mango_elf32_sym_at(image, sym, &st_value, &st_shndx, &name) != 0) return -1;
+    if (st_shndx != 0 || name == NULL || name[0] == '\0') continue;
+    uint32_t addr = resolve(ctx, name, st_value, st_shndx);
+    if (addr == 0 || addr == old_value) continue;
+    store_u32_le(mem + loc, addr);
+    n++;
+  }
+  return n;
+}
+
+int mango_elf32_rebind_undefined(const MangoElf32Image* image, uint8_t* mem, uint32_t mem_size,
+                                 uint32_t load_bias, uint32_t old_value,
+                                 MangoElf32ResolveFn resolve, void* ctx) {
+  int a, b;
+  if (image == NULL || mem == NULL || resolve == NULL) return -1;
+  a = mango_elf32_rebind_table(image, mem, mem_size, image->rel_vaddr, image->rel_size, load_bias,
+                               old_value, resolve, ctx);
+  if (a < 0) return -1;
+  b = mango_elf32_rebind_table(image, mem, mem_size, image->jmprel_vaddr, image->jmprel_size,
+                               load_bias, old_value, resolve, ctx);
+  if (b < 0) return -1;
+  return a + b;
+}
