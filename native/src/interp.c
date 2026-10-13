@@ -549,12 +549,30 @@ static int mango_cond_holds(uint32_t cond, uint32_t cpsr) {
   }
 }
 
+static uint32_t g_fastpath_addr;
+static MangoFastpathFn g_fastpath_fn;
+
+void mango_interp_set_fastpath(uint32_t addr, MangoFastpathFn fn) {
+  g_fastpath_addr = fn ? addr : 0u;
+  g_fastpath_fn = addr ? fn : NULL;
+}
+
 int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32_t max_steps) {
   uint32_t addr = cpu->r[MANGO_REG_PC];
 
   for (uint32_t step = 0; step < max_steps; step++) {
     if (addr == stop_addr) {
       return 0;
+    }
+
+    if (g_fastpath_fn != NULL && addr == g_fastpath_addr &&
+        (cpu->cpsr & MANGO_CPSR_T) != 0 && mango_get_itstate(cpu->cpsr) == 0) {
+      uint32_t next_fp = 0;
+      if (g_fastpath_fn(cpu, mem, &next_fp) == 0) {
+        addr = next_fp;
+        cpu->r[MANGO_REG_PC] = addr;
+        continue;
+      }
     }
 
     /* RUNTIME/kuser: trap ARM Linux helper page entry points (Liquid Wars Q0). */

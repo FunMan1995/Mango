@@ -42,6 +42,19 @@ if(PNG_FOUND)
 endif()
 add_test(NAME native_bridge_shim_smoke_test COMMAND mango_native_bridge_shim_tests)
 
+# research/107: differential test, OpenTTD PaletteAnimate skip-loop fast path
+# vs the interpreter running the real guest bytes.
+add_executable(mango_pa_fastpath_tests
+  src/native_bridge_shim.c
+  tests/test_pa_fastpath.c
+)
+target_include_directories(mango_pa_fastpath_tests PRIVATE tests/fake_jni)
+target_link_libraries(mango_pa_fastpath_tests PRIVATE mango_core m z)
+if(PNG_FOUND)
+  target_link_libraries(mango_pa_fastpath_tests PRIVATE PNG::PNG)
+endif()
+add_test(NAME pa_fastpath_diff_test COMMAND mango_pa_fastpath_tests)
+
 # The actual native bridge .so. Only buildable with the NDK toolchain file,
 # see docs/BUILDING.md. ANDROID is set by android.toolchain.cmake.
 if(ANDROID)

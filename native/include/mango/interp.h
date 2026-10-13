@@ -22,4 +22,12 @@ typedef struct MangoMemory {
  * max_steps exceeded). */
 int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32_t max_steps);
 
+/* Optional host fast path (research/107). When the interpreter is about to
+ * execute at `addr` (Thumb, outside an IT block), it calls fn instead. fn
+ * must leave architectural state exactly as the guest code would and return
+ * 0 with *next_pc set, or nonzero to decline (the guest code then runs
+ * normally). One call counts as one step. addr=0 / fn=NULL disables. */
+typedef int (*MangoFastpathFn)(MangoCpu* cpu, MangoMemory* mem, uint32_t* next_pc);
+void mango_interp_set_fastpath(uint32_t addr, MangoFastpathFn fn);
+
 #endif /* MANGO_INTERP_H_ */
