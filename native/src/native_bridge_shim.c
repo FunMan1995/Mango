@@ -319,7 +319,8 @@
 #define MANGO_LIBC_DEFLATERESET 194
 #define MANGO_LIBC_CRC32 195
 #define MANGO_LIBC_ZLIBVERSION 196
-#define MANGO_LIBC_COUNT 197
+#define MANGO_LIBC_SDL_UPDATE_RECTS 197
+#define MANGO_LIBC_COUNT 198
 /* bionic struct __sFILE is 84 bytes in this NDK. stderr is &__sF[2]. */
 #define MANGO_SF_FILE 84u
 #define MANGO_TSD_KEYS 16
@@ -593,6 +594,7 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "deflateReset",
     "crc32",
     "zlibVersion",
+    "SDL_UpdateRects",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -2300,6 +2302,7 @@ static int mango_sdl_soft_blit(MangoLoadedLibrary* lib, uint32_t src, uint32_t s
 static int mango_sdl_soft_fill(MangoLoadedLibrary* lib, uint32_t dst, uint32_t dstrect,
                                uint32_t color);
 static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf);
+static int mango_openttd_dump_ppm(MangoLoadedLibrary* lib, uint32_t surf, const char* path);
 static void mango_patch_meritous_img_load(MangoLoadedLibrary* lib);
 
 
@@ -3108,6 +3111,12 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
     return lib->stub_addr;
   }
   for (uint32_t i = 0; i < MANGO_LIBC_COUNT; i++) {
+    /* research/106: host-count SDL_UpdateRects only for OpenTTD
+     * libapplication.so (present metric); other libs keep guest libsdl. */
+    if (i == MANGO_LIBC_SDL_UPDATE_RECTS &&
+        strstr(lib->path, "libapplication.so") == NULL) {
+      continue;
+    }
     if (strcmp(name, kLibcNames[i]) == 0) {
       return lib->libc_thunk_base + i * MANGO_JNI_THUNK_SIZE;
     }
@@ -3554,6 +3563,18 @@ static int g_openttd_outer_post_cap_pa_suppress_logged;
 static int g_openttd_outer_post_cap_pa_suppress_count;
 static int g_openttd_outer_post_cap_pa_suppress_durable;
 static int g_openttd_outer_post_cap_pa_bl_skipped;
+/* research/106 A/B (env-gated, revertible):
+ *  Arm A (DEFAULT since 106): once SwitchToMode soft-call has fired, restore
+ *    MainLoop CheckPalette bl and stop the durable PA suppress.
+ *    MANGO_OPENTTD_106_KEEP_SUPPRESS=1 reverts to /105 (suppress kept).
+ *  MANGO_OPENTTD_106_REAL_STM=1 (arm B): run SwitchToMode guest code for real
+ *    (no pre-set PC=JNI_STOP, no poll STOP inside STM range).
+ * REAL_STM default off (arm B lost: mid-GenerateWorld, date restarts at 0). */
+static int g_openttd_post_stm_unsuppressed;
+static int mango_env_flag(const char* name) {
+  const char* v = getenv(name);
+  return v != NULL && v[0] != '\0' && v[0] != '0';
+}
 /* research/104: after durable landscape path, soft-enter SwitchToMode once
  * so Lab stm_e>=1 (prior SM handoff only forced BSS SM_NONE). soft_stm_active
  * gates nest soft-complete before GenerateWorld re-entry.
@@ -4900,7 +4921,12 @@ static void mango_openttd_soft_switchtomode_playable(MangoLoadedLibrary* lib,
               (unsigned)stm_pc_off);
       fflush(stderr);
     }
-    nested.r[MANGO_REG_PC] = MANGO_JNI_STOP;
+    if (!mango_env_flag("MANGO_OPENTTD_106_REAL_STM")) {
+      nested.r[MANGO_REG_PC] = MANGO_JNI_STOP;
+    } else {
+      fprintf(stderr, "mango: OpenTTD research/106 REAL_STM: executing SwitchToMode\n");
+      fflush(stderr);
+    }
   }
   rc = mango_run_guest(lib, &nested, NULL);
   g_openttd_soft_stm_active = 0;
@@ -4924,6 +4950,15 @@ static void mango_openttd_soft_switchtomode_playable(MangoLoadedLibrary* lib,
           (unsigned)g_openttd_switchtomode_logged);
   fflush(stderr);
   mango_openttd_log_mode_snapshot(lib, "SwitchToMode soft-call after");
+  /* research/106 arm A WON: default ON. Revert with MANGO_OPENTTD_106_KEEP_SUPPRESS=1. */
+  if (!mango_env_flag("MANGO_OPENTTD_106_KEEP_SUPPRESS") ||
+      mango_env_flag("MANGO_OPENTTD_106_REAL_STM")) {
+    mango_openttd_post_cap_pa_bl_set(lib, bias, 0);
+    g_openttd_outer_post_cap_pa_suppress_durable = 0;
+    g_openttd_post_stm_unsuppressed = 1;
+    fprintf(stderr, "mango: OpenTTD research/106 post-STM unsuppress (bl restored, durable off)\n");
+    fflush(stderr);
+  }
 }
 
 /* research/93: leave PaletteAnimate on the OUTER cpu and run MainLoop's
@@ -5282,7 +5317,8 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
      * research/101: not one-shot. logged does not gate this. Every poll while
      * PC is still in PA or CheckPalette unwinds again and the durable bl skip
      * keeps later MainLoop iterations beyond CheckPalette. */
-    if ((g_openttd_outer_post_cap_pa_suppress_durable ||
+    if (!g_openttd_post_stm_unsuppressed &&
+        (g_openttd_outer_post_cap_pa_suppress_durable ||
          (g_openttd_outer_vdd_safe_returned &&
           g_openttd_viewport_draw_logged &&
           g_openttd_outer_mainloop_uw_rearm_count >=
@@ -5457,7 +5493,7 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
   /* research/104: soft-STM playable — after entry watch fires, STOP nested
    * SwitchToMode before GenerateWorld re-entry. Nested CPU discarded; outer
    * MainLoop SP/BSS restored by soft-call epilogue (SM_NONE + GM_NORMAL). */
-  if (g_openttd_soft_stm_active &&
+  if (g_openttd_soft_stm_active && !mango_env_flag("MANGO_OPENTTD_106_REAL_STM") &&
       pc_off >= MANGO_OPENTTD_VA_SWITCHTOMODE &&
       pc_off < MANGO_OPENTTD_VA_SWITCHTOMODE_END) {
     if (!g_openttd_switchtomode_logged) {
@@ -7448,6 +7484,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           g_openttd_outer_post_cap_pa_suppress_durable = 0;
           g_openttd_soft_stm_playable_attempted = 0;
           g_openttd_soft_stm_active = 0;
+          g_openttd_post_stm_unsuppressed = 0;
           {
             uint32_t bias_pa = 0;
             if (mango_openttd_app(&bias_pa) != NULL) {
@@ -7492,15 +7529,65 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
       cpu->r[0] = (uint32_t)mango_sdl_soft_blit(lib, r0, r1, r2, dstrect);
       break;
     }
+    case MANGO_LIBC_SDL_UPDATE_RECTS: {
+      /* research/106: OpenTTD SDL driver presents via SDL_UpdateRects
+       * (DrawSurfaceToScreen). Count as presents; host soft surface needs
+       * no copy. Dump framebuffer on the 9th present. */
+      static unsigned long long s_urs;
+      s_urs++;
+      if (s_urs <= 64ull || (s_urs & 255ull) == 0ull) {
+        fprintf(stderr, "mango: SDL_UpdateRects n=%llu surf=0x%x nrects=%u blits=%llu ckey_blits=%llu\n",
+                s_urs, (unsigned)(r0 ? r0 : g_fb_surf), (unsigned)r1,
+                (unsigned long long)g_blit_count, (unsigned long long)g_ckey_blit_count);
+      }
+      {
+        /* Dump pre-STM (9th present) and post-STM (64th present after the
+         * SwitchToMode soft-call) as PPM next to MANGO_FRAME_DUMP. */
+        static unsigned long long s_post_stm_n;
+        static int s_pre_done, s_post_done;
+        const char* base = getenv("MANGO_FRAME_DUMP");
+        char path[512];
+        uint32_t sf = r0 ? r0 : g_fb_surf;
+        MangoLoadedLibrary* dl = mango_openttd_app(NULL);
+        if (dl == NULL) dl = lib;
+        if (g_openttd_soft_stm_playable_attempted) s_post_stm_n++;
+        if (base && base[0] && sf) {
+          if (!s_pre_done && s_urs == 9ull) {
+            s_pre_done = 1;
+            snprintf(path, sizeof path, "%s.pre.ppm", base);
+            mango_openttd_dump_ppm(dl, sf, path);
+          }
+          if (!s_post_done && s_post_stm_n == 64ull) {
+            s_post_done = 1;
+            snprintf(path, sizeof path, "%s.post.ppm", base);
+            mango_openttd_dump_ppm(dl, sf, path);
+          }
+        }
+      }
+      cpu->r[0] = 0;
+      break;
+    }
     case MANGO_LIBC_SDL_UPDATE_RECT: {
       /* Android Meritous VideoUpdate calls UpdateRect (not Flip). Dump once
        * after DrawPlayer has colorkey-blitted onto the framebuffer. */
       static int s_ur;
+      static unsigned long long s_ur_total;
       uint32_t surf = r0 ? r0 : g_fb_surf;
-      if (s_ur < 8) {
+      s_ur_total++;
+      /* research/106: playable gate needs >8 presents; log first 64 then every 256th. */
+      if (s_ur >= 64 && (s_ur_total & 255ull) == 0ull) {
+        fprintf(stderr, "mango: SDL_UpdateRect n=%llu blits=%llu ckey_blits=%llu\n",
+                s_ur_total, (unsigned long long)g_blit_count,
+                (unsigned long long)g_ckey_blit_count);
+      }
+      if (!g_frame_dumped && surf && s_ur_total == 9ull &&
+          mango_openttd_app(NULL) != NULL) {
+        mango_dump_framebuffer_pgm(g_fb_lib ? g_fb_lib : lib, surf);
+      }
+      if (s_ur < 64) {
         fprintf(stderr,
-                "mango: SDL_UpdateRect surf=0x%x ckey_blits=%llu blits=%llu\n",
-                (unsigned)surf, (unsigned long long)g_ckey_blit_count,
+                "mango: SDL_UpdateRect n=%llu surf=0x%x ckey_blits=%llu blits=%llu\n",
+                s_ur_total, (unsigned)surf, (unsigned long long)g_ckey_blit_count,
                 (unsigned long long)g_blit_count);
         s_ur++;
       }
@@ -9895,6 +9982,36 @@ static void mango_meritous_soft_arc(MangoLoadedLibrary* lib, uint32_t pix, uint3
       lib->guest_mem[pix + (uint32_t)(py + 1) * pitch + (uint32_t)px] = ink;
     }
   }
+}
+
+/* research/106: 32bpp OpenTTD screen → binary PPM (XRGB8888 LE). */
+static int mango_openttd_dump_ppm(MangoLoadedLibrary* lib, uint32_t surf, const char* path) {
+  uint32_t fmt, pix, w, h, pitch, y, x, nonzero = 0;
+  FILE* fp;
+  if (!lib || !surf || !path || !mango_guest_range_ok(lib, surf, 60u)) return -1;
+  fmt = mango_load_u32_guest(lib->guest_mem, surf + 4u);
+  w = mango_load_u32_guest(lib->guest_mem, surf + 8u);
+  h = mango_load_u32_guest(lib->guest_mem, surf + 12u);
+  pitch = (uint32_t)lib->guest_mem[surf + 16u] | ((uint32_t)lib->guest_mem[surf + 17u] << 8);
+  pix = mango_load_u32_guest(lib->guest_mem, surf + 20u);
+  if (!fmt || !pix || w == 0 || h == 0 || w > 4096 || h > 4096 ||
+      !mango_guest_range_ok(lib, fmt, 8u) || lib->guest_mem[fmt + 5u] != 4 ||
+      !mango_guest_range_ok(lib, pix, pitch * h)) return -1;
+  fp = fopen(path, "wb");
+  if (!fp) return -1;
+  fprintf(fp, "P6\n%u %u\n255\n", (unsigned)w, (unsigned)h);
+  for (y = 0; y < h; y++) {
+    const uint8_t* row = lib->guest_mem + pix + y * pitch;
+    for (x = 0; x < w; x++) {
+      uint8_t rgb[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0]};
+      if (rgb[0] | rgb[1] | rgb[2]) nonzero++;
+      fwrite(rgb, 1, 3, fp);
+    }
+  }
+  fclose(fp);
+  fprintf(stderr, "mango: OpenTTD frame dump %s %ux%u nonzero=%u/%u\n", path,
+          (unsigned)w, (unsigned)h, (unsigned)nonzero, (unsigned)(w * h));
+  return (int)nonzero;
 }
 
 static void mango_dump_framebuffer_pgm(MangoLoadedLibrary* lib, uint32_t surf) {
