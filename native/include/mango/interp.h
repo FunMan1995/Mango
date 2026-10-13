@@ -30,4 +30,8 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
 typedef int (*MangoFastpathFn)(MangoCpu* cpu, MangoMemory* mem, uint32_t* next_pc);
 void mango_interp_set_fastpath(uint32_t addr, MangoFastpathFn fn);
 
+#include <stdio.h>
+/* research/109: dump the last n traced PCs (only when MANGO_109_PC_TRACE=1). */
+void mango_interp_dump_trace(FILE* f, unsigned n);
+
 #endif /* MANGO_INTERP_H_ */

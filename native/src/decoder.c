@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include "mango/decoder.h"
 
 #include "mango/cpu.h"
@@ -365,7 +366,16 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       out->op = MANGO_OP_VMOV;
       out->rd = vd;
       out->rn = rn;
-      out->rm = (dbit << 4) | (word & 0xFu);
+      /* research/109: bit 22 is opcode (always 1) here, not D; Dm = M:Vm.
+       * Revert: MANGO_109_NO_VMOV_FIX=1 (old D16+ aliasing). */
+      {
+        static int s_old = -1;
+        if (s_old < 0) {
+          const char* e = getenv("MANGO_109_NO_VMOV_FIX");
+          s_old = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        out->rm = (s_old ? (dbit << 4) : 0u) | (word & 0xFu);
+      }
       if ((word >> 5) & 1u) {
         out->rm |= 16u;
       }
@@ -523,7 +533,7 @@ int mango_decode(uint32_t word, MangoInsn* out) {
       }
     }
     /* VCVT.F32.F64 Sd, Dm (cp B) / VCVT.F64.F32 Dd, Sm (cp A). */
-    if (((word >> 16) & 0xFFu) == 0xB7u && ((word >> 4) & 9u) == 8u) {
+    if (((word >> 16) & 0xBFu) == 0xB7u && ((word >> 4) & 9u) == 8u) { /* research/109: D bit allowed */
       out->op = MANGO_OP_VCVT;
       if (dbl) {
         out->imm = 1;
@@ -551,6 +561,21 @@ int mango_decode(uint32_t word, MangoInsn* out) {
     if ((word & 0x0FB00F50u) == 0x0E800B00u || (word & 0x0FB00F50u) == 0x0E800A00u) {
       out->op = MANGO_OP_VDIV;
       return 0;
+    }
+    /* research/109: VFP multiply-accumulate family (A8.8.337/.355/.304).
+     * TGP noise in OpenTTD: Thumb ee01 cb48 = vmls.f64 d12, d1, d8. */
+    {
+      static const struct { uint32_t pat; uint32_t u; } kMac[] = {
+        {0x0E000A00u, 0u}, {0x0E000A40u, 1u}, {0x0E100A40u, 2u}, {0x0E100A00u, 3u},
+        {0x0E200A40u, 4u}, {0x0EA00A00u, 5u}, {0x0EA00A40u, 6u}, {0x0E900A40u, 7u},
+        {0x0E900A00u, 8u}};
+      for (unsigned k = 0; k < sizeof kMac / sizeof kMac[0]; k++) {
+        if ((word & 0x0FB00E50u) == kMac[k].pat) {
+          out->op = MANGO_OP_VMLA;
+          out->u = kMac[k].u;
+          return 0;
+        }
+      }
     }
     if (dbl && (word & 0x0FBF0FD0u) == 0x0EB00BC0u) {
       out->op = MANGO_OP_VABS;

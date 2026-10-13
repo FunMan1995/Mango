@@ -3549,6 +3549,100 @@ static int test_t32_orr_w_reg_lsl6(void) {
   return 0;
 }
 
+/* research/109: VFP multiply-accumulate (vmls.f64 from TGP, vmla.f32). */
+/* research/109: VMOV Dm<->Rt,Rt2 (no D16 alias), Thumb literal VLDR Align(PC,4),
+ * saturating VCVT to s32, VCVT.F32.F64 with D bit. Oracle: unicorn 2.1.4. */
+static int test_research109_tgp_isa(void) {
+  uint8_t mem_buf[64];
+  MangoCpu cpu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc;
+  {
+    /* vmov d7, r0, r1 = ec41 0b17 ; bx lr */
+    static const uint16_t k[] = {0xEC41u, 0x0B17u, 0x4770u};
+    load_halfwords(mem_buf, sizeof(mem_buf), k, 3);
+    memset(&cpu, 0, sizeof(cpu)); cpu.cpsr = MANGO_CPSR_T;
+    cpu.r[0] = 0x11111111u; cpu.r[1] = 0x22222222u; cpu.r[MANGO_REG_LR] = 0xABCDu;
+    rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.s[14] != 0x11111111u || cpu.s[15] != 0x22222222u || cpu.s[46] != 0u) {
+      fprintf(stderr, "FAIL(r109_vmov_d7): rc=%d s14=%#x s15=%#x s46=%#x\n", rc, cpu.s[14], cpu.s[15], cpu.s[46]);
+      return 1;
+    }
+  }
+  {
+    /* movs r1,#0 ; vldr d9,[pc,#8] at addr 2 -> Align(6,4)+8 = 0xC */
+    static const uint16_t k[] = {0x2100u, 0xED9Fu, 0x9B02u, 0x4770u};
+    memset(mem_buf, 0, sizeof mem_buf);
+    load_halfwords(mem_buf, sizeof(mem_buf), k, 4);
+    for (int i = 8; i < 32; i++) mem_buf[i] = (uint8_t)(0x40 + i);
+    memset(&cpu, 0, sizeof(cpu)); cpu.cpsr = MANGO_CPSR_T; cpu.r[MANGO_REG_LR] = 0xABCDu;
+    rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    if (rc != 0 || cpu.s[18] != 0x4F4E4D4Cu) {
+      fprintf(stderr, "FAIL(r109_vldr_align): rc=%d s18=%#x\n", rc, cpu.s[18]);
+      return 1;
+    }
+  }
+  {
+    /* vcvt.s32.f64 s0, d1 = eebd 0bc1 ; vcvt.f32.f64 s15, d8 = eef7 7bc8 */
+    static const uint16_t k[] = {0xEEBDu, 0x0BC1u, 0xEEF7u, 0x7BC8u, 0x4770u};
+    double big = 1e12, two = 2.0; uint64_t u; float f;
+    memset(mem_buf, 0, sizeof mem_buf);
+    load_halfwords(mem_buf, sizeof(mem_buf), k, 5);
+    memset(&cpu, 0, sizeof(cpu)); cpu.cpsr = MANGO_CPSR_T; cpu.r[MANGO_REG_LR] = 0xABCDu;
+    memcpy(&u, &big, 8); cpu.s[2] = (uint32_t)u; cpu.s[3] = (uint32_t)(u >> 32);
+    memcpy(&u, &two, 8); cpu.s[16] = (uint32_t)u; cpu.s[17] = (uint32_t)(u >> 32);
+    rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    memcpy(&f, &cpu.s[15], 4);
+    if (rc != 0 || cpu.s[0] != 0x7FFFFFFFu || f != 2.0f) {
+      fprintf(stderr, "FAIL(r109_vcvt): rc=%d s0=%#x s15=%f\n", rc, cpu.s[0], f);
+      return 1;
+    }
+  }
+  printf("ok: research/109 VMOV Dm/2xR, literal VLDR align, VCVT sat, VCVT.F32.F64 D-bit\n");
+  return 0;
+}
+
+static int test_research109_vmla(void) {
+  uint8_t mem_buf[32];
+  MangoCpu cpu;
+  /* Thumb: vmls.f64 d12,d1,d8 = ee01 cb48 ; bx lr */
+  static const uint16_t kProg[] = {0xEE01u, 0xCB48u, 0x4770u};
+  double d12 = 10.0, d1 = 2.0, d8 = 3.0, r;
+  uint64_t u;
+  load_halfwords(mem_buf, sizeof(mem_buf), kProg, 3);
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.cpsr = MANGO_CPSR_T;
+  memcpy(&u, &d12, 8); cpu.s[24] = (uint32_t)u; cpu.s[25] = (uint32_t)(u >> 32);
+  memcpy(&u, &d1, 8); cpu.s[2] = (uint32_t)u; cpu.s[3] = (uint32_t)(u >> 32);
+  memcpy(&u, &d8, 8); cpu.s[16] = (uint32_t)u; cpu.s[17] = (uint32_t)(u >> 32);
+  cpu.r[MANGO_REG_LR] = 0xABCDu;
+  MangoMemory mem = {mem_buf, sizeof(mem_buf)};
+  int rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+  u = (uint64_t)cpu.s[24] | ((uint64_t)cpu.s[25] << 32);
+  memcpy(&r, &u, 8);
+  if (rc != 0 || r != 4.0) {
+    fprintf(stderr, "FAIL(r109_vmls_f64): rc=%d d12=%f\n", rc, r);
+    return 1;
+  }
+  {
+    /* A32 vmla.f32 s0,s1,s2 = ee000a81 ; bx lr. 1 + 2*3 = 7 */
+    uint32_t w[] = {0xEE000A81u, 0xE12FFF1Eu};
+    float a = 1.0f, b = 2.0f, c = 3.0f, rf;
+    memcpy(mem_buf, w, sizeof w);
+    memset(&cpu, 0, sizeof(cpu));
+    memcpy(&cpu.s[0], &a, 4); memcpy(&cpu.s[1], &b, 4); memcpy(&cpu.s[2], &c, 4);
+    cpu.r[MANGO_REG_LR] = 0xABCDu;
+    rc = mango_interp_run(&cpu, &mem, 0xABCDu, 10);
+    memcpy(&rf, &cpu.s[0], 4);
+    if (rc != 0 || rf != 7.0f) {
+      fprintf(stderr, "FAIL(r109_vmla_f32): rc=%d s0=%f\n", rc, rf);
+      return 1;
+    }
+  }
+  printf("ok: research/109 VMLS.F64 (T32) / VMLA.F32 (A32)\n");
+  return 0;
+}
+
 /* research/108: TEQ.W / EORS.W register, T32 S=1 inside IT, VNEG/VABS.F32. */
 static int test_research108_isa(void) {
   MangoInsn di;
@@ -13098,6 +13192,8 @@ int main(void) {
   failures += test_t32_orr_w_reg_lsl6();
   failures += test_t32_eor_w_reg();
   failures += test_research108_isa();
+  failures += test_research109_vmla();
+  failures += test_research109_tgp_isa();
   failures += test_t32_and_w_reg();
   failures += test_t32_ands_w_reg();
   failures += test_t32_tst_w_reg();

@@ -590,10 +590,68 @@ static MangoFastpathFn mango_fastpath_find(uint32_t addr) {
   return NULL;
 }
 
+/* research/109: optional PC trace ring (MANGO_109_PC_TRACE=1), diagnostic. */
+#define MANGO_TRACE_N 4096u
+static uint32_t g_trace_pc[MANGO_TRACE_N], g_trace_lr[MANGO_TRACE_N], g_trace_sp[MANGO_TRACE_N];
+static uint32_t g_trace_i;
+static int g_trace_on = -1;
+void mango_interp_dump_trace(FILE* f, unsigned n) {
+  if (g_trace_on != 1) return;
+  if (n > MANGO_TRACE_N) n = MANGO_TRACE_N;
+  for (unsigned k = n; k > 0; k--) {
+    uint32_t j = (g_trace_i - k) & (MANGO_TRACE_N - 1u);
+    fprintf(f, "mango: trace[-%u] pc=%#x lr=%#x sp=%#x\n", k, g_trace_pc[j], g_trace_lr[j], g_trace_sp[j]);
+  }
+}
+
+
+/* research/109: ARM VCVT to integer saturates (NaN -> 0); plain C casts are
+ * UB/x86-indefinite (0x80000000). Revert: MANGO_109_NO_VCVT_SAT=1. */
+static int mango_vcvt_sat_on(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("MANGO_109_NO_VCVT_SAT");
+    v = (e && e[0] && e[0] != '0') ? 0 : 1;
+  }
+  return v;
+}
+static uint32_t mango_vcvt_to_int(double d, int is_signed) {
+  if (!mango_vcvt_sat_on()) {
+    return is_signed ? (uint32_t)(int32_t)d : (uint32_t)d;
+  }
+  if (d != d) return 0u;
+  if (is_signed) {
+    if (d >= 2147483647.0) return 0x7FFFFFFFu;
+    if (d <= -2147483648.0) return 0x80000000u;
+    return (uint32_t)(int32_t)d;
+  }
+  if (d <= 0.0) return 0u;
+  if (d >= 4294967295.0) return 0xFFFFFFFFu;
+  return (uint32_t)d;
+}
+
+static int mango_vldr_align_on(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("MANGO_109_NO_VLDR_ALIGN");
+    v = (e && e[0] && e[0] != '0') ? 0 : 1;
+  }
+  return v;
+}
 int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32_t max_steps) {
   uint32_t addr = cpu->r[MANGO_REG_PC];
+  if (g_trace_on < 0) {
+    const char* v = getenv("MANGO_109_PC_TRACE");
+    g_trace_on = (v && v[0] && v[0] != '0') ? 1 : 0;
+  }
 
   for (uint32_t step = 0; step < max_steps; step++) {
+    if (g_trace_on == 1) {
+      uint32_t j = g_trace_i++ & (MANGO_TRACE_N - 1u);
+      g_trace_pc[j] = addr | ((cpu->cpsr & MANGO_CPSR_T) ? 1u : 0u);
+      g_trace_lr[j] = cpu->r[MANGO_REG_LR];
+      g_trace_sp[j] = cpu->r[13];
+    }
     if (addr == stop_addr) {
       return 0;
     }
@@ -1175,6 +1233,9 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
         case MANGO_OP_VLDR:
         case MANGO_OP_VSTR: {
           uint32_t base = mango_read_reg(cpu, addr, insn.rn);
+          if (insn.rn == MANGO_REG_PC && mango_vldr_align_on()) {
+            base &= ~3u; /* research/109: Align(PC,4) for Thumb literal VLDR */
+          }
           uint32_t eaddr = insn.u ? base + insn.imm : base - insn.imm;
           uint32_t n = insn.b ? 8u : 4u;
           if ((uint64_t)eaddr + n > mem->size) {
@@ -1216,7 +1277,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             float f;
             uint32_t u = cpu->s[insn.rn & 31u];
             memcpy(&f, &u, 4);
-            cpu->s[insn.rd & 31u] = insn.imm == 3 ? (uint32_t)(int32_t)f : (uint32_t)f;
+            cpu->s[insn.rd & 31u] = mango_vcvt_to_int((double)f, insn.imm == 3);
           } else if (insn.imm == 5) {
             int32_t si = (int32_t)cpu->s[insn.rn & 31u];
             float f = (float)si;
@@ -1225,7 +1286,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             cpu->s[insn.rd & 31u] = u;
           } else if (insn.imm == 6 || insn.imm == 7) {
             double d = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
-            cpu->s[insn.rd & 31u] = insn.imm == 6 ? (uint32_t)(int32_t)d : (uint32_t)d;
+            cpu->s[insn.rd & 31u] = mango_vcvt_to_int(d, insn.imm == 6);
           } else if (insn.imm == 8) {
             uint32_t u = cpu->s[insn.rn & 31u];
             mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64((double)u));
@@ -1276,7 +1337,7 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             } else if (insn.op == MANGO_OP_VMUL) {
               r = a * b;
             } else if (insn.op == MANGO_OP_VDIV) {
-              r = b == 0.0 ? 0.0 : a / b;
+              r = (b == 0.0 && !mango_vcvt_sat_on()) ? 0.0 : a / b; /* research/109 IEEE */
             } else {
               r = a + b;
             }
@@ -1292,12 +1353,58 @@ int mango_interp_run(MangoCpu* cpu, MangoMemory* mem, uint32_t stop_addr, uint32
             } else if (insn.op == MANGO_OP_VMUL) {
               r = a * b;
             } else if (insn.op == MANGO_OP_VDIV) {
-              r = b == 0.0f ? 0.0f : a / b;
+              r = (b == 0.0f && !mango_vcvt_sat_on()) ? 0.0f : a / b;
             } else {
               r = a + b;
             }
             memcpy(&ua, &r, 4);
             cpu->s[insn.rd & 31u] = ua;
+          }
+          break;
+        }
+
+        case MANGO_OP_VMLA: {
+          /* research/109: d=acc op n*m. Revert to stop: MANGO_109_NO_VMLA=1 (decoded,
+           * then treated as unsupported). */
+          static int s_no = -1;
+          if (s_no < 0) { const char* v = getenv("MANGO_109_NO_VMLA"); s_no = (v && v[0] && v[0] != '0'); }
+          if (s_no) return -1;
+          unsigned u = insn.u;
+          if (insn.b) {
+            double d = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rd));
+            double a = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rn));
+            double b = mango_u64_to_f64(mango_vfp_get_d(cpu, insn.rm));
+            double p = a * b, r;
+            switch (u) {
+              case 0: r = d + p; break;
+              case 1: r = d - p; break;
+              case 2: r = -d - p; break;
+              case 3: r = -d + p; break;
+              case 4: r = -p; break;
+              case 5: r = fma(a, b, d); break;
+              case 6: r = fma(-a, b, d); break;
+              case 7: r = fma(-a, b, -d); break;
+              default: r = fma(a, b, -d); break;
+            }
+            mango_vfp_set_d(cpu, insn.rd, mango_f64_to_u64(r));
+          } else {
+            float d, a, b, p, r;
+            uint32_t ud = cpu->s[insn.rd & 31u], ua = cpu->s[insn.rn & 31u], ub = cpu->s[insn.rm & 31u];
+            memcpy(&d, &ud, 4); memcpy(&a, &ua, 4); memcpy(&b, &ub, 4);
+            p = a * b;
+            switch (u) {
+              case 0: r = d + p; break;
+              case 1: r = d - p; break;
+              case 2: r = -d - p; break;
+              case 3: r = -d + p; break;
+              case 4: r = -p; break;
+              case 5: r = fmaf(a, b, d); break;
+              case 6: r = fmaf(-a, b, d); break;
+              case 7: r = fmaf(-a, b, -d); break;
+              default: r = fmaf(a, b, -d); break;
+            }
+            memcpy(&ud, &r, 4);
+            cpu->s[insn.rd & 31u] = ud;
           }
           break;
         }

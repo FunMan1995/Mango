@@ -320,7 +320,19 @@
 #define MANGO_LIBC_CRC32 195
 #define MANGO_LIBC_ZLIBVERSION 196
 #define MANGO_LIBC_SDL_UPDATE_RECTS 197
-#define MANGO_LIBC_COUNT 198
+/* research/109: libm/libc gaps OpenTTD imported but were stub-bound (returned 0). */
+#define MANGO_LIBC_R109_ACOS 198
+#define MANGO_LIBC_R109_ASIN 199
+#define MANGO_LIBC_R109_ATAN 200
+#define MANGO_LIBC_R109_CEIL 201
+#define MANGO_LIBC_R109_CEILF 202
+#define MANGO_LIBC_R109_FMOD 203
+#define MANGO_LIBC_R109_LOG10 204
+#define MANGO_LIBC_R109_MODF 205
+#define MANGO_LIBC_R109_STRTOD 206
+#define MANGO_LIBC_R109_ATOI 207
+#define MANGO_LIBC_R109_FIRST 198
+#define MANGO_LIBC_COUNT 208
 /* bionic struct __sFILE is 84 bytes in this NDK. stderr is &__sF[2]. */
 #define MANGO_SF_FILE 84u
 #define MANGO_TSD_KEYS 16
@@ -595,6 +607,16 @@ static const char* const kLibcNames[MANGO_LIBC_COUNT] = {
     "crc32",
     "zlibVersion",
     "SDL_UpdateRects",
+    "acos",
+    "asin",
+    "atan",
+    "ceil",
+    "ceilf",
+    "fmod",
+    "log10",
+    "modf",
+    "strtod",
+    "atoi",
 };
 
 static MangoJniSlot g_slots[MANGO_JNI_SLOTS];
@@ -683,6 +705,7 @@ static uint32_t g_sl_iid_effectsend_cell;
 static void mango_store_u32_guest(uint8_t* mem, uint32_t addr, uint32_t v);
 static uint32_t mango_load_u32_guest(const uint8_t* mem, uint32_t addr);
 static int mango_guest_range_ok(const MangoLoadedLibrary* lib, uint32_t addr, uint32_t n);
+static int mango_env_flag(const char* name);
 static uint32_t mango_handle_intern(void* p);
 static uint32_t mango_guest_alloc(MangoLoadedLibrary* lib, uint32_t n);
 static uint32_t mango_guest_strdup(MangoLoadedLibrary* lib, const char* s);
@@ -3115,6 +3138,12 @@ static uint32_t mango_resolve_import(void* ctx, const char* name, uint32_t st_va
      * libapplication.so (present metric); other libs keep guest libsdl. */
     if (i == MANGO_LIBC_SDL_UPDATE_RECTS &&
         strstr(lib->path, "libapplication.so") == NULL) {
+      continue;
+    }
+    /* research/109: new math/libc thunks bind only for OpenTTD libapplication.so.
+     * Revert: MANGO_109_NO_MATH_THUNKS=1 (stub-bound again). */
+    if (i >= MANGO_LIBC_R109_FIRST &&
+        (strstr(lib->path, "libapplication.so") == NULL || mango_env_flag("MANGO_109_NO_MATH_THUNKS"))) {
       continue;
     }
     if (strcmp(name, kLibcNames[i]) == 0) {
@@ -5846,9 +5875,9 @@ static void mango_openttd_postgen_poll(MangoLoadedLibrary* lib, MangoCpu* cpu) {
  * ThreadMutex_pthread::BeginCritical does not see a recursive lock by the
  * "same" thread (NOT_REACHED thread_pthread.cpp:132 -> exit, which skipped
  * AfterNewGRFScan::OnNewGRFsScanned and the full LoadFromConfig).
- * OPT-IN: MANGO_OPENTTD_108_SCAN_TID=1. Off by default because the real
- * settings then select the TGP generator, whose run currently wild-jumps
- * (interp stop in GetTextfile data, see 108 brief). */
+ * research/109: DEFAULT ON (revert: MANGO_OPENTTD_109_NO_SCAN_TID=1). Was opt-in (/108) because the real
+ * settings then select TGP, which stopped on unimplemented VMLA and mis-aligned Thumb
+ * literal VLDR + VMOV Dm aliasing (all fixed in /109, see 109 brief). */
 static uint32_t g_soft_pthread_self = 1u;
 
 static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) {
@@ -6481,6 +6510,36 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
     case MANGO_LIBC_POW:
       mango_ret_d(cpu, pow(mango_arg_d(cpu), mango_arg_d2(cpu)));
       break;
+    case MANGO_LIBC_R109_ACOS: mango_ret_d(cpu, acos(mango_arg_d(cpu))); break;
+    case MANGO_LIBC_R109_ASIN: mango_ret_d(cpu, asin(mango_arg_d(cpu))); break;
+    case MANGO_LIBC_R109_ATAN: mango_ret_d(cpu, atan(mango_arg_d(cpu))); break;
+    case MANGO_LIBC_R109_CEIL: mango_ret_d(cpu, ceil(mango_arg_d(cpu))); break;
+    case MANGO_LIBC_R109_CEILF: mango_ret_f(cpu, ceilf(mango_arg_f(cpu))); break;
+    case MANGO_LIBC_R109_FMOD: mango_ret_d(cpu, fmod(mango_arg_d(cpu), mango_arg_d2(cpu))); break;
+    case MANGO_LIBC_R109_LOG10: mango_ret_d(cpu, log10(mango_arg_d(cpu))); break;
+    case MANGO_LIBC_R109_MODF: {
+      /* softfp: x in r0:r1, iptr in r2 */
+      double ip = 0.0, fr = modf(mango_arg_d(cpu), &ip);
+      uint32_t p = cpu->r[2];
+      if (p && mango_guest_range_ok(lib, p, 8u)) memcpy(lib->guest_mem + p, &ip, 8);
+      mango_ret_d(cpu, fr);
+      break;
+    }
+    case MANGO_LIBC_R109_STRTOD: {
+      const char* str = mango_guest_cstr(lib, r0);
+      char* end = NULL;
+      double v = str ? strtod(str, &end) : 0.0;
+      if (r1 && mango_guest_range_ok(lib, r1, 4u)) {
+        mango_store_u32_guest(lib->guest_mem, r1, str ? r0 + (uint32_t)(end - str) : r0);
+      }
+      mango_ret_d(cpu, v);
+      break;
+    }
+    case MANGO_LIBC_R109_ATOI: {
+      const char* str = mango_guest_cstr(lib, r0);
+      cpu->r[0] = (uint32_t)(str ? atoi(str) : 0);
+      break;
+    }
     case MANGO_LIBC_EXP:
       mango_ret_d(cpu, exp(mango_arg_d(cpu)));
       break;
@@ -6580,7 +6639,7 @@ static void mango_libc_svc(MangoLoadedLibrary* lib, MangoCpu* cpu, uint32_t fn) 
           {
             uint32_t saved_tid = g_soft_pthread_self;
             uint32_t mtx[2] = {0, 0}, mown[2] = {0, 0}, mcnt[2] = {0, 0};
-            int rc, use_tid = mango_env_flag("MANGO_OPENTTD_108_SCAN_TID");
+            int rc, use_tid = mango_env_flag("MANGO_OPENTTD_108_SCAN_TID") || !mango_env_flag("MANGO_OPENTTD_109_NO_SCAN_TID"); /* research/109: default on */
             if (use_tid) {
               /* The scan "thread" runs while the main thread is parked: hand
                * it the modal paint/work mutexes free (owner 0, count 0) and
@@ -9376,6 +9435,37 @@ static int mango_probe_fn(MangoCpu* cpu, MangoMemory* mem, uint32_t* next_pc) {
               g_probes[i].ret ? "ret " : "", g_probes[i].name, n, cpu->r[0], cpu->r[1], cpu->r[2],
               cpu->r[3], cpu->r[4], cpu->r[14], sr >= 0 ? " str=\"" : "", str, sr >= 0 ? "\"" : "");
     }
+    if (strcmp(g_probes[i].name, "_Z13GenerateTowns10TownLayout") == 0) {
+      /* research/109: heightmap / tile-type histogram at town placement. */
+      uint32_t ab = 0;
+      if (mango_openttd_app(&ab) != NULL) {
+        uint32_t m = mango_load_u32_guest(mem->bytes, ab + 0x59c79cu);
+        uint32_t n = mango_load_u32_guest(mem->bytes, ab + 0x59c7a4u);
+        unsigned hist[16] = {0}, types[16] = {0};
+        unsigned hmax = 0;
+        if (m && n && (uint64_t)m + (uint64_t)n * 8u <= mem->size) {
+          for (uint32_t t = 0; t < n; t++) {
+            uint8_t ty = mem->bytes[m + t * 8u], h = mem->bytes[m + t * 8u + 1u];
+            hist[h < 15 ? h : 15]++; types[ty >> 4]++; if (h > hmax) hmax = h;
+          }
+        }
+        fprintf(stderr, "mango: research/109 map n=%u hmax=%u h0..15:", n, hmax);
+        for (int k = 0; k < 16; k++) fprintf(stderr, " %u", hist[k]);
+        fprintf(stderr, " types:");
+        for (int k = 0; k < 16; k++) fprintf(stderr, " %u", types[k]);
+        fprintf(stderr, "\n");
+      }
+    }
+    if (strstr(g_probes[i].name, "GenerateTerrainPerlin") && mango_env_flag("MANGO_109_SETTINGS_DUMP")) {
+      uint32_t ab = 0;
+      if (mango_openttd_app(&ab) != NULL && ab + 0x977548u + 0x600u <= mem->size) {
+        for (uint32_t o = 0; o < 0x600u; o += 32u) {
+          fprintf(stderr, "mango: sg %03x:", o);
+          for (uint32_t k = 0; k < 32u; k++) fprintf(stderr, " %02x", mem->bytes[ab + 0x977548u + o + k]);
+          fprintf(stderr, "\n");
+        }
+      }
+    }
     if (!g_probes[i].ret && strncmp(g_probes[i].name, "FT_", 3) == 0 && (cpu->r[14] & 1u)) {
       mango_probe_add(cpu->r[14] & ~1u, g_probes[i].name, 1, -1);
     }
@@ -9401,6 +9491,12 @@ static void mango_openttd_font_probe_arm(uint32_t bias) {
     {"libapplication.so", "_Z15ScanNewGRFFilesP18NewGRFScanCallback", -1},
     {"libapplication.so", "_Z17DoScanNewGRFFilesPv", -1},
     {"libapplication.so", "DoScan.after_mutex(0x27f7a4)", -1, 0x27f7a4u},
+    {"libapplication.so", "_Z13GenerateTowns10TownLayout", -1},
+    {"libapplication.so", "_Z29HandleGeneratingWorldAbortionv", -1},
+    {"libapplication.so", "_Z20AbortGeneratingWorldv", -1},
+    {"libapplication.so", "_Z16ShowErrorMessagett12WarningLeveliiPK7GRFFilejPKj", -1},
+    {"libapplication.so", "_Z21GenerateTerrainPerlinv", -1},
+    {"libapplication.so", "_Z17GenerateLandscapeh", -1},
     {"libapplication.so", "DoScan.cbz_callback(r6)", -1, 0x27f7cau},
     {"libapplication.so", "DoScan.blx_callback(r3)", -1, 0x27f7d2u},
     /* ZoomInOrOutToCursorWindow zoom-out limit compare: r4=vp->zoom r3=zoom_max */
@@ -9412,6 +9508,10 @@ static void mango_openttd_font_probe_arm(uint32_t bias) {
   int found = 0;
   (void)bias;
   for (unsigned k = 0; k < sizeof kp / sizeof kp[0]; k++) {
+    if (strncmp(kp[k].sym, "FT_", 3) == 0 && !mango_env_flag("MANGO_OPENTTD_108_FONT_PROBE")) {
+      found++;
+      continue;
+    }
     for (int i = 0; i < g_nlibs; i++) {
       if (g_libs[i] == NULL || strstr(g_libs[i]->path, kp[k].lib) == NULL) continue;
       uint32_t st = kp[k].off ? kp[k].off : mango_elf32_find_symbol(&g_libs[i]->image, kp[k].sym);
@@ -9427,6 +9527,17 @@ static void mango_openttd_font_probe_arm(uint32_t bias) {
   if (found == (int)(sizeof kp / sizeof kp[0])) s_done = 1;
 }
 
+/* research/109: EARLY-default arming must only hit OpenTTD (Meritous also
+ * ships a libapplication.so). Keyed on an OpenTTD-only export. */
+static int mango_openttd_is_openttd(void) {
+  static int v = -1;
+  MangoLoadedLibrary* l;
+  if (v >= 0) return v;
+  l = mango_openttd_app(NULL);
+  if (l == NULL) return 0; /* not loaded yet: re-check later */
+  v = mango_elf32_find_symbol(&l->image, "_Z21GenerateTerrainPerlinv") != 0 ? 1 : 0;
+  return v;
+}
 static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) {
   MangoMemory mem = {lib->guest_mem, lib->guest_mem_size};
   for (;;) {
@@ -9445,7 +9556,10 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
       uint32_t pb = 0;
       if (mango_openttd_app(&pb) != NULL && pb != 0) mango_openttd_font_probe_arm(pb);
     }
-    if (g_openttd_post_stm_unsuppressed || mango_env_flag("MANGO_OPENTTD_107_PA_FASTPATH_EARLY")) {
+    /* research/109: EARLY is the default. MANGO_OPENTTD_109_SOFT_STACK=1
+     * restores /108 (arm only after the post-STM unsuppress, soft stack runs). */
+    if (g_openttd_post_stm_unsuppressed || mango_env_flag("MANGO_OPENTTD_107_PA_FASTPATH_EARLY") ||
+        (!mango_env_flag("MANGO_OPENTTD_109_SOFT_STACK") && mango_openttd_is_openttd())) {
       mango_openttd_pa_fastpath_arm();
     }
     int rc = mango_interp_run(cpu, &mem, MANGO_JNI_STOP, budget);
@@ -9575,6 +9689,7 @@ static int mango_run_guest(MangoLoadedLibrary* lib, MangoCpu* cpu, JNIEnv* env) 
               pc, cpu->cpsr, w, rc, dec, dec == 0 ? (int)ins.op : -1, cpu->r[0], cpu->r[1],
               cpu->r[2], cpu->r[3], cpu->r[4], cpu->r[5], cpu->r[6], cpu->r[7],
               cpu->r[MANGO_REG_SP], cpu->r[MANGO_REG_LR], lib->load_bias);
+      mango_interp_dump_trace(stderr, 400);
       fflush(stderr);
       for (int i = 0; i < g_nlibs; i++) {
         fprintf(stderr, "mango: lib[%d] bias=0x%x %s\n", i, g_libs[i]->load_bias, g_libs[i]->path);
